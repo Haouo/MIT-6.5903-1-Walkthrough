@@ -28,6 +28,13 @@ Each walkthrough follows a fixed standalone-study template: **TL;DR → Learning
 self-check questions, exercises, common traps) → Key Terms glossary → Takeaways → Connections to later
 lectures → Slide-to-Section map.**
 
+Additional self-guided reading aids:
+
+- [`docs/CROSS_LECTURE_INDEX.md`](docs/CROSS_LECTURE_INDEX.md) — concept threads across L01-L13
+  (data movement, Einsums, mapping, sparsity, precision, CiM, ISL).
+- [`docs/SLIDE_FIDELITY_AUDIT.md`](docs/SLIDE_FIDELITY_AUDIT.md) — slide coverage and traceability
+  notes against the source PDFs.
+
 ---
 
 ## Lecture Index
