@@ -1,6 +1,9 @@
 # Local Claude Code settings
 .claude/
 
+# Copyright-sensitive paper PDFs — local reference only, never committed
+papers/
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db
