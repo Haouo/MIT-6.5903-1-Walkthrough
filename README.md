@@ -32,20 +32,22 @@ Connections to later lectures → Slide-to-Section map.**
 | # | Lecture | English | 繁體中文 | Status |
 |---|---|---|---|---|
 | L01 | Introduction and Applications | [EN](walkthroughs/en/L01-Intro-and-Applications.md) | [ZH](walkthroughs/zh/L01-Intro-and-Applications.md) | ✅ Done |
-| L02 | Overview on DNN Components | — | — | ⬜ Pending |
-| L03 | Memory + Metrics + Einsums + Transformers | — | — | ⬜ Pending |
-| L04 | Einsums + Transformers | — | — | ⬜ Pending |
-| L05 | Mapping — Dataflows | — | — | ⬜ Pending |
-| L06 | Mapping — Partitioning | — | — | ⬜ Pending |
-| L07 | Sparsity | — | — | ⬜ Pending |
-| L08 | Sparse Architectures | — | — | ⬜ Pending |
-| L09 | Sparse Architectures 2 | — | — | ⬜ Pending |
-| L10 | Sparse Architectures 3 | — | — | ⬜ Pending |
-| L11 | Advanced Technologies | — | — | ⬜ Pending |
-| L12 | Precision | — | — | ⬜ Pending |
-| L13 | Calculating Motion | — | — | ⬜ Pending |
+| L02 | Overview on DNN Components | [EN](walkthroughs/en/L02-Overview-on-DNN-Components.md) | [ZH](walkthroughs/zh/L02-Overview-on-DNN-Components.md) | ✅ Done |
+| L03 | Memory, Metrics, Einsums & Transformers | [EN](walkthroughs/en/L03-Memory-Metrics-Einsums-Transformers.md) | [ZH](walkthroughs/zh/L03-Memory-Metrics-Einsums-Transformers.md) | ✅ Done |
+| L04 | Einsums & Transformers | [EN](walkthroughs/en/L04-Einsums-and-Transformers.md) | [ZH](walkthroughs/zh/L04-Einsums-and-Transformers.md) | ✅ Done |
+| L05 | Mapping — Dataflows | [EN](walkthroughs/en/L05-Mapping-Dataflows.md) | [ZH](walkthroughs/zh/L05-Mapping-Dataflows.md) | ✅ Done |
+| L06 | Mapping — Partitioning | [EN](walkthroughs/en/L06-Mapping-Partitioning.md) | [ZH](walkthroughs/zh/L06-Mapping-Partitioning.md) | ✅ Done |
+| L07 | Sparsity | [EN](walkthroughs/en/L07-Sparsity.md) | [ZH](walkthroughs/zh/L07-Sparsity.md) | ✅ Done |
+| L08 | Sparse Architectures | [EN](walkthroughs/en/L08-Sparse-Architectures.md) | [ZH](walkthroughs/zh/L08-Sparse-Architectures.md) | ✅ Done |
+| L09 | Sparse Architectures 2 | [EN](walkthroughs/en/L09-Sparse-Architectures-2.md) | [ZH](walkthroughs/zh/L09-Sparse-Architectures-2.md) | ✅ Done |
+| L10 | Sparse Architectures 3 | [EN](walkthroughs/en/L10-Sparse-Architectures-3.md) | [ZH](walkthroughs/zh/L10-Sparse-Architectures-3.md) | ✅ Done |
+| L11 | Advanced Technologies | [EN](walkthroughs/en/L11-Advanced-Technologies.md) | [ZH](walkthroughs/zh/L11-Advanced-Technologies.md) | ✅ Done |
+| L12 | Precision | [EN](walkthroughs/en/L12-Precision.md) | [ZH](walkthroughs/zh/L12-Precision.md) | ✅ Done |
+| L13 | Calculating (Data) Motion | [EN](walkthroughs/en/L13-Calculating-Motion.md) | [ZH](walkthroughs/zh/L13-Calculating-Motion.md) | ✅ Done |
 
-> L01 is the **pilot** that establishes the style and structure. L02–L13 follow the same pipeline and template.
+> All 13 lectures are complete in both languages. L01 was the pilot that established the style; L02–L13 follow the same pipeline and 8-section template.
+>
+> **Note on L13:** the deck is titled "Calculating Data Motion" — a formal lecture on computing exact data-movement counts for a mapping using the Integer Set Library (ISL), with 1-D convolution as the running example. It is *not* about optical-flow/motion estimation.
 
 ---
 
