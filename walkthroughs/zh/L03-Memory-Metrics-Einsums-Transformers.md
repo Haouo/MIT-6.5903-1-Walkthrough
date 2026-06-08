@@ -1,529 +1,971 @@
-# L03 — 記憶體、評估指標、Einsum 與 Transformer（Memory, Metrics, Einsums and Transformers）
+# L03 - 記憶體、評估指標、Einsum 與 Transformer（Memory, Metrics, Einsums, and Transformers）
 
-> **課程：** 6.5930/1 — 深度學習硬體架構（Hardware Architectures for Deep Learning）
+> **課程：** 6.5930/1 - 深度學習硬體架構（Hardware Architectures for Deep Learning）
 > **講師：** Joel Emer 與 Vivienne Sze（MIT EECS）
-> **講授日期：** 2026 年 2 月 9 日 · **投影片：** 127 頁 · **來源：** [`Lecture/L03-Memory+Metrics+Einsums+Transformers.pdf`](../../Lecture/L03-Memory+Metrics+Einsums+Transformers.pdf)
+> **講授日期：** 2026 年 2 月 9 日。**投影片：** 127 頁。**來源：** [`Lecture/L03-Memory+Metrics+Einsums+Transformers.pdf`](../../Lecture/L03-Memory+Metrics+Einsums+Transformers.pdf)
 >
-> *本文是以「概念」為單位重建講課脈絡的導讀（walkthrough）。本講的投影片合併了四個子模組——記憶體技術、評估指標、DNN 核心運算的 Einsum 記法，以及注意力機制（Attention）與 Transformer——每一個主題在各自的章節中分別介紹。導讀依主題而非逐頁編排，每節所引用的投影片範圍均可在原始 PDF 中對照驗證。*
+> 本章依據公開投影片重建缺少的課堂講解。它不是投影片摘要，而是給無法觀看 lecture video 的讀者使用的自學章節。文中以投影片 PDF 頁碼作為來源錨點；公式與例子則重新撰寫，以利獨立學習。
 
 ---
 
 ## 一句話總結（TL;DR）
 
-本講有三個核心事實貫穿整門課程：
+L03 把四個會貫穿後續課程的觀念接在一起。
 
-1. **資料搬移（data movement）的能耗遠高於算術運算。** 一次 32 位元的 DRAM 讀取耗費 640 pJ；一次 32 位元浮點乘法僅耗 3.7 pJ——相差約 170 倍。設計或映射（map）DNN 加速器的一切努力，本質上都是為了讓資料離運算更近、搬得更少。
+第一，DNN 硬體常常受限於**資料搬移（data movement）**，而不是算術本身。投影片引用 Horowitz 的能耗表：一次 32-bit DRAM 讀取是 640 pJ，一次 32-bit 浮點乘法是 3.7 pJ。這個投影片陳述的比例約為 170 倍。因此硬體架構師的工作不只是增加 MAC units，而是安排記憶體階層與計算順序，讓 weights、activations、partial sums 盡量少搬動。
 
-2. **GOPS/W 這個單一數字不足以評估一個設計。** 評估 DNN 處理器需要一整套協調一致的指標——準確率（accuracy）、吞吐量（throughput）、延遲（latency）、能耗（energy）、硬體成本（hardware cost）和靈活性（flexibility）——且每個指標都必須附上正確的規格細節。
+第二，加速器評估需要一組**評估指標（metrics）**，不能只看 GOPS/W 這種單一數字。Accuracy、throughput、latency、energy、power、cost、flexibility、scalability 回答的是不同問題。一個設計可能在某個指標看起來很好，卻在實際應用上失敗。
 
-3. **每一種 DNN 運算都可以用 Einsum 來表達。** 這種精簡的記法能捕捉「計算什麼」而不規定「依什麼順序」，是本課程後續所有討論的形式語言。全連接（fully-connected）層、卷積（convolution）層，以及 Transformer 自注意力（self-attention）的每一個計算步驟，都可以化為以 Einsum 表達的矩陣乘法。
+第三，本課程需要一種記法，能說清楚 DNN 計算**要算什麼**，但不先規定**怎麼排程**。這個記法就是 Einsum。像 $Z_{m,n} = A_{m,k} B_{n,k}$ 這樣的 Einsum 定義了 tensor contraction 與 iteration space，但沒有規定 loop order、tiling、data placement 或 parallelization。
 
----
-
-## 學習目標（Learning Objectives）
-
-讀完本講後，你應該能夠：
-
-- 說明**記憶體階層（memory hierarchy）**的設計邏輯，以及正反器（latches/flip-flops）、SRAM、DRAM 與快閃記憶體（Flash）在密度（density）、延遲（latency）、頻寬（bandwidth）和能耗之間的取捨。
-- 用 Horowitz 能耗表（例：32 位元 DRAM 讀取 = 640 pJ，32 位元浮點乘法 = 3.7 pJ）量化說明**資料搬移主導能耗**的原因。
-- 列出**七項關鍵評估指標**（準確率、吞吐量、延遲、能耗／功率、硬體成本、靈活性、可擴展性），並說明每項指標必須附上哪些規格細節。
-- 理解**間接指標（OPs 數、參數量）無法直接預測延遲或能耗**的原因，以及為什麼需要全面性的基準測試（如 MLPerf）。
-- 書寫並解讀 **Einsum 記法**：區分收縮（contracted）與非收縮（uncontracted）維度，辨認常見模式（矩陣-矩陣乘、矩陣-向量乘、逐元素運算、笛卡爾積、卷積），並理解操作性定義（Operational Definition for Einsums, ODE）。
-- 推導**全連接（FC）層的 Einsum**，說明如何在展平後對應到矩陣-向量乘和矩陣-矩陣乘（加入批次維度後），以及 Toeplitz 變換（im2col）如何把卷積轉換為矩陣乘法。
-- 把**自注意力（self-attention）**分解為各個 Einsum 步驟（嵌入 → Q、K、V 投影 → QK 乘積 → softmax → AV 乘積 → 輸出投影），命名所有維度變數，並推廣到批次與多頭注意力（multi-headed attention）。
+第四，Transformer self-attention 不是另一種完全無關的 workload。它是一串 tensor contractions：input projection、$QK^T$、softmax、$AV$、output projection。硬體上最重要的警告是：標準 self-attention 會產生一個大小為 $M \times M$ 的 attention matrix，其中 $M$ 是 sequence length。
 
 ---
 
-## 第一章 — 記憶體階層與它存在的原因
+## 本講要解決的問題
 
-> *投影片：L03-2 … L03-19（實體頁 2–19）*
+前面講次介紹了 deep learning workload 與 accelerator 的動機。L03 補上比較與映射這些 workload 所需的共同語言。
 
-### 核心問題：記憶體無法同時又快又大
+問題在於，「一個 DNN layer」對硬體設計來說太模糊。硬體架構師需要知道：
 
-記憶體階層是計算機架構中最古老的思想之一，而 L03 為它提供了對 DNN 加速器設計至關重要的精確量化基礎。
+- 有哪些 tensors？
+- 哪些 indices 會保留在 output？
+- 哪些 indices 會被 reduction？
+- 有多少 bytes 在 memory hierarchy 之間移動？
+- 正在最佳化哪個 metric？
+- 報告中的結果是真實系統結果，還是 weight count、peak TOPS 這類 proxy？
 
-出發點極為簡明：**沒有任何一種記憶體技術能同時達到大容量、低延遲、高頻寬和低每次存取能耗。** 物理定律——具體地說，能量 = 電容 × 電壓²——意味著陣列越大，位元線（bit-line）越長，電容越大，每次讀取消耗的能量也越多。這是無從迴避的取捨。
+L03 用三座橋來解決這件事：
 
-解決方案是建構由不同大小和位置的記憶體組成的**階層（hierarchy）**：
+| 橋接 | 從 | 到 | 為什麼重要 |
+|---|---|---|---|
+| Memory hierarchy | 物理記憶體技術 | DNN data movement cost | 解釋 local reuse 為什麼有價值 |
+| Evaluation metrics | Model/application goals | Hardware comparison | 避免被單一數字誤導 |
+| Einsum notation | Neural-network layers | Loop nests 與 mapping | 讓後續課程可以精確討論 dataflow |
 
-- **正反器（Latches / Flip-flops）**（< 0.5 kB）：每位元 10 個以上的電晶體，密度低，但速度極快且緊鄰邏輯電路。用於管線暫存器（pipeline registers）。
-- **SRAM**（kB–MB）：每位元格 6 個電晶體，密度和速度均介於正反器與 DRAM 之間。周邊電路（字線 word-line、位元線 bit-line、感測放大器 sense amplifier）可佔用大量面積與能量——實測 SRAM 功耗有 56% 來自感測網路（sensing network），22% 來自位元線。陣列越大，位元線越長，電容越大。
-- **DRAM**（GB）：每位元格僅 1 個電晶體，需要定期更新（periodic refresh）。通常位於晶片外（off-chip），因此連線的電容遠高於晶片上佈線，能耗差距極為懸殊。
-- **快閃記憶體（Flash）**（100 GB 至 TB）：非揮發性（non-volatile），密度高於 DRAM，但寫入需要高電壓（改變電晶體閾值電壓）。現代三維 NAND 已達到每顆晶片 512 Gb，採 100 層以上、單棧堆疊架構（Samsung 第六代 V-NAND，2022）。
-
-![能耗階層表——32 位元 DRAM 讀取 640 pJ，約為浮點乘法的 170 倍](../../assets/L03/L03-p03-energy-cost-table.png)
-
-以下是本節的錨點——Horowitz 能耗表（ISSCC 2014）。建議把這張表記住，因為它是課程中幾乎每一項設計決策的量化依據：
-
-| 運算 | 能耗（pJ） |
-|---|---|
-| 8 位元加法 | 0.03 |
-| 32 位元加法 | 0.1 |
-| 32 位元浮點加法 | 0.9 |
-| 8 位元乘法 | 0.2 |
-| 32 位元浮點乘法 | 3.7 |
-| 32 位元 SRAM 讀取（8 kB） | 5 |
-| **32 位元 DRAM 讀取** | **640** |
-
-DRAM 讀取比 SRAM 讀取**貴 128 倍**，比 32 位元浮點乘法**貴 170 倍**。速度上也是同樣的排名：記憶體存取限制效能的程度不亞於能耗。
-
-### 設計因應：利用資料局部性（locality）
-
-記憶體階層的目標是透過在小型近端記憶體中保留常用資料，**減少對大型記憶體的存取次數**。兩種被利用的局部性形式為：
-
-- **時間局部性（temporal locality）：** 同一個資料元素被多次使用。若在這些使用之間把它留在小型本地緩衝區中，只需一次昂貴的 DRAM 存取，而非多次。
-- **空間局部性（spatial locality）：** 相鄰的資料元素一起被使用。一次載入整個快取行（cache line）或分塊（tile）可以分攤單次存取的成本。
-
-對 DNN 加速器而言，關鍵洞見是：**處理順序（迴圈巢套的排列）不改變數學結果**（乘加運算 MACs 滿足交換律），但它深刻地改變了哪些資料在哪個緩衝區層次被重複使用，進而改變能耗與延遲。選擇正確的處理順序以利用資料重用，正是後續映射（Mapping）講次（L05–L06）的主題。
-
-![記憶體階層——PE、L1、L2、DRAM；目標是最小化對大型記憶體的存取](../../assets/L03/L03-p04-memory-hierarchy.png)
-
-### 記憶體取捨摘要
-
-各技術間的取捨可整理為五個屬性：
-
-- **每位元成本：** 取決於電路類型（電晶體越小→越便宜）
-- **延遲：** 電路類型（越小→越慢）*與*總容量（越小→越快）共同決定
-- **頻寬：** 隨平行度（parallelism）提升
-- **每次存取每位元能耗：** 總容量（越小→能耗越低）*與*電路類型（越小→能耗越低）共同決定
-- **密度：** 取決於電路類型（電晶體越小→密度越高）
-
-大多數屬性會隨製程技術進步、較低供電電壓和較小電容而改善——這也是為何每個製程節點（process node）對加速器設計都有幫助，儘管幫助程度已不如以往那麼顯著。
-
-![記憶體取捨——各技術在成本、延遲、頻寬、能耗、密度之間的比較](../../assets/L03/L03-p18-memory-tradeoffs.png)
-
-> **為什麼重要：** 記憶體階層不是抽象概念——它是 DNN 加速器典型架構（DRAM → 全域緩衝區 → PE 陣列 → 暫存器檔 RF）的物理成因，也是「資料搬移主導能耗」這一斷言的量化基礎。本課程的每一項架構決策，都是為了讓資料在階層中的最低（最便宜）那一層停留盡可能長的時間。
+本講最後把同一套 Einsum 語言用在 Transformer attention，因為現代 DNN accelerator 不可能只處理 CNN。
 
 ---
 
-## 第二章 — 評估指標：遠不只是 GOPS/W
+## 為什麼本講重要
 
-> *投影片：L03-40 … L03-56（實體頁 40–56）*
+初學者常有一個太簡化的心智模型：「神經網路主要是矩陣乘法，所以最好的 accelerator 就是乘法單元最多的 accelerator。」L03 修正這個模型。
 
-### 為什麼單一效率數字很危險
+乘法單元當然重要，但只有在系統能餵資料給它們時才有用。若每個 MAC 都從 DRAM 抓 operands，系統花在搬資料的能量會遠高於乘法本身。若 benchmark 只報 peak TOPS，卻不報 PE utilization、batch size、off-chip bandwidth 或 accuracy，那個結果可能不能描述一個可部署系統。
 
-題為「GOPS/W 還是 TOPS/W？」的投影片發出了一個尖銳的警告：用一個**環形振盪器（ring oscillator）** 也可以得到很高的 GOPS/W。環形振盪器完全沒有運算能力，但它高頻率地切換位元且消耗一定功率，因此這個比值看起來可以很亮眼。這個極端案例說明了一個道理：**峰值吞吐量除以峰值功率，幾乎無法告訴你這個晶片對你的工作負載（workload）是否有用。**
+同樣的修正也出現在記法上。像 $O = AB$ 這樣的公式不夠。硬體設計需要知道 $A$ 與 $B$ 是 weights、activations 還是 intermediate tensors；reduced rank 能不能 tile；intermediate 是否 materialize；loop order 是否暴露 reuse。
 
-### 你必須報告的七項指標
-
-本講確定了一整套指標，這些指標共同提供公平的評估圖像：
-
-![七項關鍵指標——準確率、吞吐量、延遲、能耗／功率、硬體成本、靈活性、可擴展性](../../assets/L03/L03-p42-key-metrics.png)
-
-1. **準確率（Accuracy）** — 結果的品質。必須指明資料集和任務難度；在 MNIST 上達到 99% 準確率的晶片，與在 ImageNet 上達到 90% 的晶片不可相提並論。
-
-2. **吞吐量（Throughput）** — 每秒的推論次數或運算次數。分析型資料管線（analytics pipeline）和即時應用（如每秒 30 幀的視頻）均有需求。必須報告*實際*吞吐量（在特定 DNN 上），而非「峰值 TOPS」。
-
-3. **延遲（Latency）** — 從輸入到輸出的時間。對互動式應用（自動駕駛、語音辨識）至關重要。有一個額外約束：需要小批次（small batch size），因為批次越大，吞吐量越高，但延遲也越高。
-
-4. **能耗與功率（Energy and Power）** — 嵌入式裝置的電池容量有限；資料中心的功率上限則受散熱成本制約。功率消耗限制了可以同時運行的最大 MAC 數量（熱包絡 thermal envelope）。
-
-5. **硬體成本（Hardware Cost）** — 晶片面積、製程技術及外部介面成本，共同決定售價。
-
-6. **靈活性（Flexibility）** — 可有效支援的 DNN 模型和任務範圍。由於 DNN 演算法設計者未必會使用特定模型，硬體必須能應對層形狀（layer shape）、精度（precision）和稀疏度（sparsity）的變化。
-
-7. **可擴展性（Scalability）** — 效能如何隨資源（PE 數量、記憶體頻寬）的增加而擴展。
-
-### 測量每項指標時需要附上的規格
-
-本講明確點出每項指標必須附帶的細節：
-
-- **準確率：** 指明資料集、任務難度和訓練程序。
-- **吞吐量：** 指明 PE 數量*及其利用率（utilization）*（不只是峰值），並報告特定 DNN 模型的運行時間。
-- **延遲：** 指明批次大小（batch size）。
-- **能耗／功率：** 報告運行特定 DNN 模型的功率，以及**片外記憶體存取（off-chip bandwidth）**。若不附頻寬數字，只做乘法器的晶片可以宣稱低晶片功率，但系統功率卻因 DRAM 存取而相當驚人。
-- **硬體成本：** 報告片上儲存容量、PE 數量、晶片面積及製程技術。
-- **靈活性：** 報告跨多種 DNN 模型的效能表現。
-
-![關鍵設計目標——吞吐量、延遲、能耗；PE 利用率與資料重用](../../assets/L03/L03-p45-key-design-objectives.png)
-
-### 評估流程：一個逐層篩選的閘道
-
-本講描述了評估一個 DNN 系統是否適合某項應用的自然順序：
-
-1. **準確率** 決定它能否*執行*該任務。
-2. **延遲與吞吐量** 決定它能否以*足夠快的速度*進行即時處理。
-3. **能耗與功率** 決定裝置的形態（手機、邊緣伺服器、資料中心）。
-4. **成本**（面積+介面）決定價格點。
-5. **靈活性** 決定它能服務的任務範圍。
-
-若缺少任何一項指標，都可能導致比較失真或結論無效。本講舉了兩個反面教材：(a) 不報告準確率就宣稱「低功率、高吞吐量」——若模型本身很簡單，這毫無意義；(b) 不報告片外頻寬就宣稱「低晶片功率」——這隱藏了系統層面的巨大能耗。
-
-### MLPerf：標準化基準測試
-
-MLPerf（首批結果於 2018 年 12 月發布，由 23 家企業和 7 所機構支持）是業界的對策：**一套涵蓋影像分類、物件偵測、翻譯、語音轉文字、推薦系統、情感分析和強化學習等多類 DNN 模型的廣泛基準套件**，作為評比硬體、軟體框架和雲端平台的共同標準。涵蓋訓練與推論、雲端與邊緣、封閉（closed）與開放（open）等多個組別。
-
-### 間接指標的警告
-
-本講在本章結尾明確警告：**參數量較少、MACs 較少，不能直接等同於更低的能耗或更低的延遲。** 濾波器形狀（filter shape）、批次大小和硬體映射都很重要。在特定硬體上，參數較少的模型有可能比參數較多的模型消耗更多能量，取決於資料流的安排方式。這正是本講要求使用直接指標而非代理計數的原因。
-
-> **為什麼重要：** 加速器論文中常常只挑一項指標展示。理解完整的指標套件——並知道每項指標必須附上哪些規格——對於做出公平比較以及設計真正能被部署的硬體至關重要。
+因此 L03 是「語言與測量」的講次。L05 與 L06 會問如何把 Einsum map 到硬體。L07 之後會問 sparsity、precision 與 specialized architectures 如何改變同一套成本模型。
 
 ---
 
-## 第三章 — Einsum 記法：DNN 運算的形式語言
+## 先備知識與心智模型
 
-> *投影片：Extended Einsums 2/37 … 18/37（實體頁 57–72）*
+你需要帶著三個觀念閱讀本章。
 
-### 什麼是 Einsum？為什麼要用它？
+第一，DNN layer 是 tensor computation。Tensor 是有命名維度的陣列，例如 channel、height、width、batch、sequence position 或 embedding dimension。
 
-DNN 加速器需要執行一組固定的代數運算——乘加（multiply-accumulate）、規約（reduction）、逐元素運算——但這些運算可以用許多不同的迴圈順序來表達，而不改變結果。為了能夠獨立於「怎麼計算（以什麼順序）」來推理「計算什麼」，本課程採用 **Einsum 記法（Einsum notation）**。
+第二，DNN accelerator 有 memory hierarchy。一個有用的簡化圖像是：
 
-Einsum 的形式如下：
-
-```
-Z_m,n = A_m,k × B_n,k
+```text
+DRAM -> global buffer / SRAM -> PE-local RF or registers -> MAC units
 ```
 
-這同時是一個張量聲明（Z 由 m 和 n 索引；A 由 m 和 k；B 由 n 和 k）和一條運算規則。**Einsum 的操作性定義（Operational Definition for Einsums, ODE）** 說明：
+資料離 MAC unit 越遠，通常需要越多 energy 與 latency。這是來自 memory slides 的硬體原理，不只是 software locality 口號。
 
-> 遍歷所有合法維度變數值所構成的空間（**迭代空間** iteration space）中的每個點。在每個點：以該點的維度變數值計算右側的值；將計算結果賦值（或規約累加）到左側運算元在其指定維度變數值處的位置。若左側運算元當前非零，則將值*規約（reduce，即累加）*進去。
+第三，許多 DNN 計算都是 reductions。Dot product、matrix multiplication、convolution、attention score 都會計算 products，然後沿著至少一個 rank 加總。Einsum 讓課程能乾淨地命名這些 ranks。
 
-![Einsum 範例 Z_m,n = A_m,k × B_n,k 及其操作性定義（ODE）](../../assets/L03/L03-p59-einsum-example-ode.png)
+本講的心智模型是：
 
-這個定義看似簡單，實則極為強大：它指定了*計算什麼*——數學關係——而不規定*以什麼順序*遍歷迭代空間。只要能訪問迭代空間中的每個點，任何遍歷順序都能得到相同的結果。
+```text
+mathematical layer -> Einsum -> possible loop orders -> memory traffic -> metrics
+```
 
-### 維度（rank）、維度名稱與維度形狀
+Einsum 固定數學合約。後續 mapping 會選擇 loop order 與 data placement。Metrics 告訴我們產生的系統是否有用。
 
-Einsum 使用精確的術語：
+---
 
-- **維度變數（rank variable）**（如 k、m）：迴圈索引。
-- **維度名稱（rank name）**（如「K」、「M」）：用於標記該維度的標籤。
-- **維度形狀（rank shape）**（如 K、M）：該維度的大小（範圍）。
+## 學習目標
 
-記法 `A^{K,M}_{k,m}` 表示張量 A 有維度名稱 K 和 M，維度變數 k 和 m 分別在 K 和 M 的範圍內取值。當給定具體值時（例如 `A^{K=X, M=X}_{k,m}`），兩個維度的大小均為 X。
+讀完本章後，你應該能夠：
 
-### Einsum 模式：一套分類法
+- 解釋為什麼大型記憶體通常比小型近端記憶體更慢、每次存取能耗更高。
+- 使用投影片中的 Horowitz table 比較 arithmetic、SRAM access 與 DRAM access 的能耗。
+- 定義 accuracy、throughput、latency、energy、power、hardware cost、flexibility、scalability 這些 accelerator metrics。
+- 解釋為什麼 weights 與 operation counts 是 proxy metrics，而不是 energy 或 latency 的直接測量。
+- 讀懂 Einsum，並指出 output ranks、input ranks 與 reduction ranks。
+- 將 Einsum 的 Operational Definition 理解為對 iteration space 的遍歷。
+- 透過 flattening ranks，把 fully connected layer 轉成 matrix-vector 或 matrix-matrix multiplication。
+- 解釋 Toeplitz/im2col 如何把 convolution 轉成 matrix multiplication，以及為什麼這個轉換會重複資料。
+- 追蹤 self-attention 從 $I$、$Q$、$K$、$V$ 到 $QK$、softmax、$A$、$AV$、$Z$ 的 cascade。
+- 解釋 $M \times M$ attention matrix 對硬體的影響。
+- 區分投影片直接陳述、paper/source-derived claims、standard background 與 teaching interpretation。
 
-本講逐一介紹了一套全面的 Einsum 模式。每一種 DNN 層都是這些模式之一：
+---
 
-![Einsum 模式——矩陣-矩陣乘、矩陣-向量乘、笛卡爾積、逐元素運算](../../assets/L03/L03-p63-einsum-patterns.png)
+## 1. 記憶體是第一級設計限制
 
-**收縮維度（contracted / reduced rank）：** 出現在右側但*不*出現在左側的維度變數。該維度被規約（求和）消去。在 `Z_{m,n} = A_{m,k} × B_{k,n}` 中，維度 k 是收縮維度。
+**來源錨點：** PDF 頁 2-19。能耗表在投影片中歸因於 Horowitz, ISSCC 2014。
 
-**非收縮維度（uncontracted rank）：** 出現在兩側的維度，在輸出中保留。
+### 直覺
 
-常見模式：
+記憶體不是被動容器，而是一個電路。記憶體越大，通常線越長、電容越大、周邊電路越多，每次存取能耗也越高。投影片用物理規則 $E = C V^2$ 表達這件事：在固定電壓下，電容越大，能量越高。
 
-| Einsum | 模式 | 備注 |
+這就是 memory hierarchy 存在的原因。我們把小、快、低能耗的 storage 放在 compute 附近，把大容量但較昂貴的 storage 放在遠處。
+
+### 精確意義
+
+本講比較四種 storage technologies。
+
+| Storage | 本講中的典型角色 | 優點 | 代價 |
+|---|---|---|---|
+| Latches / flip-flops | 很小的 local state、pipeline registers | 極低 latency，靠近 logic | 密度低，每 bit 需要很多 transistors |
+| SRAM | Register files、buffers、on-chip memories | On-chip、可重用、比 DRAM 快 | 面積比 DRAM 大；peripheral circuits 很重要 |
+| DRAM | Main memory，通常 off-chip | 容量大，每 bit 成本低 | 高 access energy 與 latency |
+| Flash | Persistent storage | 非揮發、密度高 | 寫入對 compute 使用來說昂貴且慢 |
+
+對 DNN 最重要的不是每個 accelerator 都必須有完全相同的階層，而是 capacity、latency、bandwidth、density、energy 彼此拉扯。Local buffer 只有在 computation 會在資料被 evict 前重用它時才有幫助。
+
+### 量化錨點
+
+投影片表格給出以下能耗：
+
+| Operation | Energy |
+|---|---:|
+| 8-bit add | 0.03 pJ |
+| 32-bit add | 0.1 pJ |
+| 32-bit floating-point add | 0.9 pJ |
+| 8-bit multiply | 0.2 pJ |
+| 32-bit multiply | 3.1 pJ |
+| 32-bit floating-point multiply | 3.7 pJ |
+| 32-bit SRAM read from an 8 kB SRAM | 5 pJ |
+| 32-bit DRAM read | 640 pJ |
+
+兩個比例值得仔細看：
+
+- 在這張表中，一次 32-bit DRAM read 是一次 32-bit SRAM read 的 $640 / 5 = 128$ 倍。
+- 在這張表中，一次 32-bit DRAM read 是一次 32-bit floating-point multiply 的 $640 / 3.7 \approx 173$ 倍。
+
+這些是特定技術脈絡下的投影片數值，不是普世常數。但它們足以支持架構方向：減少 large-memory traffic。
+
+### Worked example：一個被重用的 word 為什麼重要
+
+假設某個 weight 會被 16 次 MAC 使用。若系統每次 MAC 都從 DRAM 讀這個 weight，依 Horowitz table，這個 32-bit 值的 weight traffic 是 $16 \times 640 = 10{,}240$ pJ。
+
+若系統只從 DRAM 讀一次，然後把它留在 local storage，DRAM 部分是 $640$ pJ。即使每次 local reuse 都用類似 SRAM 的 $5$ pJ，16 次 local reads 也只是 $80$ pJ，總計 $720$ pJ。
+
+這個 toy example 不是完整 accelerator energy model。它故意忽略 address generation、interconnect、control 與 writes。它的目的只是展示 reuse opportunity 的量級。
+
+### 硬體意義
+
+Memory hierarchy 改變 mapping problem。若某個 loop order 讓 weight 在 PE-local register file 中被重用 16 次，它可能比另一個反覆 evict/refetch 同一 weight 的 loop order 便宜很多。Arithmetic 相同，traffic 不同。
+
+### 常見誤解
+
+**誤解：** Data movement 昂貴只是因為 DRAM 慢。
+
+**修正：** Latency 很重要，但 energy 也同樣核心。Large memories 與 off-chip links 具有高 capacitance。投影片先把 energy cost 連到 capacitance 與 voltage，再用 Horowitz table 顯示 memory movement 可以主導 arithmetic。
+
+---
+
+## 2. Efficient models 不會自動變成 efficient hardware
+
+**來源錨點：** PDF 頁 20-39。
+
+本講在 metrics 之前放了一段 efficient-CNN interlude。這不是離題，而是在鋪陳一個警告：model-design papers 常用 number of weights 與 number of operations 當作「complexity」，但這些只是 indirect metrics。
+
+### Model 端試圖減少什麼
+
+投影片列出幾種 CNN designer 降低表面 complexity 的做法：
+
+- 用堆疊的小 filters 取代一個大的 spatial filter，例如用兩個 $3 \times 3$ filters 取代一個 $5 \times 5$ filter。
+- 用 $1 \times 1$ bottleneck convolutions 在昂貴 layer 前降低 channel count。
+- 用 grouped 或 depthwise convolutions，讓每個 filter 只看一部分 channels。
+- 跨 layers reuse feature maps，例如 DenseNet-style connectivity。
+- 用 NAS 自動搜尋 architectures。
+
+MobileNet 投影片給了一個緊湊公式。Standard convolution 的 work 正比於 $H W C R S M$。Depthwise-separable 版本有 depthwise work $H W C R S$ 加上 pointwise work $H W C M$，所以 work 正比於 $H W C (R S + M)$。因此 standard-to-depthwise-separable MAC ratio 是：
+
+$$
+\frac{H W C R S M}{H W C (R S + M)} = \frac{R S M}{R S + M}.
+$$
+
+這是真實的 algorithmic reduction，來源錨點是 MobileNets 投影片。但投影片接著警告：operations 變少不會自動代表 latency 或 energy 變低。
+
+### 為什麼硬體答案更細
+
+Operation count 至少忽略五件硬體事實：
+
+- 減少後的 operation 是否還有足夠 parallelism 填滿 PE array。
+- 較小 tensors 是否仍保有良好 reuse。
+- grouped/depthwise layers 是否造成尷尬的 memory access patterns。
+- 是否出現 metadata、layout conversion 或 kernel launch overhead。
+- 硬體是為 dense GEMM-like work 設計，還是能處理許多小而不規則的 kernels。
+
+這是根據 PDF 頁 36-37 的投影片警告與頁 40-56 的 metrics section 所做的教學詮釋。投影片不是說 efficient CNN techniques 不好，而是說 algorithmic complexity 必須透過真實 mapping 與 measurement 連到 hardware cost。
+
+### 常見誤解
+
+**誤解：** 如果一個 model 有 50 倍更少 parameters，它就應該用 50 倍更少 energy。
+
+**修正：** Parameter count 估的是 weights 的 storage，但 energy 還取決於 activations、outputs、partial sums、reuse、memory level、data layout、utilization 與 batch size。後續 metrics 投影片用 AlexNet 與 SqueezeNet 作為警告：proxy metrics 可能誤導。
+
+---
+
+## 3. Evaluation Metrics：必須報告什麼
+
+**來源錨點：** PDF 頁 40-56。
+
+### 直覺
+
+一個 metric 只回答一個問題，不可能回答所有問題。
+
+例如，throughput 問「每秒處理多少 inputs？」Latency 問「單一 input 等多久？」Energy 問「每 joule 做多少工作？」Accuracy 問「結果是否有用？」一個系統可能贏其中一項，卻輸掉另一項。
+
+投影片用 ring oscillator 例子把這點講得很清楚：一個快速切換但不做有用 DNN inference 的電路，也能製造出看似很高的 TOPS/W。Peak arithmetic 除以 peak power 不夠。
+
+### 指標集合
+
+| Metric | 它問什麼 | 必須附上的脈絡 |
 |---|---|---|
-| `Z_{m,n} = A_{m,k} × B_{k,n}` | 矩陣-矩陣乘（matrix-matrix multiply） | k 被收縮 |
-| `Z_{m,n} = A_{k,m} × B_{k,n}` | 矩陣-矩陣乘 | 同上，維度順序無關緊要 |
-| `Z_m = A_{k,m} × B_k` | 矩陣-向量乘（matrix-vector multiply） | k 被收縮 |
-| `Z_{m,n} = A_m × B_n` | 笛卡爾積（Cartesian product） | 無收縮 |
-| `Z_m = A_m × B_m` | 逐元素乘（element-wise multiply） | 無收縮，無展開 |
-| `Z_m = A_m + B_m` | 逐元素加（element-wise addition） | 不同的運算子（非規約-乘） |
+| Accuracy | Model 是否解決任務？ | Dataset、task difficulty、training/evaluation procedure |
+| Throughput | 每秒完成多少 operations 或 inferences？ | 實際 model、PE count、utilization、batch size |
+| Latency | 從 input 到 output 多久？ | Batch size 與 end-to-end path |
+| Energy and power | 每次 inference 消耗多少 energy？執行時 power 多高？ | Model、memory traffic、off-chip bandwidth、measurement/simulation method |
+| Hardware cost | Implementation 多昂貴？ | Area、process node、on-chip storage、PE count、external interfaces |
+| Flexibility | 多少 workloads 能有效率地跑？ | Models、shapes、precisions、sparsity、layer types 的範圍 |
+| Scalability | 增加資源後會如何？ | Scaling variable 與 bottleneck，例如 PEs 或 memory bandwidth |
 
-注意：維度變數的*名稱*無關緊要——`Z_{p,q} = A_{p,r} × B_{q,r}` 依然是矩陣-矩陣乘。
+### Throughput、latency 與 batch size
 
-### 維度變數模式：元組、分割與展平
+Throughput 與 latency 相關，但不是同一件事。Batch size 64 可能提高 throughput，因為同一組 weights 可被更多 inputs reuse，但它也可能增加單一 input 的等待時間。因此投影片明確說 low latency 有額外限制：small batch size。
 
-本講進一步探討了兩種重要操作：
+### Energy 與 off-chip memory
 
-**分割（Partitioning）：** 一個維度 i 可以拆分為高階對 (i₁, i₀)，其中 `i = i₁ × I₀ + i₀`。這會增加一個維度。Einsum `Z_i = A_i × B_i` 在分割後變為 `Z_{i₁,i₀} = A_{i₁,i₀} × B_{i₁,i₀}`。
+Metrics 投影片特別強調 off-chip memory access。若 paper 只報 chip power，它可能把 accelerator core 外部的 DRAM traffic energy 藏起來。一個有很多 multipliers 但 local storage 不足的設計，可能在 chip 上看似便宜，卻把成本推給 memory system。
 
-**展平（Flattening，分割的逆操作）：** `Z_{(i₁,i₀)} = A_{(i₁,i₀)} × B_{(i₁,i₀)}`——元組維度變數可以視為單一坐標，其中 `ij = i × J + j`。這將兩個維度折疊為一個。
+### Worked example：operational intensity
 
-這兩種操作是**分塊（tiling）**的形式基礎（在 L05–L06 的映射講次中介紹）：分塊*就是*維度變數的分割，而在 Einsum 層面理解這一點，才能讓課程獨立於任何特定硬體地推理分塊問題。
+Operational intensity 常讀成 $\text{ops}/\text{byte}$。Metrics references 提到 Roofline paper；本章把這個概念當作標準背景使用。
 
-### 卷積作為 Einsum
+假設一個 tiny kernel 做 1024 次 MAC。這個 toy example 中把一次 MAC 算成一次 operation，且 kernel 從 DRAM 讀 2048 bytes，則 operational intensity 是：
 
-一維卷積 `O_q = I_{q+s} × F_s` 是所有卷積 Einsum 的原型。其關鍵特徵是**變數替換（change of variables）**：輸入索引與輸出索引和濾波器索引之間存在結構性關聯（二維情況下：`h = U×p + r`，`w = U×q + s`，其中 U 是步長）。這種結構性耦合在全連接層中並不存在，也是卷積略為特殊的原因。
+$$
+\text{OI} = \frac{1024\ \text{ops}}{2048\ \text{bytes}} = 0.5\ \text{ops/byte}.
+$$
 
-![卷積 Einsum——從一維卷積到包含步長關係的二維推廣](../../assets/L03/L03-p70-convolution-einsum.png)
+若另一個 loop order 透過 local reuse，讓同樣 1024 次 MAC 只需從 DRAM 讀 512 bytes，則：
 
-包含批次的完整二維卷積：
+$$
+\text{OI} = \frac{1024}{512} = 2\ \text{ops/byte}.
+$$
 
-```
-O_{n,m,p,q} = B_{m} + I_{n,c,(U×p+r),(U×q+s)} × F_{m,c,r,s}
-```
+Arithmetic 沒變，memory traffic 變了。較高 operational intensity 通常表示每個 fetched byte 支撐更多 computation，這正是 local reuse 想達成的事。
 
-其中 N = 批次大小、M = 輸出通道數、P×Q = 輸出空間維度、C = 輸入通道數、R×S = 濾波器大小。
+### Source bridge：MLPerf、Accelergy 與 AccelForge
 
-> **為什麼重要：** Einsum 是本課程的形式骨幹。TeAAL 框架中「Compute（運算）」層的含義，恰恰就是「正在被評估的 Einsum」。若沒有獨立於順序表達運算的方式，就不可能以有原則的方式討論映射（mapping）、分塊（tiling）或資料流（dataflow）。
+投影片指向三種 evaluation infrastructure。
 
----
+| Source/tool | 解決的問題 | 與 L03 的關係 |
+|---|---|---|
+| MLPerf | 跨 models 與 platforms 的 standardized benchmarking | 用共同 workloads 與 divisions 降低 cherry-picking |
+| Accelergy, Wu et al., ICCAD 2019 | Architecture-level energy estimation | 把 components 與 actions 連到 estimated energy |
+| AccelForge | DNN mapping 與 performance simulation | 產生可餵給 energy estimator 的 action counts |
 
-## 第四章 — 全連接層與卷積層的 Einsum
+本章把它們當作 source bridges，而不是完整 paper summaries。重點是：公平的 accelerator evaluation 需要 workload shape、architecture description、mapping、action counts 與 energy modeling，而不是 peak arithmetic alone。
 
-> *投影片：Kernel Computation 1 … 37（實體頁 73–109）*
+### 常見誤解
 
-### 全連接層：從巢套迴圈到矩陣乘法
+**誤解：** GOPS/W 就等於某個有用應用的 energy efficiency。
 
-**全連接（FC）層**計算 `O_m = I_{c,h,w} × F_{m,c,h,w}`（對輸入通道 c 和空間維度 h、w 求和）。Einsum 以無迴圈順序約束的方式捕捉這一計算。
-
-![展平 FC 的 Einsum——O_m = I_chw × F_{m,chw}，展示矩陣-向量結構](../../assets/L03/L03-p85-einsum-for-fc.png)
-
-本講明確示範了如何將其轉換為矩陣乘法：
-
-1. **展平**（C, H, W）維度為單一的 CHW 索引：`I_{c,h,w} → I_{chw}`，`F_{m,c,h,w} → F_{m,chw}`。
-2. Einsum 變為 `O_m = I_{chw} × F_{m,chw}`——這是一個**矩陣-向量乘**（在維度 chw 上規約）。
-3. 加入**N 個輸入的批次（batch）**：`O_{n,m} = I_{n,chw} × F_{m,chw}`——這是一個**矩陣-矩陣乘**。
-
-這正是 Lab 2 中的標準記法：`C_{m,n} = A_{m,k} × B_{k,n}`，在維度 k 上規約。Einsum 中維度的排列順序無關緊要；重要的是哪些維度被收縮。
-
-### 卷積：Toeplitz 變換與 im2col 技巧
-
-卷積也可以轉換為矩陣乘法——但需要一個結構性的中間步驟。
-
-對一維卷積 `O_q = I_{q+s} × F_s`，轉換分兩步：
-1. **Toeplitz 轉換（第一步）：** `T_{q,s} = I_{q+s}`——以偏移 `q+s` 對輸入進行索引，構建二維 Toeplitz 矩陣 T。
-2. **矩陣乘（第二步）：** `O_q = T_{q,s} × F_s`。
-
-關鍵觀察是 Toeplitz 矩陣包含**重複的資料**——輸入元素以移位一格的方式出現在多行中。PyTorch 等框架中的 im2col（image-to-column，影像轉列）變換做的正是這件事。
-
-對二維卷積，矩陣乘的維度為：
-
-```
-濾波器 [M × CRS] × 輸入_Toeplitz [CRS × PQN] = 輸出 [M × PQN]
-```
-
-其中 P = H−R+1，Q = W−S+1，N = 批次大小。
-
-![全卷積→矩陣乘（經由 Toeplitz）：M × CRS 乘以 CRS × PQN = M × PQN](../../assets/L03/L03-p107-conv-to-matmul.png)
-
-二維 Toeplitz 卷積 Einsum 為：
-
-```
-T_{q,p,s,r} = I_{p+r, q+s}              （Toeplitz 轉換）
-T_{qp,sr}   = T_{q,p,s,r}               （展平維度）
-O_{m,qp}    = T_{qp,sr} × F_{m,sr}      （矩陣乘）
-```
-
-因此，卷積 Einsum `O_{n,m,p,q} = I_{n,c,(U×p+r),(U×q+s)} × F_{m,c,r,s}` 在經過 Toeplitz/im2col 變換後，等同於矩陣-矩陣乘法——這正是 GPU 等矩陣乘法加速器能高效處理卷積的原因。
-
-> **為什麼重要：** FC 和 CONV 層轉換為矩陣乘法的過程，是 DNN 加速器可以圍繞通用矩陣乘法（GEMM，General Matrix Multiply）引擎構建的分析基礎。它也說明了計算同一矩陣乘法的方式*非常多*（許多有效的迴圈順序），而順序的選擇會影響每個記憶體層次上的資料搬移量。
+**修正：** GOPS/W 只有在 operations 是有用的、workload 被指明、utilization 被測量、accuracy 被保留、memory-system energy 被納入時才有意義。否則很容易最佳化一個 ratio，而不是最佳化 application。
 
 ---
 
-## 第五章 — Transformer 自注意力的 Einsum 表達
+## 4. Einsum：Tensor computation 的合約
 
-> *投影片：Attention Einsums 20/37 … 37/37（實體頁 110–127）*
+**來源錨點：** PDF 頁 57-72。
 
-### Transformer 編碼器（Encoder）的整體結構
+### 直覺
 
-Transformer 編碼器在兩個子層之間交替：**自注意力（self-attention）**（帶 Add+Norm 殘差）和**前饋網路（feed-forward）**（帶 Add+Norm 殘差）。本講聚焦於自注意力子層。
+Einsum 把兩個問題分開：
 
-![Transformer 編碼器整體結構——自注意力 → Add+Norm → 前饋 → Add+Norm](../../assets/L03/L03-p113-encoder-structure.png)
+- 哪些值必須被 multiplied、added 或 otherwise combined？
+- 機器應該用什麼順序執行這些 operations？
 
-編碼器是一個 Einsum 的串聯（cascade）。本講為每個步驟確定了對應的 Einsum、維度變數名稱及張量維度。
+第一個問題是 Einsum。第二個問題是 mapping。
 
-### 基本自注意力的計算圖
+例如 $Z_{m,n} = A_{m,k} B_{n,k}$ 表示每個 output element $Z_{m,n}$ 都會沿著 $k$ 加總 products。它沒有說 $m$、$n$ 或 $k$ 哪個 loop 先跑，也沒有說 $m$ 與 $n$ 是否要 parallelize。
 
-一個自注意力區塊的資料流（單頭、無批次）包含八個步驟，每個都可表達為 Einsum：
+### Einsum 的 Operational Definition
 
-![基本自注意力編碼器計算——I → Q、K、V → QK × softmax → AV → Z](../../assets/L03/L03-p114-self-attention-computation.png)
+投影片用 operational definition 定義 Einsum：
 
-**第一步 — 輸入嵌入（Input Embedding，僅第一層）：**
+1. 遍歷 rank variables 的所有合法值。這個集合就是 **iteration space**。
+2. 在每個點，用該點的 rank-variable values 計算 right-hand side。
+3. 將結果 assign 到 left-hand-side tensor。
+4. 如果 target location 已經有值，就 reduce 進去，通常是加總。
 
-```
-I_{m,d} = IR_{m,c} × W^I_{c,d}
-```
+以 $Z_{m,n} = A_{m,k} B_{n,k}$ 來說，合法點是 triples $(m,n,k)$。Output location 由 $(m,n)$ 識別。因為 $k$ 只出現在 right-hand side，多個 iteration points 會貢獻到同一個 $Z_{m,n}$，所以 $k$ 是 reduction rank。
 
-將原始 one-hot 輸入 IR（序列長度 M、詞彙量大小 C）轉換為大小為 d_model（D）的稠密嵌入 I。
+### 精確詞彙
 
-**第二步 — 投影為查詢（Query, Q）和鍵（Key, K）：**
-
-```
-Q_{m,e} = I_{m,d} × W^Q_{d,e}
-K_{m,e} = I_{m,d} × W^K_{d,e}
-```
-
-將輸入 I 從 D 空間投影到 E 空間（dk 維度），分別形成 Q 和 K。
-
-**第三步 — QK 乘積（softmax 前的注意力分數）：**
-
-```
-QK_{m,p} = Q_{p,e} × K_{m,e}    （在維度 E 上規約）
-```
-
-M 和 P 都是序列長度的別名；QK 是 M×M 的注意力 logit 矩陣。
-
-**第四步 — Softmax：**
-
-```
-SN_{m,p} = exp(QK_{m,p})
-SD_p      = Σ_m SN_{m,p}
-A_{m,p}   = SN_{m,p} / SD_p
-```
-
-Softmax 不是嚴格的 Einsum（涉及指數和除法），但其中的求和步驟符合 Einsum 框架。
-
-**第五步 — 投影為值（Value, V）：**
-
-```
-V_{m,f} = I_{m,d} × W^V_{d,f}
-```
-
-將 I 從 D 空間投影到 F 空間（dv 維度）。
-
-**第六步 — AV 乘積：**
-
-```
-AV_{p,f} = A_{m,p} × V_{m,f}    （在維度 M 上規約）
-```
-
-**第七步 — 輸出投影：**
-
-```
-Z_{p,g} = AV_{p,f} × W^Z_{f,g}
-```
-
-從 F 空間投影到 G 空間（通常與 D 相同）。
-
-### 維度字典
-
-本講提供了一份名稱對維度的明確對照表：
-
-| 維度 | 含義 |
+| Term | Meaning |
 |---|---|
-| M | 序列長度（自注意力中 Q、K、V 共用） |
-| P | 序列長度的別名（用於 QK 乘積的輸出維度） |
-| R | 交叉注意力（cross-attention）中查詢的序列長度 |
-| C | 詞典大小（vocabulary size） |
-| D | 全局輸入嵌入維度（d_model） |
-| E | Q 和 K 的局部嵌入維度（dk） |
-| F | V 的局部嵌入維度（dv） |
-| G | 輸出嵌入維度 |
-| B | 批次大小 |
+| Rank variable | Einsum 中的 index，例如 $m$、$n$、$k$ |
+| Rank name | 維度標籤，例如 $M$、$N$、$K$ |
+| Rank shape | 維度大小，例如 $M=64$ |
+| Uncontracted rank | 出現在左右兩側的 rank；保留在 output 中 |
+| Contracted rank | 出現在 right-hand side 但不在 left-hand side；會被 reduction |
+| Iteration space | 所有 rank-variable ranges 的 Cartesian product |
 
-### 批次化與多頭注意力
+### 常見模式
 
-加入**批次維度 B** 只需在每個張量前加上 B：所有 Einsum 增加一個索引 b，矩陣乘法變為批次矩陣乘（batched matrix multiplication）。
+| Einsum | 讀法 | Reduced rank |
+|---|---|---|
+| $Z_{m,n} = A_{m,k} B_{k,n}$ | Matrix-matrix multiply | $k$ |
+| $Z_m = A_{k,m} B_k$ | Matrix-vector multiply | $k$ |
+| $Z_{m,n} = A_m B_n$ | Cartesian product | 無 |
+| $Z_m = A_m B_m$ | Element-wise multiply | 無 |
+| $Z_m = A_m + B_m$ | Element-wise addition | 無 |
 
-**多頭注意力（multi-headed attention）**（H 個注意力頭）在權重張量中加入維度 H：
+Variables 的名字本身不特殊。$Z_{p,q} = A_{p,r} B_{q,r}$ 仍是 matrix-matrix-style contraction，因為 $r$ 被 reduce，$p,q$ 被保留。
 
-```
-K_{b,h,m,e} = I_{b,m,d} × W^K_{d,h,e}
-Q_{b,h,m,e} = I_{b,m,d} × W^Q_{d,h,e}
-V_{b,h,m,f} = I_{b,m,d} × W^V_{d,h,f}
-QK_{b,h,m,p} = Q_{b,h,p,e} × K_{b,h,m,e}
-AV_{b,h,p,f} = A_{b,h,m,p} × V_{b,h,m,f}
-```
+### Partitioning 與 flattening
 
-所有注意力頭計算出各自的 AV 之後，透過**拼接並展平**步驟將 H×F 維度合併為單一的 G=H×F 維度：
+投影片介紹 rank split：若 $i = i_1 I_0 + i_0$，一個原始 rank $i$ 可以用兩個 ranks $(i_1,i_0)$ 表示。這就是 partitioning。
 
-```
-C_{b,p,h×F} = AV_{b,h,p,f}     （重塑／展平）
-Z_{b,p,d}   = C_{b,p,f} × W^Z_{g,d}
-```
+Flattening 是反向操作。一對 $(i_1,i_0)$ 可以被視為一個 flattened coordinate $i$。這很重要，因為後續講次會把 tiling 描述成 rank partitioning，而不是 ad hoc code trick。
 
-![多頭注意力的 Einsum——完整串聯，含 B、H、M、E、F、G 等維度](../../assets/L03/L03-p127-multi-headed-attention.png)
+### Worked example：讀一個 Einsum
 
-### 完整串聯一覽
+考慮：
 
-一個注意力層的完整 Einsum 集合：
+$$
+Y_{b,m} = X_{b,k} W_{m,k}.
+$$
 
-![一次完整自注意力計算的 Einsum 全串聯](../../assets/L03/L03-p125-full-cascade.png)
+Rank variables 是 $b$、$m$、$k$。Output ranks 是 $b$ 與 $m$。Rank $k$ 只出現在 right-hand side，所以它被 reduce。若 $B=2$、$M=3$、$K=4$，iteration space 有 $2 \times 3 \times 4 = 24$ 個點，output 有 $2 \times 3 = 6$ 個 elements。每個 output element 累加 4 個 products。
 
-每個步驟的核心都是矩陣乘法：投影步驟是 M×D 乘以 D×E；QK 是 M×E 乘以 M×E 的轉置 = M×M；AV 是 M×M 乘以 M×F = M×F。Transformer 在計算上是一連串矩陣乘法的串聯，中間插入了一個非線性的 softmax。
+### 硬體意義
 
-> **為什麼重要：** 把 Transformer 自注意力表達為 Einsum，賦予了加速器設計者與對卷積工作負載（L04）相同的形式化工具。這是後續把 Transformer 層映射到硬體上（L05–L06）、針對稀疏或近似計算優化注意力（L07–L10）、以及設計注意力專屬加速器（各專題項目）的前提。它也清晰地揭示了 QK 乘積會產生 O(M²) 的中間張量——這正是標準注意力的二次方（quadratic）計算成本的根源。
+Einsum 讓硬體架構師可以用 workload-independent 的方式討論 data reuse。若 $k$ 是 reduced，left-hand-side tensor 的 partial sums 必須被累加。若 $m$ 或 $n$ 是 uncontracted，這些 ranks 可能暴露 parallel output elements。若某個 rank 被 partition，tile size 可以選到符合 buffer capacity。
+
+### 常見誤解
+
+**誤解：** Einsum 只是矩陣乘法的短記法。
+
+**修正：** Matrix multiplication 只是其中一個 Einsum pattern。這個記法更廣：它描述 tensor contractions、element-wise operations、Cartesian products、convolution index relationships 與 attention projections，而且不預先承諾 loop order。
 
 ---
 
-## 獨立學習指南（Standalone Study Guide）
+## 5. Fully connected 與 convolution layers 作為 matrix multiplication
 
-### 進入下一講前必須掌握
+**來源錨點：** PDF 頁 73-109。
 
-- 將記憶體階層解釋為容量、頻寬與能耗之間的取捨。
-- 區分延遲、吞吐量、利用率、能效、面積效率與準確度影響。
-- 把 Einsum 作為 FC、CONV 與 attention 的共同表示法。
-- 追蹤 self-attention 從 input embeddings 到 Q/K/V、score、softmax、value mixing 與 output projection 的完整串接。
+### Fully connected layer
+
+Fully connected layer 可以看成 filter 覆蓋整個 input spatial extent 的 convolution。投影片方程式是：
+
+$$
+O_m = I_{c,h,w} F_{m,c,h,w}.
+$$
+
+重複的 ranks $c,h,w$ 會被 reduce。若要把它轉成 matrix-vector multiply，可將 $(c,h,w)$ flatten 成單一 rank $chw$：
+
+$$
+O_m = I_{chw} F_{m,chw}.
+$$
+
+加入 batch size $N$ 後，input 多了 batch rank $n$：
+
+$$
+O_{n,m} = I_{n,chw} F_{m,chw}.
+$$
+
+這就是 Einsum 形式的 matrix-matrix multiplication。Output 有 ranks $(n,m)$，而 $chw$ 是 reduction rank。
+
+### 為什麼 flattening 不只是記法
+
+Flattening 改變我們看待 memory layout 的方式。若 tensor 的儲存方式讓連續的 $chw$ elements 彼此 contiguous，matrix-vector view 可以很有效率。若 layout 不合，硬體可能需要 strided accesses 或 layout conversion。數學 contraction 相同，但 memory behavior 可能不同。
+
+### Convolution 與 Toeplitz/im2col
+
+對 1-D convolution：
+
+$$
+O_q = I_{q+s} F_s.
+$$
+
+Input index 不是單純的 $q$ 或 $s$，而是 $q+s$。這種 coupling 是 convolution 與普通 matrix multiplication 的差異。
+
+投影片把轉換拆成兩步：
+
+$$
+T_{q,s} = I_{q+s}
+$$
+
+然後：
+
+$$
+O_q = T_{q,s} F_s.
+$$
+
+第一步建立由 shifted input windows 組成的 Toeplitz/im2col matrix。第二步是 matrix multiplication。
+
+對有 batch 的 2-D convolution，投影片陳述的 matrix dimensions 是：
+
+$$
+\text{Filters }[M \times C R S] \times \text{Input-Toeplitz }[C R S \times P Q N] = \text{Output }[M \times P Q N],
+$$
+
+其中在投影片顯示的 no-padding、unit-stride 情況下，$P = H - R + 1$ 且 $Q = W - S + 1$。
+
+### Worked example：tiny 1-D Toeplitz conversion
+
+令 input 為 $I=[1,2,3,4,5]$，filter 為 $F=[a,b,c]$。Valid 1-D convolution 有三個 output positions：
+
+$$
+O_0 = 1a + 2b + 3c,
+$$
+
+$$
+O_1 = 2a + 3b + 4c,
+$$
+
+$$
+O_2 = 3a + 4b + 5c.
+$$
+
+Toeplitz matrix 是：
+
+```text
+T = [1 2 3
+     2 3 4
+     3 4 5]
+```
+
+於是 $O = T F$。重要的硬體觀察是 input values 會在 $T$ 中重複。值 3 出現在三個 windows。Materializing $T$ 會讓 operation 看起來像 GEMM，但若 implementation 真的寫出所有重複 entries，memory traffic 可能增加。
+
+### 硬體意義
+
+這個轉換解釋了為什麼 GEMM engines 可以跑 FC 與 CONV layers。它也揭示一個取捨：im2col 可以產生規則的 matrix multiplication，但規則性可能來自 data duplication。後續 mapping lectures 會問 accelerator 能否不完整 materialize Toeplitz matrix，也能 exploit convolutional reuse。
+
+### 常見誤解
+
+**誤解：** 既然 convolution 可以轉成 matrix multiplication，convolution hardware 只需要 generic GEMM block。
+
+**修正：** GEMM 是強大的 abstraction，但轉換可能複製 input data 並改變 memory traffic。Convolution-aware mapping 可以直接利用 overlap；naive im2col implementation 則可能花能量搬重複資料。
+
+---
+
+## 6. Transformer self-attention 作為 Einsums
+
+**來源錨點：** PDF 頁 110-127。
+
+### 心智模型
+
+Self-attention 接收長度為 $M$ 的 token sequence。每個 token 一開始是維度 $D$ 的 embedding vector。這個 block 計算三種 projections：
+
+- Query $Q$：這個位置想找什麼。
+- Key $K$：每個位置提供什麼可被匹配的特徵。
+- Value $V$：若被 attend 到，每個位置貢獻什麼資訊。
+
+Query position 與 key position 的 attention score 來自 dot product。Softmax 把 scores 轉成 weights。Value vectors 依這些 weights 混合。最後 output projection 把結果轉回 model embedding space。
+
+### Rank dictionary
+
+| Rank | Meaning |
+|---|---|
+| $M$ | Keys、values 與 self-attention positions 的 sequence length |
+| $P$ | 投影片用於 query/output position 的 sequence-length alias |
+| $R$ | Non-self-attention 中的 query sequence length |
+| $C$ | Vocabulary size |
+| $D$ | Input/global embedding dimension，常稱 $d_{\text{model}}$ |
+| $E$ | Query/key projection dimension，常稱 $d_k$ |
+| $F$ | Value projection dimension，常稱 $d_v$ |
+| $G$ | Output embedding dimension |
+| $B$ | Batch size |
+| $H$ | Number of attention heads |
+
+投影片用 $M$ 與 $P$ 作為 sequence length 的 aliases，讓 attention matrix 的兩個 axes 可以分開命名。
+
+### Single-head attention cascade
+
+只有第一層需要把 raw one-hot input $IR$ embedding 起來：
+
+$$
+I_{m,d} = IR_{m,c} W^I_{c,d}.
+$$
+
+接著 input 被投影到 key、query、value spaces：
+
+$$
+K_{m,e} = I_{m,d} W^K_{d,e},
+$$
+
+$$
+Q_{m,e} = I_{m,d} W^Q_{d,e},
+$$
+
+$$
+V_{m,f} = I_{m,d} W^V_{d,f}.
+$$
+
+Softmax 前的 score matrix 是：
+
+$$
+QK_{m,p} = Q_{p,e} K_{m,e}.
+$$
+
+這裡 $e$ 被 reduce。對每個 query position $p$，score 會把該 query 與每個 key position $m$ 比較。投影片註明某些 constant scaling steps 沒畫出來，因此本章不把 scaling 當作投影片陳述的方程式處理。
+
+投影片 convention 下的 softmax components 是：
+
+$$
+SN_{m,p} = \exp(QK_{m,p}),
+$$
+
+$$
+SD_p = \sum_m SN_{m,p},
+$$
+
+$$
+A_{m,p} = SN_{m,p} / SD_p.
+$$
+
+接著 values 被混合：
+
+$$
+AV_{p,f} = A_{m,p} V_{m,f}.
+$$
+
+最後 output projection 是：
+
+$$
+Z_{p,g} = AV_{p,f} W^Z_{f,g}.
+$$
+
+### Worked example：attention shapes
+
+假設 single head、無 batch，$M=4$、$D=8$、$E=2$、$F=3$。
+
+| Tensor | Shape | 原因 |
+|---|---|---|
+| $I$ | $4 \times 8$ | 四個 tokens，每個是八維 embedding |
+| $W^Q$ 與 $W^K$ | $8 \times 2$ | 從 $D$ 投影到 $E$ |
+| $Q$ 與 $K$ | $4 \times 2$ | 每個 token 一個 2-D query/key vector |
+| $QK$ | $4 \times 4$ | 每個 query position 都與每個 key position 比較 |
+| $W^V$ | $8 \times 3$ | 從 $D$ 投影到 $F$ |
+| $V$ | $4 \times 3$ | 每個 token 一個 value vector |
+| $AV$ | $4 \times 3$ | 每個 query position 一個 mixed value vector |
+
+Quadratic tensor 是 $QK$ 或 $A$：此例有 $M^2 = 16$ 個 entries。若 $M$ 加倍，這個 intermediate 約成長 4 倍，還沒算 batch 或 heads。
+
+### Batched 與 multi-headed attention
+
+Batching 加入 rank $b$：
+
+$$
+QK_{b,m,p} = Q_{b,p,e} K_{b,m,e}.
+$$
+
+Multi-headed attention 加入 head rank $h$：
+
+$$
+QK_{b,h,m,p} = Q_{b,h,p,e} K_{b,h,m,e}.
+$$
+
+每個 head 產生 $AV_{b,h,p,f}$。接著 head 與 value dimensions 會 concat 或 flatten，再做 output projection。依投影片 convention：
+
+$$
+C_{b,p,hF+f} = AV_{b,h,p,f},
+$$
+
+再接 output projection，例如：
+
+$$
+Z_{b,p,d} = C_{b,p,g} W^Z_{g,d}.
+$$
+
+### 硬體意義
+
+Attention block 裡有兩種不同成本型態。Projection layers 很像 GEMM，成本大致隨 $M D E$、$M D F$、$M F G$ 成長。Attention score 與 value-mixing steps 則會產生與消耗形狀受 $M^2$ 控制的 tensors。這表示即使 embedding dimensions 中等，sequence length 也可能主導 memory capacity 與 bandwidth。
+
+硬體問題因此不只是「accelerator 能不能做 matrix multiplication？」還包括「它是否 materialize $M \times M$ attention matrix？這個 matrix 存在哪一層？softmax 能否與前後 operations fusion？」
+
+### 常見誤解
+
+**誤解：** Transformer attention 與 CNN 所用的 tensor computations 完全不同。
+
+**修正：** Data dependencies 不同，但本講把 attention 表達成與 FC/CONV 相同的 Einsum cascade。新的挑戰是 intermediates 的 shape 與 lifetime，尤其是 $M \times M$ attention matrix 與 softmax normalization。
+
+---
+
+## 7. 關鍵方程式與閱讀方式
+
+### Energy ratio
+
+$$
+\frac{E_{\text{DRAM read, 32b}}}{E_{\text{FP multiply, 32b}}} = \frac{640}{3.7} \approx 173.
+$$
+
+這要讀成「減少 DRAM access 的來源錨定動機」，不是 universal technology constant。
+
+### Operational intensity
+
+$$
+\text{Operational intensity} = \frac{\text{operations}}{\text{bytes moved from the measured memory level}}.
+$$
+
+Denominator 必須被指明。DRAM operational intensity 與 SRAM operational intensity 是不同測量。
+
+### Matrix multiplication Einsum
+
+$$
+Z_{m,n} = A_{m,k} B_{k,n}.
+$$
+
+Ranks $m$ 與 $n$ 保留在 output。Rank $k$ 被 reduce。Mapping 可以用許多合法 loop orders 執行它。
+
+### Fully connected layer
+
+$$
+O_m = I_{c,h,w} F_{m,c,h,w}
+$$
+
+變成：
+
+$$
+O_m = I_{chw} F_{m,chw}.
+$$
+
+Flattening 把 input dimensions 變成一個 reduction rank。
+
+### Convolution
+
+$$
+O_{n,m,p,q} = I_{n,c,U p + r,U q + s} F_{m,c,r,s}.
+$$
+
+Ranks $c,r,s$ 被 reduce。Output ranks $n,m,p,q$ 保留。Input spatial coordinates 由 output location 與 filter offset 推導而來。
+
+### Attention score
+
+$$
+QK_{m,p} = Q_{p,e} K_{m,e}.
+$$
+
+Rank $e$ 被 reduce。結果比較每個 query position $p$ 與每個 key position $m$。
+
+---
+
+## 8. 硬體意義
+
+- **Energy：** DRAM traffic 可能主導 arithmetic energy；local reuse 是第一級設計目標。
+- **Bandwidth：** PE array 要達到 peak throughput，memory system 必須夠快供應 operands。
+- **Latency：** Batching 可能改善 throughput 但傷害 latency；low-latency applications 需要 small-batch evaluation。
+- **Area：** 更多 local SRAM/RF 可降低 traffic，但會消耗 area；若 array 太大，access energy 也可能提高。
+- **Utilization：** Depthwise convolution 這類 model shapes 可能減少 MACs，但也可能減少固定 array 可利用的 dense parallel work。
+- **Interconnect：** Tensor contractions 建立 producer-consumer relationships；intermediates 存在哪一層會決定 network traffic。
+- **Correctness：** Einsum reductions 需要正確累加。改變 loop order 只有在 reduction semantics 被保留時才合法。
+- **Programmability：** Flexible hardware 必須處理 CNNs、FC layers、attention、varying precision、sparsity 與 layer shapes。
+
+---
+
+## 9. 常見誤解
+
+### 誤解：Data movement 是 compute 之後的次要細節。
+
+在 accelerator design 中，compute 與 movement 不能分開。投影片的能耗表顯示，一次 DRAM read 可能比一次 multiply 貴好幾個數量級。
+
+### 誤解：MACs 更少一定代表 latency 更低。
+
+MACs 更少只有在 hardware bottleneck 是 arithmetic，而且剩餘工作能良好 map 到硬體時才會有比例效果。若 bottleneck 是 memory bandwidth、layout conversion、synchronization 或 poor utilization，latency 不一定等比例下降。
+
+### 誤解：Accuracy 是 algorithm metric，不是 hardware metric。
+
+Hardware choices 會限制 precision、sparsity support、model size 與 memory capacity。若這些選擇改變 model 或 numerical behavior，accuracy 就必須納入 evaluation。
+
+### 誤解：Einsum 告訴 accelerator 該如何跑 loops。
+
+Einsum 告訴我們要算什麼。Mapping 才選擇 loop order、tiling、storage placement 與 parallelism。
+
+### 誤解：im2col 總是有效率，因為它把 convolution 變成 GEMM。
+
+im2col 暴露規則的 GEMM structure，但可能複製 input data。有效率的 implementations 常避免 materialize 完整 expanded matrix。
+
+### 誤解：Attention 只需要 matrix multiplication acceleration。
+
+Matrix multiplication 很核心，但 $M \times M$ score/attention matrix、softmax、memory capacity 與 fusion opportunities 同樣重要。
+
+---
+
+## 10. 重點回顧（Takeaways）
+
+- 投影片的 Horowitz table 給出 32-bit DRAM read = 640 pJ、32-bit floating-point multiply = 3.7 pJ，這是 data-movement-aware design 的主要動機。
+- Memory hierarchy 存在，是因為沒有一種 memory 可以同時大、快、高密度、便宜、低能耗。
+- Efficient model techniques 降低 weights 與 OPs 這些 proxy costs，但硬體效率取決於 mapping、locality、utilization 與 memory traffic。
+- 公平的 accelerator evaluation 需要 accuracy、throughput、latency、energy、power、cost、flexibility、scalability，且每個 metric 必須附足夠脈絡。
+- Einsum 是本課程對 tensor computations 的 mathematical contract。它固定 output、input 與 reduction ranks，但不固定 loop order。
+- FC layers 透過 flattening ranks 與加入 batch 變成 matrix-vector 或 matrix-matrix multiplication。
+- Convolution 透過 Toeplitz/im2col conversion 變成 matrix multiplication，但這個轉換可能重複資料。
+- Transformer self-attention 是一串 Einsum cascade，且含有 $M \times M$ attention intermediate。
+
+---
+
+## 11. 與前後講次的連結（Connections）
+
+- **L01：** L01 的 accelerator motivation 在這裡透過 memory energy 與 evaluation metrics 變成量化論點。
+- **L02：** CNN layer shapes 與 efficient model designs 在 L03 重新出現，用來說明 proxy metrics 可能誤導。
+- **L04：** Einsum formalism 會成為描述更多 DNN operations 與 tensor transformations 的基礎。
+- **L05-L06：** Mapping 以 Einsum 作為 input，選擇 loop order、partitioning、data placement 與 parallelism。
+- **Sparsity lectures：** Sparsity 改變的是同一個 Einsum framework 內部的 tensors，但會增加 metadata、irregularity 與 load-balancing issues。
+- **Precision lectures：** Bit width 會改變 arithmetic energy 與 storage traffic，但必須連同 accuracy 與 system metrics 評估。
+- **Attention accelerators：** 本章 attention equations 解釋為什麼後續系統會嘗試 fusion 或避免 materialize $QK$ 與 $A$。
+
+---
+
+## 12. 來源橋接（Source Bridge）
+
+### Paper Bridge: Computing's Energy Problem
+
+**Bibliographic identity：** Mark Horowitz，*Computing's Energy Problem (and what we can do about it)*，ISSCC 2014。Local PDF：`papers/L07_ComputingsEnergyProblem_Horowitz_ISSCC2014.pdf`。
+
+**Problem addressed：** Technology scaling 已無法自動提供足夠 energy improvement。本文問的是：當 power/energy 成為一級限制時，computing systems 要如何繼續改善？
+
+**Core idea：** 高 energy efficiency 需要 low-energy operations 與 **extreme locality**。Paper 強調 memory-system energy 可能壓過 efficient computation，而 specialization 在能減少 movement 與 overhead 時有價值。
+
+**Relevance to L03：** 這是本講 memory-vs-compute argument 的 paper-level 支撐。它說明為什麼 L03 把 memory hierarchy、action counts 與 operational intensity 當作架構概念，而不是帳務細節。
+
+**Key claims used in this chapter：**
+
+- DRAM accesses 比 internal cache accesses 或 simple functional operations 貴數個數量級。來源：Section 5, "Don't Forget the Memory Energy"。
+- Figure 1.1.9 給出 operations 與 memory accesses 的 rough energy costs；lecture energy table 是這個概念的投影片呈現。
+- 高 energy efficiency 需要 data locality，讓一次昂貴 memory access 支援多次 operations。來源：Sections 5-6。
+
+**What students should remember：** Memory hierarchy 不是次要細節；它正是 DNN accelerators 重視 reuse、tiling、dataflow 的原因。
+
+**Limitations and assumptions：** 數值 energy values 具 technology specificity。它們應作為 order-of-magnitude motivation，而不是 universal constants。
+
+### Paper Bridge: AlexNet
+
+**Bibliographic identity：** Alex Krizhevsky、Ilya Sutskever、Geoffrey Hinton，*ImageNet Classification with Deep Convolutional Neural Networks*，NeurIPS 2012。Local PDF：`papers/L03_AlexNet_Krizhevsky_NeurIPS2012.pdf`。
+
+**Problem addressed：** 在 ImageNet-scale data 上訓練大型 supervised CNN；其 model capacity 與 computation 都超過早期小型 CNN examples。
+
+**Core idea：** 結合大型 convolutional/fully connected layers、ReLU activations、GPU implementation、data augmentation 與 dropout，使 deep CNN 能在 ImageNet scale 上訓練。
+
+**Relevance to L03：** AlexNet 把「DNN 是 tensor program」連到「DNN 是 hardware workload」。它展示 convolution、FC layers、memory capacity、GPU parallelism 與 regularization 如何同時影響設計。
+
+**Key claims used in this chapter：**
+
+- Model 有八個 learned layers 與約 60M parameters。來源：Abstract 與 Section 3.5。
+- Paper 明確討論 GPU memory limits 與 two GTX 580 GPUs training。來源：Introduction 與 Section 3.2。
+- ReLU 用來比 saturating nonlinearities 更快訓練。來源：Section 3.1。
+- Dropout 用於降低 FC layers overfitting。來源：Section 4。
+
+**What students should remember：** AlexNet 不只是「一個 CNN」。它是 dataset scale、model size、GPU memory 與 implementation choices 一起塑造 architecture 的早期例子。
+
+**Limitations and assumptions：** AlexNet 架構具有歷史重要性，但後來模型改變了 accuracy/efficiency tradeoff。本章把它當作 workload history 與 hardware motivation，不當作現代建議設計。
+
+### Paper Bridge: Deep Residual Learning
+
+**Bibliographic identity：** Kaiming He、Xiangyu Zhang、Shaoqing Ren、Jian Sun，*Deep Residual Learning for Image Recognition*，CVPR 2016。Local PDF：`papers/L03_ResNet_He_CVPR2016.pdf`。
+
+**Problem addressed：** 單純讓 plain networks 更深可能讓 optimization 變差；paper 稱之為 **degradation problem**，且不只是 overfitting。
+
+**Core idea：** 學 residual function $F(x)=H(x)-x$，再透過 shortcut 把 input 加回來，使 block 計算 $F(x)+x$。Identity shortcuts 讓 very deep networks 學 identity mapping 附近的 perturbations。
+
+**Relevance to L03：** ResNet 支撐本章警告：model complexity 不能只化約成 layer count 或 MAC count。Graph structure 會引入 elementwise additions 與 skip paths，進而影響 memory traffic、buffering 與 fusion。
+
+**Key claims used in this chapter：**
+
+- Degradation problem 於 Introduction 引入。來源：Section 1。
+- Residual formulation $F(x)+x$ 與 identity shortcut 在 residual-learning section 定義。來源：Section 3。
+- Paper 報告 18/34-layer comparisons 與 deeper bottleneck ResNets。來源：Tables 1-4。
+
+**What students should remember：** Skip connections 數學上簡單，但硬體上可見：tensor 必須被保存或重新載入以供後續 addition 使用。
+
+**Limitations and assumptions：** L03 不把 ResNet accuracy numbers 當作 current benchmark claims；它使用 paper 來解釋現代 layer graph 為何包含 non-chain data dependencies。
+
+### Paper Bridge: MobileNets
+
+**Bibliographic identity：** Andrew Howard et al.，*MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications*，2017。Local PDF：`papers/L03_MobileNet_Howard_2017.pdf`。
+
+**Problem addressed：** Mobile 與 embedded systems 需要 computation 與 model size 較低、但仍保有實用 accuracy 的 CNNs。
+
+**Core idea：** 用 **depthwise separable convolution** 取代 standard convolution：每個 input channel 各自做 depthwise spatial filter，接著用 $1 \times 1$ pointwise convolution 混合 channels。Paper 也引入 width multiplier 與 resolution multiplier。
+
+**Relevance to L03：** MobileNet 是本章 efficient-CNN warning 的 paper 支撐：減少 MACs 很有用，但 hardware 還要看 work 被移到哪裡。在 MobileNet 中，許多 computation 轉移到 dense $1 \times 1$ convolution，具有不同 reuse 與 bandwidth behavior。
+
+**Key claims used in this chapter：**
+
+- Standard convolution cost 在 paper notation 中是 $D_K^2 M N D_F^2$。來源：Section 3.1。
+- Depthwise separable convolution 分離 filtering 與 channel mixing，降低 computation 與 model size。來源：Section 3.1。
+- 對 $3 \times 3$ filters，paper 陳述約 8-9x computation reduction，accuracy 只小幅下降。來源：Section 3.1。
+- Table 2 指出 MobileNet 多數 computation 在 $1 \times 1$ convolution。來源：Table 2。
+
+**What students should remember：** Lower-MAC model 可能只是移動 bottleneck。Depthwise layers 算術上便宜，但 pointwise layers 可能主導 compute 與 memory traffic。
+
+**Limitations and assumptions：** Paper 的 accuracy/latency tradeoffs 取決於 training setup 與 hardware context。本章使用 operator decomposition，而不是精確 benchmark ranking，作為長期概念。
+
+### Paper Bridge: EfficientNet
+
+**Bibliographic identity：** Mingxing Tan 與 Quoc Le，*EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks*，ICML 2019。Local PDF：`papers/L03_EfficientNet_Tan_ICML2019.pdf`。
+
+**Problem addressed：** 只沿 depth、width 或 input resolution 單一方向 scaling CNN，會有 diminishing returns 且需要手動調參。
+
+**Core idea：** Compound scaling 用係數 $\phi$ 共同 scaling depth、width、resolution：$d=\alpha^\phi$、$w=\beta^\phi$、$r=\gamma^\phi$，並受 resource constraint 限制。
+
+**Relevance to L03：** EfficientNet 強化本章訊息：model-level efficiency 是多維的。Depth、width、resolution 會以不同方式改變 arithmetic、activation sizes、memory footprint 與 hardware utilization。
+
+**Key claims used in this chapter：**
+
+- Single-dimension scaling 會提高 accuracy，但模型變大後收益趨於飽和。來源：Section 3.2 與 Figure 3。
+- Compound scaling 平衡 depth、width、resolution。來源：Section 3.3 與 Equation 3。
+- Paper 用 accuracy、parameters、FLOPs、latency 比較 scaled EfficientNets 與其他 ConvNets。來源：Tables 2 與 4。
+
+**What students should remember：** "Efficient" 不是單一 scalar。模型可以在 depth、channel width、resolution、parameter count、activation size 與 latency 之間做不同 tradeoff。
+
+**Limitations and assumptions：** EfficientNet 的結果依賴 architecture search、training recipe 與 evaluation hardware。L03 使用它解釋 scaling dimensions 與 proxy metrics，不做 current leaderboard claim。
+
+### Source Bridge: Evaluation Tools and Benchmarks
+
+**Bibliographic identity：** Slides 引用 MLPerf、Accelergy、Timeloop、AccelForge 作為 benchmark 與 modeling infrastructure 例子。
+
+**Relevance to L03：** 這些來源支撐 realistic accelerator evaluation 必須指定 workload、mapping、precision、batch size、memory hierarchy 與 action counts。
+
+**Key claims used in this chapter：** Required metric specifications 清單取自 L03 PDF page 48；attention equations 與 rank names 取自 PDF pages 115-127。
+
+**Limitations：** 此 bridge 是 slide-anchored。對應 original papers 並非全部存在於本 repository 的 local PDFs。
+
+---
+
+## 13. 獨立學習指南（Standalone Study Guide）
+
+### 必須掌握什麼
+
+- 能解釋 memory hierarchy，而不是只說「data movement is expensive」。
+- 記住 qualitative ordering：local register-like storage 小而便宜；DRAM 大但 access 昂貴。
+- 練習讀 Einsum，標出 output ranks 與 reduction ranks。
+- 練習把 FC 與 convolution 轉成 matrix multiplication，同時指出哪些資料被重複。
+- 追蹤 self-attention shapes，從 $I$ 到 $QK$ 與 $AV$。
 
 ### 自我檢核問題
 
-1. 為什麼小型 local buffer 即使增加一層記憶體，仍可能降低能耗？
-2. 如果一個設計透過 gating 零值 MAC 省能但不跳過週期，哪些評估指標會變、哪些不會？
-3. 在 attention 中，哪些張量取決於執行時的 token sequence，哪些是學到的權重？
+1. 為什麼 small local buffer 只有在有 reuse 時才會降低 energy？
+2. 為什麼 latency claim 必須附 batch size？
+3. 在 $Z_{m,n} = A_{m,k}B_{k,n}$ 中，哪個 rank 被 reduce？哪些 ranks 保留？
+4. 為什麼 im2col 即使 enable GEMM，也可能增加 memory traffic？
+5. 在投影片 convention 中，$QK_{m,p}$ 儲存什麼？
+6. 為什麼 depthwise convolution 即使 MACs 較少，也可能讓 dense accelerator 難以有效利用？
+7. 哪個 metric 可以揭露「低 chip power 但大量 off-chip bandwidth」的設計？
 
 ### 練習
 
-1. 選本講一個 Einsum，標出每個秩是自由秩、reduction rank，還是由其他秩推導而來。
-2. 對 attention cascade，寫出每個中間張量和下一個中間張量的 producer-consumer 關係。
-3. 用至少三個指標比較兩個設計，說明單一 scalar metric 會隱藏什麼取捨。
-
-### 常見誤區
-
-- 把低延遲等同於高吞吐量。兩者相關，但不能互換。
-- 把所有記憶體存取視為同等成本。本課程的核心正是 RF、SRAM、global buffer、DRAM 的差異。
-- 把 Einsum 當成單純記法；在這門課中，它是 mapping 與 architecture tools 的共同契約。
+1. **Conceptual：** 解釋為什麼 ring oscillator 可以產生誤導性的 TOPS/W-style number。
+2. **Small calculation：** 用 Horowitz table 計算 32-bit SRAM read 與 8-bit multiply 的 energy ratio。
+3. **Einsum reading：** 對 $Y_{b,p,f} = A_{b,m,p} V_{b,m,f}$，指出所有 output ranks 與 reduction ranks。
+4. **Convolution：** 對 input $[2,4,6,8]$ 與 length-2 filter 建立 Toeplitz matrix。
+5. **Attention shapes：** 若 $B=2$、$H=8$、$M=128$、$E=64$，$QK$ 的 shape 是什麼？
+6. **Design tradeoff：** 用 energy、bandwidth、programmability 比較 im2col-based convolution implementation 與 direct convolution implementation。
+7. **Paper/source bridge：** 閱讀 Accelergy 投影片，解釋為什麼估 energy 前需要 action counts。
 
 ---
 
-## 關鍵詞彙（Key Terms）
+## 14. 關鍵詞彙（Key Terms）
 
-| 詞彙 | 說明 |
-|---|---|
-| **記憶體階層（memory hierarchy）** | 多層結構（RF → SRAM → DRAM），以容量換速度／能耗，把小型快速記憶體置於靠近運算之處。 |
-| **時間局部性（temporal locality）** | 同一資料元素被多次重複使用；若保留在近端緩衝區，可避免昂貴的大型記憶體存取。 |
-| **空間局部性（spatial locality）** | 相鄰資料元素一起被存取；一次載入分塊（tile/block）可攤分每次存取的成本。 |
-| **SRAM** | 六電晶體的晶片上記憶體；構成 DNN 加速器的全域緩衝區（Global Buffer）和暫存器檔（RF）層。 |
-| **DRAM** | 單電晶體的晶片外記憶體；容量龐大，但每次 32 位元讀取耗費 640 pJ——是最主要的能耗來源。 |
-| **Horowitz 能耗表** | ISSCC 2014 的參考表，以 pJ 為單位量化各類算術運算和記憶體存取的能耗。 |
-| **吞吐量（throughput）** | 每秒推論次數或 MAC 數；必須以真實 DNN 的*實際*利用率報告，而非峰值。 |
-| **延遲（latency）** | 從輸入到輸出的時間；需指明批次大小（小批次 → 低延遲）。 |
-| **PE 利用率（PE utilization）** | 實際在執行有效工作的 PE 比例；100% 為峰值效能。 |
-| **MLPerf** | 涵蓋訓練與推論、多類 DNN 模型的業界標準基準套件。 |
-| **Einsum** | 形如 `Z_ij = A_ik × B_jk` 的張量縮並（contraction）表達式，指定「計算什麼」但不規定迴圈順序。 |
-| **迭代空間（iteration space）** | 由所有維度變數範圍構成的合法元組集合；Einsum 對此集合進行遍歷。 |
-| **收縮維度（contracted rank）** | 出現在右側但不在左側的維度變數；在輸出中被規約（求和）消去。 |
-| **非收縮維度（uncontracted rank）** | 出現在兩側的維度；在輸出中保留。 |
-| **分割（partitioning）** | 將一個維度 i 拆分為 (i₁, i₀)，其中 `i = i₁×I₀ + i₀`；增加一個維度。分塊（tiling）的形式基礎。 |
-| **展平（flattening）** | 分割的逆操作；將元組維度變數 `(i₁, i₀)` 折疊為單一索引。 |
-| **Toeplitz 矩陣 / im2col** | 將卷積轉換為矩陣乘法的結構性變換，通過構建移位輸入片段矩陣來實現。 |
-| **Q、K、V（查詢、鍵、值）** | 自注意力中輸入序列的三種投影。 |
-| **注意力矩陣（attention matrix, A）** | Q 與 K 的 softmax 正規化乘積，大小為 M×M；每行都是位置上的概率分布。 |
-| **d_model（D）** | Transformer 模型的全局嵌入維度。 |
-| **dk（E）** | 每個注意力頭中 Q 和 K 的投影維度。 |
-| **多頭注意力（multi-headed attention）** | 在權重張量中加入 H 維度，並行執行 H 個獨立的注意力頭。 |
+### Memory hierarchy（記憶體階層）
+
+多層 storage system，把小、快、低能耗 memories 放在 compute 附近，把大型 memories 放在遠處。在 accelerator design 中，它存在的理由是 exploit reuse 並減少 expensive traffic。
+
+### Data movement（資料搬移）
+
+Weights、activations、partial sums 或 intermediates 在 memory levels 或 PEs 之間的移動。它影響 energy、bandwidth、latency 與 utilization。
+
+### Operational intensity（操作強度）
+
+在指定 memory boundary 上的 $\text{operations}/\text{bytes moved}$。它衡量每個 fetched byte 支撐多少 computation。
+
+### Throughput（吞吐量）
+
+單位時間完成的 work，例如 inferences/s 或 operations/s。必須在真實 workload 與 utilization 脈絡下報告。
+
+### Latency（延遲）
+
+從 input 到 output 的 elapsed time。Batch size 是必要脈絡，因為 large batch 可改善 throughput，但可能增加單一 input 等待時間。
+
+### PE utilization（PE 利用率）
+
+Processing elements 實際做 useful work 的比例。Peak TOPS 假設 high utilization；真實 workloads 未必達到。
+
+### Einsum
+
+命名 output、input 與 reduction ranks 的 tensor expression，不指定 traversal order。它是後續 mapping lectures 使用的 mathematical contract。
+
+### Rank variable
+
+Einsum 中的 index variable，例如 $m$、$n$、$k$。
+
+### Contracted rank（收縮維度）
+
+出現在 right-hand side 但不在 left-hand side 的 rank。它會被 reduction，通常是 summation。
+
+### Uncontracted rank（非收縮維度）
+
+出現在 output 中並被保留的 rank。
+
+### Partitioning（切分）
+
+把一個 rank 拆成多個 ranks，例如 $i = i_1 I_0 + i_0$。後續講次用這個觀念描述 tiling。
+
+### Flattening（展平）
+
+把多個 ranks 折成一個 rank，例如把 $(c,h,w)$ 折成 $chw$。
+
+### Toeplitz / im2col
+
+一種把 convolution 表示為 matrix multiplication 的轉換，方法是把 shifted input windows 收集成 matrix。它可暴露 GEMM structure，但可能複製資料。
+
+### Query, Key, Value（查詢、鍵、值）
+
+Attention 中的三種 projections。Queries 表示要找什麼，keys 用來匹配，values 提供被 attention weights 混合的資訊。
+
+### Attention matrix（注意力矩陣）
+
+投影片 convention 中 softmax-normalized score tensor $A_{m,p}$。它隨 sequence length 以平方成長。
 
 ---
 
-## 重點回顧（Takeaways）
+## 15. 附錄 - 投影片對照表（Slide-to-Section Map）
 
-- **32 位元 DRAM 讀取耗費 640 pJ；32 位元浮點乘法耗費 3.7 pJ**——相差 170 倍。這個單一事實驅動了整個 DNN 加速器領域的存在。
-- 記憶體階層（RF → SRAM → DRAM → Flash）的存在，是因為**沒有任何記憶體技術能同時做到大容量、快速、高密度且便宜**；階層把小型快速記憶體置於靠近運算之處，以利用資料重用。
-- **處理順序不改變結果**（MACs 滿足交換律），但深刻地改變資料在階層中如何移動。選擇正確的順序就是映射（mapping）問題的核心。
-- **GOPS/W 單一數字不是有效指標。** 全面的評估需要準確率、吞吐量（含利用率）、延遲（含批次大小）、能耗（含 DRAM 頻寬）、硬體成本、靈活性和可擴展性。
-- **較少的 MACs 和參數不保證更低的能耗或延遲**——濾波器形狀、批次大小和硬體映射都決定了實際效能。
-- **每一種 DNN 運算都是一個 Einsum：** 一個帶收縮維度的張量表達式，指定「計算什麼」而不規定「如何」（迭代順序）。FC 層是矩陣-向量或矩陣-矩陣乘；卷積在 Toeplitz 變換後是矩陣乘；Transformer 自注意力是帶 softmax 的矩陣乘串聯。
-- Transformer 自注意力產生 **O(M²) 的注意力矩陣**，這是注意力專屬加速器（如 FuseMax、FlashAttention）所針對的根本瓶頸。
-
----
-
-## 與後續講次的連結（Connections）
-
-- **Einsum 形式在 L04 進一步深化**——記法擴展到涵蓋更多 DNN 層類型（池化 pooling、正規化 normalization）和特殊情況。
-- **映射（Mapping，L05–L06）**——給定一個 Einsum 和一個架構，映射決定迴圈順序、分塊（= 維度變數的分割）和資料放置位置。Einsum 是「計算什麼」；映射是「如何計算」。
-- **稀疏性（Sparsity，L07–L10）**——稀疏性是 Einsum 中張量的一種屬性（許多元素為零）。稀疏架構利用這一點跳過 MACs 並減少資料搬移。
-- **精度（Precision，L12）**——降低維度變數或張量元素的位元寬度；精度與每次 MAC 的能耗和儲存成本相互影響。
-- **注意力加速器**——L01 中提及的 FuseMax，透過融合 QK 和 AV 步驟來避免把 M×M 的注意力矩陣物化（materialize）到 DRAM 中，直接應用第一章的能耗-搬移原則。
-- 第一章引入的**能耗層級（energy-cost hierarchy）**，是 L05 至 L13 中幾乎每一項最佳化所反覆援引的正當理由。
+| PDF 頁 | PDF 中的 slide label | 章節 | 備註 |
+|---|---|---|---|
+| 1 | L02-1 | Title | PDF 內部把早期頁標成 L02，但 repository 視為 L03 |
+| 2-19 | L02-2 to L02-19 | 記憶體是第一級設計限制 | 加入 reuse example 與 hardware implications |
+| 20-39 | L02-20 to L02-39 | Efficient models 不會自動變成 efficient hardware | 當作 metrics bridge，不作完整 CNN-model survey |
+| 40-56 | L02-40 to L02-56 | Evaluation metrics | 加入 operational-intensity example 與 tool bridge |
+| 57-72 | Extended Einsums 2/37 to 18/37 | Einsum contract | 加入 vocabulary 與 worked reading example |
+| 73-90 | Kernel Computation 1 to 18 | Fully connected as matrix multiplication | 解釋 flattening 與 batch |
+| 91-109 | Kernel Computation 19 to 37 | Convolution as matrix multiplication | 解釋 Toeplitz/im2col 與 data repetition |
+| 110-127 | Attention Einsums 20/37 to 37/37 | Transformer self-attention as Einsums | 加入 shape example 與 hardware implications |
 
 ---
 
-## 附錄 — 投影片對照表（Slide-to-Section Map）
+## 16. 來源註記（Source Notes）
 
-| 實體頁 | 投影片標記 | 章節 |
-|---|---|---|
-| 1 | L02-1 | 標題——記憶體與評估指標 |
-| 2–19 | L02-2 … L02-19 | 第一章——記憶體階層 |
-| 20–39 | L02-20 … L02-39 | （高效 CNN 模型——L02 背景材料） |
-| 40–56 | L02-40 … L02-56 | 第二章——評估指標 |
-| 57 | Einsums 2/37 | 第三章——Extended Einsums（標題） |
-| 58–59 | Einsums 3/37 … 4/37 | 第三章——Einsum ODE、範例 |
-| 60–61 | Einsums 5/37 … 6/37 | 第三章——矩陣乘遍歷動畫 |
-| 62–69 | Einsums 7/37 … 13/37 | 第三章——張量引用、模式、維度變數、分割、展平 |
-| 69–72 | Einsums 14/37 … 18/37 | 第三章——矩陣乘變體、卷積 Einsum、維度形狀 |
-| 73 | Kernel 1 | 第四章——Kernel Computation（標題） |
-| 74–85 | Kernel 2 … 13 | 第四章——FC 計算、Einsum、展平、矩陣-向量乘 |
-| 85–90 | Kernel 13 … 18 | 第四章——加入批次 → 矩陣-矩陣乘 |
-| 91–109 | Kernel 19 … 37 | 第四章——CONV Einsum、Toeplitz 轉換、卷積→矩陣乘 |
-| 110 | Attention 20/37 | 第五章——Attention Einsums（標題） |
-| 111–114 | Attention 21/37 … 24/37 | 第五章——圖示慣例、編碼器結構、基本自注意力 |
-| 115–120 | Attention 25/37 … 30/37 | 第五章——I、Q、K、softmax、V、Z 各步驟 |
-| 121–123 | Attention 31/37 … 33/37 | 第五章——維度名稱、輸入與權重張量 |
-| 124–125 | Attention 34/37 … 35/37 | 第五章——中間張量、完整串聯 |
-| 126 | Attention 36/37 | 第五章——批次化注意力 |
-| 127 | Attention 37/37 | 第五章——多頭注意力 |
+- 投影片直接陳述的 claims 包括 Horowitz energy table values、memory hierarchy tradeoffs、key metric list、metric specification checklist、MobileNets MAC ratio、FC/CONV conversion dimensions，以及 attention rank/equation cascade。
+- Paper/source-derived claims 限於投影片引用的來源：Horowitz ISSCC 2014、MobileNets 2017、MLPerf、Accelergy 與相關 evaluation tools。
+- Standard background explanations 包括 operational intensity、matrix multiplication reading、batch-vs-latency interpretation，以及 query/key/value roles 的說明。
+- Teaching interpretations 包括 small energy-reuse example、operational-intensity toy calculation 與 attention-shape example。
+- 本次重寫沒有嵌入 slide figures 或 paper figures。Repository 中既有的 `assets/L03/*.png` 仍保留，但本章不使用。
+
+---
+
+## 17. 不確定性註記（Uncertainty Notes）
+
+- Public PDF 的許多早期頁面標成 L02，但 repository 把它作為 L03。本章引用 PDF 頁碼以避免混淆。
+- Live lecture 可能對 efficient-CNN examples 有不同強調。本章主要把 PDF 頁 20-39 用來支持 proxy-metric warning。
+- Horowitz energy values 依技術而變；應作為 order-of-magnitude guidance，而非 universal constants。
+- Attention softmax axis 依投影片 convention：$p$ 是 query/output position，normalization 沿 $m$ 加總。

@@ -1,368 +1,932 @@
 # L02 — Overview on DNN Components
 
 > **Course:** 6.5930/1 — Hardware Architectures for Deep Learning
-> **Instructors:** Joel Emer & Vivienne Sze (MIT EECS)
+> **Instructors:** Joel Emer and Vivienne Sze (MIT EECS)
 > **Lecture date:** February 4, 2026 · **Slides:** 102 · **Source:** [`Lecture/L02-Overview_on_DNN_components.pdf`](../../Lecture/L02-Overview_on_DNN_components.pdf)
 >
-> *This is a conceptual walkthrough that reconstructs the lecture's narrative from the slides. It is organized by idea, not slide-by-slide. Each section cites the slide range it draws from so you can follow along with the original deck.*
+> This chapter reconstructs the teaching layer behind the slides. It uses the slides as the ordering backbone, but the prose is written as a self-contained study companion for a reader who cannot watch the lecture video.
 
 ---
 
 ## TL;DR
 
-This lecture builds the language every hardware architect needs to reason about DNN workloads. The first half formalizes the **accelerator design methodology** through the TeAAL framework — defining Einsums as the workload specification format, deriving compute intensity as the key efficiency metric, and connecting both to the Roofline Model. The second half systematically dissects **Convolutional Neural Network (CNN) components**: the CONV layer (with its sliding-window computation, stride, padding, and multi-channel extensions), the Fully-Connected (FC) layer (which is CONV with filter size equaling feature-map size, collapsing to matrix–vector/matrix–matrix multiply), and the auxiliary NORM and POOL layers. The throughline is **data reuse**: every architectural dimension — spatial, channel, batch — creates an opportunity to amortize weight or activation memory traffic, and the challenge for the hardware architect is to exploit that reuse efficiently.
+Lecture 02 teaches two languages that the rest of the course will use constantly.
+
+The first language is the **workload-description language**: tensors, ranks, Einsums, iteration spaces, compute intensity, and Roofline reasoning. These let a hardware architect say exactly what a DNN layer computes, how much arithmetic it requires, how much data it ideally needs to move, and whether a particular implementation is limited by memory bandwidth or compute parallelism. The key teaching point is that an Einsum specifies **what** computation is performed, while a loop order or mapping specifies **how** the iteration space is traversed.
+
+The second language is the **CNN-component language**: CONV, activation, NORM, POOL, and FC layers; feature maps; filters; stride; padding; channels; batch size; and the standard loop variables $N, C, H, W, R, S, M, P, Q, U$. The main workload is convolution: each output activation is a sum over a local receptive field and input channels, and the full layer performs $N \times M \times P \times Q \times C \times R \times S$ multiply-accumulates.
+
+The reason these two languages appear in the same lecture is architectural: once a CONV layer is written as an Einsum, the accelerator designer can reason about data reuse, memory traffic, stationarity, mapping, tiling, and parallelism. Later lectures will keep returning to this exact bridge.
+
+---
+
+## What Problem This Lecture Solves
+
+Lecture 01 motivated why DNN acceleration matters: compute demand is high, data movement is expensive, and general-purpose processors do not always expose the right structure for efficient DNN execution. Lecture 02 asks the next question: **what exactly is the workload that the accelerator is supposed to run?**
+
+That question is more subtle than it first appears. Saying "run a CNN" is not precise enough for architecture. A hardware designer needs to know:
+
+- which tensors exist and what their shapes are,
+- which indices are output indices and which are reduction indices,
+- how many multiply-accumulates the layer performs,
+- which values can be reused across many operations,
+- how stride and padding change output shape,
+- whether a loop order repeatedly spills partial sums,
+- and whether more MAC units would help or whether memory traffic is the real limit.
+
+The lecture therefore starts with a modeling discipline: describe the workload as tensor algebra, evaluate it with compute and traffic metrics, and only then talk about hardware choices. It then applies that discipline to CNN components, especially convolution and fully connected layers.
+
+**Source note:** This ordering follows Lecture 02 slides 2-44 for the accelerator design methodology and slides 45-102 for CNN components.
+
+---
+
+## Why This Lecture Matters
+
+Most beginner explanations of CNNs emphasize the machine-learning view: filters detect edges, deeper layers detect higher-level concepts, and FC layers produce class scores. That view is useful, but it is incomplete for this course.
+
+For a hardware architect, a DNN layer is also a structured data-movement problem. A convolutional layer does not merely contain many multiplications. It contains repeated use of the same weights, repeated use of nearby activations, and repeated updates to partial sums. These reuse patterns decide whether an accelerator spends its energy doing arithmetic or moving data between DRAM, SRAM, interconnect, register files, and processing elements.
+
+The lecture's deeper lesson is:
+
+> A DNN component is not just a neural-network concept. It is an iteration space over tensors, and the way that iteration space is traversed determines memory traffic, reuse, utilization, and bottlenecks.
+
+That lesson sets up L03-L04, where tensor algebra and memory metrics are expanded, and L05-L06, where mapping/dataflow and partitioning decide how CONV loop nests run on real hardware.
+
+---
+
+## Prerequisites and Mental Model
+
+You should be comfortable with:
+
+- vectors and matrices,
+- matrix-vector and matrix-matrix multiplication,
+- basic CNN terminology such as input image, feature map, filter, and layer,
+- and the idea that memory accesses can be much more expensive than arithmetic.
+
+The mental model for this chapter is:
+
+1. A tensor is a multi-dimensional box of values.
+2. An Einsum describes a set of points in an iteration space.
+3. Each point usually performs a multiply and contributes to an output.
+4. If an index appears on the right-hand side but not the left-hand side, the computation reduces over that index.
+5. Hardware efficiency depends on how much useful arithmetic is obtained per value moved through the memory hierarchy.
+
+A useful analogy is a nested loop nest. An Einsum says which loops must exist, but not the order of those loops. The mapping chooses the order, tiling, and parallelism. Later, dataflow names such as output-stationary and weight-stationary will describe particular ways of making some values stay close to the processing elements.
 
 ---
 
 ## Learning Objectives
 
-After this lecture you should be able to:
+After studying this chapter, you should be able to:
 
-- Describe the **five-step TeAAL accelerator design methodology** and explain what each step decides.
-- Write a **CONV layer computation as an Einsum** and read off the iteration-space size and the seven canonical loop variables (N, C, H, W, R, S, M, P, Q, U).
-- Define **compute intensity (CI)** as multiplications per value, compute the best-case CI for a given Einsum, and use the **Roofline Model** to interpret what limits throughput.
-- Explain how **stride** and **zero padding** control the spatial dimensions of a CONV output.
-- Show that an **FC layer** is a special case of a CONV layer (R = H, S = W), and that with batch size N > 1 it reduces to **matrix–matrix multiplication**.
-- Identify NORM and POOL as auxiliary layers and state that CONV accounts for **>90%** of overall computation in a typical CNN.
-
----
-
-## Chapter 1 — Accelerator Design Methodology
-
-> *Slides: L02-3 … L02-44*
-
-### From workload to hardware: the five-step cycle
-
-The lecture opens by establishing that hardware architects need a **principled, repeatable methodology** to move from a DNN workload specification all the way to an optimized accelerator. The TeAAL framework (introduced in Nayak, MICRO 2023) formalizes this as five steps that can be iterated:
-
-![TeAAL five-step accelerator design methodology](../../assets/L02/L02-p04-accel-design-methodology.png)
-
-1. **Describe the architecture** — Select from a library of hardware components (PEs with ALUs and register files, global SRAM buffers, DRAM) and organize them into an accelerator specification.
-2. **Develop the workload** — Write a cascade of Einsums that describes the computation, together with mapping, format, and binding specifications.
-3. **Evaluate the workload** — Model the workload on the hardware: count computes, compute memory traffic, and derive compute intensity.
-4. **Compare implementations** — Normalize across hardware parameters and re-evaluate to compare design alternatives fairly.
-5. **Optimize the design** — Incrementally modify one or more specifications (architecture, mapping, format, binding) and re-evaluate.
-
-This cycle is not sequential; optimizing often sends you back to step 1 or 2. Steps 3–4 are what **Lab 1** is about; steps 2 and 3 (mapping / traverse order) are what **Labs 2–3** focus on.
-
-### The separation of concerns inside step 2
-
-Within "develop the workload," TeAAL draws a strict hierarchy — from coarsest and most concise to finest-grained:
-
-![Separation of concerns: Cascade → Mapping → Format → Binding](../../assets/L02/L02-p08-separation-of-concerns.png)
-
-- **Cascade of Einsums** — *what* computation is performed.
-- **Mapping** — *how* the iteration space is traversed (loop order, tiling, parallelism).
-- **Format** — *how data is encoded* (dense vs. sparse, compression scheme).
-- **Binding** — *which* hardware resources execute which parts of the mapping.
-
-This mirrors the TeAAL Pyramid of Concerns from L01, and it is the reason the course can discuss a change in loop order without touching the hardware description.
-
-### Tensors, ranks, and Einsums
-
-A **tensor** is a multi-dimensional array. In this course, a tensor's dimensionality is called its number of **ranks**, and the size of each rank is its **shape**. The size of the tensor is the product of all rank shapes.
-
-Matrix multiplication is the archetype. The Einsum notation captures it in one line:
-
-$$Z_{m,n} = A_{k,m} \times B_{k,n}$$
-
-Every index that appears on the right but *not* on the left is summed over (the "reduction" index). For matrix-vector multiplication the same idea holds:
-
-$$Z_m = A_{k,m} \times B_k$$
-
-The **Operational Definition of an Einsum (ODE)** makes this precise:
-
-1. Form the **iteration space** — the Cartesian product of all legal index values (e.g., K × M for the vector case).
-2. For each point in the iteration space, read the operand values at the specified indices, multiply them, and accumulate into the output at the left-hand-side indices.
-3. Indices that appear only on the right are **reduction indices** and are summed over implicitly.
-
-The size of the iteration space (K × M) is exactly the amount of work (number of multiplications) the Einsum requires.
-
-### Compute intensity and the Roofline Model
-
-**Compute intensity (CI)** is defined as *multiplications per value* (rather than the ambiguous FLOPs/byte):
-
-$$\text{CI} = \frac{\text{number of multiplications}}{\text{number of values accessed}}$$
-
-For the matrix-vector Einsum Z_m = A_{k,m} × B_k:
-
-- **Best-case CI** (minimum traffic, maximum reuse): The numerator is K × M multiplications; the denominator is K×M (loads of A) + K (loads of B) + M (stores of Z) = K×M + K + M values. For K=250, M=100 this gives ≈ **0.99 multiplications/value**.
-
-- **Achieved CI** (with a specific loop nest): If the outer loop is over k and the inner loop is over m — the natural loop order — achieved traffic is K×M (loads of A) + K (loads of B) + (K−1)×M (loads of Z for partial sums) + K×M (stores of Z) ≈ 3K×M values. For K=250, M=100 this drops to ≈ **0.33 multiplications/value**.
-
-The achieved CI is always ≤ the best-case CI. The gap comes from not exploiting reuse fully — here, the Z[m] partial sum is repeatedly loaded from DRAM across the k-loop because there is only one register (no tiling).
-
-The **Roofline Model** turns CI into a throughput prediction:
-
-![Roofline Model — memory-bound vs. compute-bound regimes](../../assets/L02/L02-p42-roofline-model.png)
-
-- The horizontal roof is the **compute ceiling** (e.g., 8 MACs/cycle for L=8 lanes), limited by the number of parallel multiply units.
-- The diagonal ramp is the **memory bandwidth ceiling** — throughput = CI × bandwidth.
-- A workload's CI places it on the x-axis; it falls in the **memory-bound region** (on the ramp) or the **compute-bound region** (under the roof).
-
-Key implication: when a workload is memory-bound, adding more compute lanes does *not* increase throughput — only reducing memory traffic (increasing CI) helps.
-
-> **Why it matters:** Compute intensity is the single most important number linking a workload specification to a hardware design. It tells the architect whether the bottleneck is memory bandwidth or arithmetic throughput — and therefore which lever to pull.
+1. Explain the five-step TeAAL accelerator design methodology and distinguish architecture, workload, mapping, format, and binding.
+2. Define tensor rank, rank shape, tensor size, iteration space, free index, and reduction index.
+3. Read an Einsum such as $Z_m = A_{k,m} \times B_k$ and derive its iteration-space size, number of multiplications, and reduction behavior.
+4. Compute best-case and achieved compute intensity for the matrix-vector example used in the lecture.
+5. Use Roofline reasoning to explain when more compute parallelism helps and when memory bandwidth is the bottleneck.
+6. Describe the role of CONV, activation, NORM, POOL, and FC layers in a CNN.
+7. Derive the output dimensions of a 2-D convolution with stride and optional padding.
+8. Explain the meaning of the CNN decoder-ring variables $N, C, H, W, R, S, M, P, Q, U$.
+9. Write the CONV layer as an Einsum and identify the output indices and reduction indices.
+10. Explain why an FC layer is a special case of CONV and why batching turns FC into matrix-matrix multiplication.
+11. Connect these DNN components to hardware concerns: data reuse, partial sums, memory traffic, bandwidth, latency, utilization, and mapping.
 
 ---
 
-## Chapter 2 — CNN Structure and Layer Types
+## Main Narrative: From Workload to Hardware
 
-> *Slides: L02-45 … L02-52*
+### TeAAL's Five-Step Methodology
 
-### CNNs: deep stacks of heterogeneous layers
+Lecture 02 begins with a design method rather than with a neural-network layer. This is deliberate. A DNN accelerator is not designed by first choosing a PE array and hoping the workload fits. The course wants a repeatable path from workload to hardware.
 
-A modern CNN is a sequence of **5 to 1000 layers** organized to transform a raw input (an image, a speech spectrogram, game state, or medical scan) into a prediction:
+Lecture 02 uses TeAAL as the organizing framework. In the slides, the five steps are:
 
-![CNN layer stack: CONV → NORM → POOL → FC](../../assets/L02/L02-p47-cnn-overview.png)
+1. **Describe the architecture.** Choose hardware components, such as processing elements (PEs), ALUs, register files, global buffers, and DRAM, and organize them into an accelerator specification.
+2. **Develop the workload.** Describe the computation as a cascade of Einsums, then specify mapping, format, and binding.
+3. **Evaluate the workload.** Count operations, memory traffic, and compute intensity for the workload on the architecture.
+4. **Compare implementations.** Normalize hardware parameters and compare alternative designs.
+5. **Optimize the design.** Modify architecture, mapping, format, or binding and evaluate again.
 
-The canonical layer types are:
+This is not a one-pass checklist. It is a loop. A poor memory-traffic result may force a different mapping; a mapping that exposes more reuse may require more local storage; a sparse format may reduce data movement but add metadata and control complexity.
 
-| Layer type | Role |
+**Source note:** The five-step framing is directly stated in Lecture 02 slides 4-8 and 21-44, which cite TeAAL and HiFiber and Nayak, MICRO 2023.
+
+### Separation of Concerns
+
+The most important part of the methodology is the separation between **what is computed** and **how it is computed**.
+
+The slides describe four workload concerns, from most concise to most detailed:
+
+| Concern | Question it answers | Example |
+|---|---|---|
+| Cascade of Einsums | What computations make up the workload? | A CONV followed by activation and pooling |
+| Mapping | In what order is the iteration space traversed? | Loop order, tiling, parallelism |
+| Format | How is data represented? | Dense, sparse, compressed |
+| Binding | Which hardware resource performs each part? | Which PE, buffer, or memory level holds a tensor tile |
+
+This separation matters because many design choices are independent only if the model keeps them independent. For example, the CONV Einsum can remain the same while the mapping changes from output-stationary to weight-stationary. Likewise, a sparse format can be introduced without changing the mathematical layer definition.
+
+**Teaching interpretation:** The "pyramid" in slides 8 and 28 is a warning against mixing concerns too early. If you fuse the computation definition with a specific loop order, you make it harder to explore alternative accelerators.
+
+---
+
+## Tensors, Ranks, and Einsums
+
+### Tensor Terminology
+
+A **tensor** is a multi-dimensional array of values. In this course, a dimension of a tensor is called a **rank**. This differs from some math contexts where "rank" has a different meaning; here, rank simply means one named dimension.
+
+Examples:
+
+| Object | Number of ranks | Shape example | Size |
+|---|---:|---|---:|
+| Scalar | 0 | `[]` | $1$ |
+| Vector | 1 | $[K]$ | $K$ |
+| Matrix | 2 | $[M, K]$ | $M \times K$ |
+| 3-D activation tensor | 3 | $[C, H, W]$ | $C \times H \times W$ |
+| Batched activation tensor | 4 | $[N, C, H, W]$ | $N \times C \times H \times W$ |
+
+The **rank shape** is the number of elements along one rank. The **size** of the tensor is the product of all rank shapes.
+
+**Source note:** Lecture 02 slides 9-11 introduce tensors, ranks, rank shapes, and tensor size.
+
+### What an Einsum Means
+
+An **Einsum** is a compact way to describe tensor algebra. It tells us which operands are multiplied, which output element is updated, and which indices are reduced.
+
+For matrix multiplication, the slides write:
+
+$$Z_{m,n} = A_{k,m} \times B_{k,n}.$$
+
+The index $k$ appears on the right-hand side but not on the left-hand side, so $k$ is a **reduction index**. More explicitly:
+
+$$Z_{m,n} = \sum_k A_{k,m} B_{k,n}.$$
+
+For matrix-vector multiplication:
+
+$$Z_m = A_{k,m} \times B_k.$$
+
+Here, $m$ is a **free index** because it appears in the output. The index $k$ is a **reduction index** because it appears only on the right-hand side. The computation means: for every output coordinate $m$, sum over all $k$.
+
+The lecture gives an operational definition of an Einsum:
+
+1. Build the iteration space from all legal values of the unique indices.
+2. At each point, read the operand values selected by those indices.
+3. Multiply the selected values.
+4. Accumulate into the output if a reduction index is present.
+
+For $Z_m = A_{k,m} \times B_k$, the iteration space is $K \times M$. Each point $(k,m)$ performs one multiplication, and points with the same $m$ reduce into the same $Z_m$.
+
+### Small Worked Example: Matrix-Vector Einsum
+
+Suppose $K=3$ and $M=2$. Let the output be $Z_0, Z_1$. The iteration space has $3 \times 2 = 6$ points:
+
+```text
+(k,m): (0,0), (1,0), (2,0), (0,1), (1,1), (2,1)
+```
+
+The output equations are:
+
+$$Z_0 = A_{0,0}B_0 + A_{1,0}B_1 + A_{2,0}B_2,$$
+
+$$Z_1 = A_{0,1}B_0 + A_{1,1}B_1 + A_{2,1}B_2.$$
+
+There are $K \times M = 6$ multiplications. There are $(K-1) \times M = 4$ additions if we count additions needed to combine $K$ products per output. The exact addition count can vary depending on whether initialization and accumulation are counted separately, which is why the lecture focuses on multiplication count and memory traffic for compute intensity.
+
+**Hardware implication:** The same value $B_0$ is used for both $m=0$ and $m=1$. If a PE loads $B_0$ once and keeps it in a register while it multiplies by $A_{0,0}$ and $A_{0,1}$, it reduces memory traffic. This is the first appearance of the idea later called **stationarity**.
+
+---
+
+## Compute Intensity and Roofline Reasoning
+
+### Best-Case Compute Intensity
+
+Lecture 02 defines compute intensity as:
+
+$$\mathrm{CI} = \frac{\text{multiplications}}{\text{values accessed}}.$$
+
+The slides intentionally use **multiplications per value** instead of the common FLOPs/byte definition. This avoids two ambiguities: whether a MAC is one operation or two, and what bitwidth the values use.
+
+For $Z_m = A_{k,m} \times B_k$:
+
+- Multiplications: $K \times M$.
+- Best-case traffic: load every $A_{k,m}$ once, load every $B_k$ once, and store every $Z_m$ once.
+- Best-case values accessed: $K \times M + K + M$.
+
+So:
+
+$$\mathrm{CI}_{\text{best}} = \frac{K \times M}{K \times M + K + M}.$$
+
+For the slide example $K=250$ and $M=100$:
+
+$$\mathrm{CI}_{\text{best}} = \frac{250 \times 100}{250 \times 100 + 250 + 100} \approx 0.99\ \text{multiplications/value}.$$
+
+This is an upper bound for this simple memory model. It assumes the implementation can exploit all reuse needed to avoid extra traffic.
+
+**Source note:** Lecture 02 slides 23-26 define compute intensity and derive the best-case traffic for the matrix-vector example. Slide 41 gives the $K=250, M=100$ numerical example.
+
+### Achieved Compute Intensity Depends on Mapping
+
+The best-case CI is not automatically achieved. The actual loop order and storage behavior determine achieved traffic.
+
+The lecture uses the loop order:
+
+```text
+for k in range(K):
+    keep B[k] in a register
+    for m in range(M):
+        load A[k,m]
+        load current Z[m] partial sum when needed
+        update Z[m]
+        store Z[m]
+```
+
+With this processing order and simple storage model, the achieved traffic is:
+
+- $K \times M$ loads of $A_{k,m}$,
+- $K$ loads of $B_k$,
+- $(K-1) \times M$ loads of $Z_m$ partial sums,
+- $K \times M$ stores of $Z_m$.
+
+Therefore:
+
+$$\text{traffic}_{\text{achieved}} = 3KM - M + K,$$
+
+and:
+
+$$\mathrm{CI}_{\text{achieved}} = \frac{K \times M}{3KM - M + K}.$$
+
+For $K=250$ and $M=100$:
+
+$$\mathrm{CI}_{\text{achieved}} = \frac{250 \times 100}{3 \times 250 \times 100 - 100 + 250} \approx 0.33\ \text{multiplications/value}.$$
+
+The gap between $0.99$ and $0.33$ is not a mathematical property of matrix-vector multiplication. It is a property of this implementation. The loop order keeps $B_k$ stationary but repeatedly reloads and stores partial sums $Z_m$ across the $k$ loop.
+
+**Common misconception:** "The Einsum determines the memory traffic." It does not. The Einsum determines the mathematical iteration space. The mapping and hardware storage choices determine achieved traffic.
+
+### Roofline Model
+
+The **Roofline Model** connects compute intensity to throughput. In its simplest form:
+
+$$\text{achievable throughput} \le \min(\text{peak compute throughput},\ \mathrm{CI} \times \text{memory bandwidth}).$$
+
+The diagonal line is the memory-bandwidth limit. The horizontal line is the compute limit. A low-CI workload sits on the diagonal and is **memory-bound**. A high-CI workload can reach the horizontal roof and become **compute-bound**.
+
+The architectural lesson is direct:
+
+- If the workload is memory-bound, adding more MAC lanes may not improve throughput.
+- If the workload is compute-bound, improving memory bandwidth may not be the main bottleneck.
+- If the measured implementation is far below the roof, the gap may come from stalls, instruction overhead, poor mapping, insufficient buffering, or utilization problems.
+
+**Source note:** Lecture 02 slides 42-43 introduce the Roofline Model and cite Williams, Waterman, and Patterson, CACM 2009. The slides note that rooflines can be drawn for each memory-hierarchy level, though they are often shown for DRAM.
+
+---
+
+## DNN Workloads and CNN Components
+
+### Why CNNs Appear After Einsums
+
+The lecture's transition from Einsums to CNNs is not a topic jump. It is the moment where the abstract workload language gets applied to a real DNN family.
+
+CNNs are useful for computer vision, speech spectrograms, gameplay, and medical imaging. A modern deep CNN can contain roughly 5 to 1000 layers. Its layers transform low-level input features into higher-level features and eventually into class scores.
+
+The common components are:
+
+| Component | What it does | Hardware perspective |
+|---|---|---|
+| CONV | Applies learned filters over local regions of feature maps | Dominant MAC count and rich reuse patterns |
+| Activation | Applies a pointwise nonlinearity such as ReLU | Usually simple elementwise logic; often fused with CONV/FC output |
+| NORM | Normalizes activations to stabilize training or inference behavior | More control/data movement than arithmetic in many cases |
+| POOL | Downsamples spatial dimensions | Reduces later work; max/average reductions over local windows |
+| FC | Connects all input neurons to all output neurons | Dense matrix-vector or matrix-matrix multiply after flattening |
+
+The slides state that convolutions account for more than 90% of overall computation in typical CNNs, dominating runtime and energy consumption. This is why the lecture spends most of its DNN-component time on CONV.
+
+**Source note:** CNN applications and components are directly shown in Lecture 02 slides 45-52. The more-than-90% computation claim is on slide 52.
+
+### CONV Layer: Intuition and Precise Meaning
+
+A convolutional layer slides a learned filter over an input feature map. At each output position, the layer multiplies the filter weights by the input values under the filter and sums the products. That sum is one output activation.
+
+For a single-channel 2-D convolution:
+
+- input feature map shape: $H \times W$,
+- filter shape: $R \times S$,
+- output feature map shape: $P \times Q$.
+
+For one output location $(p,q)$, the layer computes:
+
+$$O_{p,q} = \sum_{r=0}^{R-1}\sum_{s=0}^{S-1} I_{Up+r,\ Uq+s}F_{r,s},$$
+
+where $U$ is stride. The term $Up+r$ selects the input row under the filter, and $Uq+s$ selects the input column.
+
+The filter's support, $R \times S$, is also called the **receptive field** for one output activation in that layer. If $R=S=3$, each output activation uses 9 input values and 9 weights, before considering channels.
+
+### Worked Example: 5-by-5 Input and 3-by-3 Filter
+
+Lecture 02 uses a $5 \times 5$ input and a $3 \times 3$ filter with stride $U=1$. With no padding, the filter can start at rows $0,1,2$ and columns $0,1,2$, so the output is $3 \times 3$.
+
+The output-size formula used in the slides for no padding is:
+
+$$P = \frac{H - R + U}{U}, \qquad Q = \frac{W - S + U}{U},$$
+
+when the division is exact. More generally, many frameworks use floor-style shape rules for valid convolution:
+
+$$P = \left\lfloor \frac{H - R}{U} \right\rfloor + 1, \qquad Q = \left\lfloor \frac{W - S}{U} \right\rfloor + 1.$$
+
+For $H=W=5$, $R=S=3$, and $U=1$:
+
+$$P=Q=\left\lfloor \frac{5-3}{1} \right\rfloor + 1 = 3.$$
+
+Each output activation needs $R \times S = 9$ multiplications. The whole layer has $P \times Q = 9$ output activations, so it performs $9 \times 9 = 81$ multiplications for this single-channel example.
+
+**Hardware implication:** Those 81 multiplications do not require 81 independent filter loads if the hardware can reuse the same $3 \times 3$ filter across all 9 output positions. Likewise, neighboring output positions reuse many input pixels because their sliding windows overlap.
+
+### Stride
+
+**Stride** is the distance the filter moves between adjacent output positions. Stride $U=1$ evaluates every valid window. Stride $U=2$ skips every other starting position. Stride $U=3$ skips even more.
+
+Using the same $5 \times 5$ input and $3 \times 3$ filter:
+
+- $U=1$ gives $P=Q=3$, so 9 output activations.
+- $U=2$ gives $P=Q=2$, so 4 output activations.
+- $U=3$ gives $P=Q=1$, so 1 output activation.
+
+Stride is therefore a downsampling mechanism. It reduces output size and later computation, but it also changes which input positions are sampled. Architecturally, larger stride reduces the number of output partial sums but may reduce overlap reuse between neighboring windows.
+
+**Source note:** Lecture 02 slides 64-71 show the output sizes for stride 1, stride 2, and stride 3 and state that stride greater than 1 is equivalent to downsampling the stride-1 output feature map.
+
+### Zero Padding
+
+Without padding, convolution shrinks the spatial dimensions. A $5 \times 5$ input with a $3 \times 3$ filter and stride 1 produces a $3 \times 3$ output. Repeating that shrinkage across many layers would quickly collapse feature-map size.
+
+**Zero padding** adds zeros around the input boundary so the filter can be centered near the edge. For a $3 \times 3$ filter, padding one row/column on each side turns the effective input into $7 \times 7$, and a stride-1 valid convolution over that padded input produces a $5 \times 5$ output.
+
+For symmetric padding $A_h$ rows vertically and $A_w$ columns horizontally, a common formula is:
+
+$$P = \left\lfloor \frac{H + 2A_h - R}{U} \right\rfloor + 1,\qquad
+Q = \left\lfloor \frac{W + 2A_w - S}{U} \right\rfloor + 1.$$
+
+For odd filter sizes and stride $U=1$, choosing $A_h=(R-1)/2$ and $A_w=(S-1)/2$ keeps spatial size unchanged.
+
+**Important caveat:** Different frameworks define padding modes slightly differently. Lecture 02 explicitly notes PyTorch examples and warns that padding is not always explicitly defined but can often be inferred from feature-map sizes.
+
+### Depth and Receptive Field Growth
+
+As a CNN gets deeper, one output activation in a later layer depends on a larger region of the original input. A single $3 \times 3$ convolution sees a $3 \times 3$ patch. A second $3 \times 3$ convolution over the first layer's outputs combines neighboring first-layer outputs, each of which already depended on a $3 \times 3$ patch. The effective receptive field grows with depth.
+
+This explains the usual CNN story in hardware terms:
+
+- early layers operate on large spatial maps and often have fewer channels,
+- later layers operate on smaller spatial maps but often have more channels,
+- deeper features become more semantic because each activation aggregates information from a wider input region.
+
+**Source note:** Lecture 02 slides 47-48 and 75 connect CNN depth with low-level and high-level features and show receptive-field growth.
+
+---
+
+## Multichannel CONV and the CNN Decoder Ring
+
+### From One Channel to Many Channels
+
+The simple 2-D example hides the channel dimension. Real CNN layers usually have many input channels and many output channels.
+
+For a batched CONV layer:
+
+| Tensor | Shape | Meaning |
+|---|---|---|
+| Input activations $I$ | $N \times C \times H \times W$ | $N$ input feature maps, each with $C$ channels |
+| Filter weights $F$ | $M \times C \times R \times S$ | $M$ filters, each spanning all $C$ input channels |
+| Bias $B$ | $M$ | one bias per output channel |
+| Output activations $O$ | $N \times M \times P \times Q$ | $N$ output feature maps, each with $M$ channels |
+
+One filter produces one output channel. If a layer has $M$ output channels, it has $M$ filters. The next layer's input-channel count is usually the previous layer's output-channel count.
+
+### Decoder-Ring Variables
+
+Lecture 02 defines a standard notation set that the rest of the course reuses:
+
+| Symbol | Meaning |
 |---|---|
-| **CONV** (Convolution) | Extracts spatial features using learned filters; hierarchically from low-level edges to high-level semantics. |
-| **Activation (nonlinear)** | Pointwise nonlinearity applied after each CONV or FC (e.g., ReLU). Enables networks to learn non-linear decision boundaries. |
-| **NORM** (Normalization) | Stabilizes training; occurs between CONV and POOL layers. |
-| **POOL** (Pooling) | Spatially downsamples the feature map, reducing computation and providing translation invariance. |
-| **FC** (Fully-Connected) | Produces the final class-score vector from high-level features; typically 1–3 layers at the network's end. |
+| $N$ | batch size, number of input/output feature maps |
+| $C$ | number of input channels |
+| $H$ | input feature-map height |
+| $W$ | input feature-map width |
+| $R$ | filter height |
+| $S$ | filter width |
+| $M$ | number of output channels / number of filters |
+| $P$ | output feature-map height |
+| $Q$ | output feature-map width |
+| $U$ | convolution stride |
 
-The critical quantitative fact: **CONV layers account for >90% of overall computation** in a typical CNN, dominating both runtime and energy. This single statistic motivates why the rest of the lecture — and much of the course — focuses on understanding and optimizing the CONV computation.
+These variables are not just notation. They are loop bounds. When you see $N \times M \times P \times Q \times C \times R \times S$, you should see seven loops and a large design space for reordering, tiling, and parallelizing those loops.
 
-Depth creates hierarchy: each successive CONV layer combines local patches from the previous layer's output, so by layer 3 or 4, each output activation "sees" a region covering much of the original input. Low layers respond to edges and textures; deep layers respond to parts, objects, and scenes.
+**Source note:** Lecture 02 slides 76-80 introduce many input channels, many output channels, batch size, and the CNN decoder ring.
 
-> **Why it matters:** Understanding which layer type costs what — and that CONV dominates — is the first step toward a principled hardware budget. Architectural choices for NORM, POOL, and activation are largely free-riders on the CONV and FC engines.
+### CONV Einsum
 
----
+The full dense CONV layer can be written:
 
-## Chapter 3 — The CONV Layer in Depth
+$$O_{n,m,p,q} = B_m + I_{n,c,U p+r,U q+s} \times F_{m,c,r,s}.$$
 
-> *Slides: L02-53 … L02-83*
+The reduction over $c,r,s$ is implicit. Expanded:
 
-### Anatomy of one CONV layer
+$$O_{n,m,p,q} = B_m +
+\sum_{c=0}^{C-1}\sum_{r=0}^{R-1}\sum_{s=0}^{S-1}
+I_{n,c,U p+r,U q+s}F_{m,c,r,s}.$$
 
-A single CONV layer slides a **filter** (a learned weight tensor) across an **input feature map** to produce an **output feature map**:
+The free output indices are $n,m,p,q$. The reduction indices are $c,r,s$.
 
-![CONV layer anatomy — input fmap, filter (weights), output fmap](../../assets/L02/L02-p53-conv-layer-anatomy.png)
+The total number of multiplications is:
 
-For the 2D case:
+$$N \times M \times P \times Q \times C \times R \times S.$$
 
-- The **input feature map (fmap)** is an H × W plane of activations.
-- The **filter** is an R × S grid of weights (R and S are typically 1×1, 3×3, 5×5, or 7×7).
-- The filter slides across the input in a **sliding window**: at each position, the R×S activations under the filter are multiplied element-wise by the R×S weights and summed to produce one **output activation** (a partial sum accumulation).
-- The resulting **output feature map** is P × Q in spatial dimensions.
+This equation is one of the most important in the course. It tells you how work scales with batch size, channel count, output spatial size, and filter size. It also shows where reuse can come from:
 
-### Worked 2D convolution example
+- a weight $F_{m,c,r,s}$ can be reused across $N \times P \times Q$ output positions,
+- an input activation can be reused by multiple filters $M$ and by overlapping spatial windows,
+- an output partial sum $O_{n,m,p,q}$ is updated $C \times R \times S$ times before it is complete.
 
-The slides walk through a concrete 5×5 input, 3×3 filter example with stride 1:
+### Naive Loop Nest
 
-![2D convolution example — 5×5 input, 3×3 filter, stride 1](../../assets/L02/L02-p57-2d-conv-example-stride1.png)
+The slides show a naive seven-loop implementation. A readable pseudocode version is:
 
-Each output activation requires 3×3 = 9 element-wise multiplications and 8 additions. Sliding the filter across all valid positions with stride 1 produces a **3×3 output** (since (5−3+1)/1 = 3). The output feature map size formula is:
+```text
+for n in [0, N):
+  for m in [0, M):
+    for q in [0, Q):
+      for p in [0, P):
+        O[n,m,p,q] = B[m]
+        for c in [0, C):
+          for r in [0, R):
+            for s in [0, S):
+              O[n,m,p,q] += I[n,c,U*p+r,U*q+s] * F[m,c,r,s]
+        O[n,m,p,q] = Activation(O[n,m,p,q])
+```
 
-$$P \times Q = \left\lfloor\frac{H - R + U}{U}\right\rfloor \times \left\lfloor\frac{W - S + U}{U}\right\rfloor$$
+The loop nest enforces an order. The Einsum does not. That difference is the bridge to mapping and dataflow.
 
-where **U** is the stride.
-
-### Stride and zero padding
-
-**Stride** controls how many pixels the filter moves between output positions:
-
-![Impact of stride — stride 1 (3×3 output), stride 2 (2×2), stride 3 (1×1)](../../assets/L02/L02-p71-stride-impact.png)
-
-- Stride 1 → 3×3 output (9 values).
-- Stride 2 → 2×2 output (4 values), which is equivalent to downsampling the stride-1 result.
-- Stride 3 → 1×1 output (1 value).
-
-Stride > 1 is a spatial downsampling mechanism: it reduces the number of output activations (and hence subsequent computation) without requiring a separate pooling layer.
-
-**Zero padding** surrounds the input with zeros to control the output size. Without padding, every CONV layer shrinks the spatial dimensions — for a deep network this quickly collapses the feature maps to zero size. Setting padding to (R−1)/2 for each spatial dimension (with stride U=1) keeps the output the same spatial size as the input, which simplifies network design.
-
-### Multichannel: C input channels, M output channels
-
-The 2D description above assumed a single-channel input. In practice:
-
-- The input fmap has **C channels** (for the first layer, C=3 for RGB; for subsequent layers, C equals the number of output channels of the preceding layer).
-- The filter is now an **R × S × C** tensor — one R×S plane per input channel.
-- Each filter is applied to all C input channels simultaneously, producing one scalar output activation by summing across all R×S×C products.
-- There are **M such filters**, one per desired output channel.
-- The output fmap therefore has **M channels**, each a P×Q spatial map.
-
-With batch size **N** (processing N images simultaneously), the four tensor shapes are:
-
-| Tensor | Shape |
-|---|---|
-| Input fmap | N × C × H × W |
-| Filter weights | M × C × R × S |
-| Output fmap | N × M × P × Q |
-| Bias | M (one per output channel) |
-
-### The CNN "decoder ring"
-
-The lecture provides a definitive table of all CONV layer loop variables — the **CNN decoder ring**:
-
-![CNN decoder ring — all 10 canonical variable definitions](../../assets/L02/L02-p79-cnn-decoder-ring.png)
-
-| Variable | Meaning |
-|---|---|
-| **N** | Batch size (number of input/output fmaps) |
-| **C** | Number of input channels |
-| **H** | Height of input fmap |
-| **W** | Width of input fmap |
-| **R** | Height of filter (kernel) |
-| **S** | Width of filter (kernel) |
-| **M** | Number of output channels (number of filters) |
-| **P** | Height of output fmap |
-| **Q** | Width of output fmap |
-| **U** | Stride |
-
-These ten symbols will appear repeatedly throughout the course. Every CONV layer is fully characterized by specifying values for all of them.
-
-### The CONV Einsum and the 7-nested-loop implementation
-
-The full CONV computation is compactly expressed as an Einsum:
-
-![CONV layer Einsum notation](../../assets/L02/L02-p82-conv-einsum.png)
-
-$$O_{n,m,p,q} = B_m + I_{n,c,U\cdot p + r, U\cdot q + s} \times F_{m,c,r,s}$$
-
-The naïve implementation is a 7-nested loop nest: outer loops over n (batch), m (output channels), q and p (output spatial position); inner loops over c (input channel), r and s (filter position). The inner body performs one multiply-accumulate and adds the bias once per output activation. The total work is N × M × P × Q × C × R × S multiply-accumulate operations.
-
-The Einsum is more general than the loop nest: it specifies *what* is computed without fixing any loop order — that choice is the **mapping**, addressed in L05–L06.
-
-> **Why it matters:** The CONV Einsum is the workload specification that flows through the entire TeAAL pipeline. Its seven reduction indices (n, m, p, q, c, r, s) correspond to seven loop levels, and the choice of which to tile, reorder, or parallelize is the central hardware design question of the course.
+**Hardware implication:** In this loop order, the output partial sum is naturally kept local while the inner $c,r,s$ loops run. That resembles output-stationary behavior. A different loop order might keep weights stationary or input activations stationary instead.
 
 ---
 
-## Chapter 4 — The Fully-Connected Layer
+## Fully Connected Layers
 
-> *Slides: L02-84 … L02-102*
+### FC as a Special Case of CONV
 
-### FC is CONV with full-size filters
+A fully connected layer connects every input neuron to every output neuron. From the CONV point of view, an FC layer is a convolution whose filter covers the entire input feature map:
 
-A Fully-Connected layer connects every input neuron to every output neuron. From the CONV layer's point of view, this is just a CONV layer where the filter size equals the input feature map size: **R = H, S = W**. There is no sliding window — each filter covers the entire spatial extent of the input.
+$$R=H,\qquad S=W.$$
 
-The FC Einsum (for a single image) is:
+There is no spatial sliding. Each output channel is produced by one filter that spans all $C \times H \times W$ input values.
 
-$$O_m = I_{c,h,w} \times F_{m,c,h,w}$$
+For a single input example:
 
-By **flattening** the three ranks C, H, W into a single rank CHW (of size C×H×W), this becomes a **matrix–vector multiply**:
+$$O_m = I_{c,h,w} \times F_{m,c,h,w},$$
 
-$$O_m = I_{chw} \times F_{m,chw}$$
+or explicitly:
 
-![FC layer as matrix-vector multiply](../../assets/L02/L02-p92-fc-matrix-vector.png)
+$$O_m = \sum_{c=0}^{C-1}\sum_{h=0}^{H-1}\sum_{w=0}^{W-1} I_{c,h,w}F_{m,c,h,w}.$$
 
-The weight matrix F has shape M × CHW; the input vector I has shape CHW × 1; the output vector O has shape M × 1.
+### Flattening to Matrix-Vector Multiplication
 
-### Batch size N > 1 promotes to matrix–matrix multiply
+The ranks $C,H,W$ can be flattened into one rank $CHW$:
 
-When N images are processed simultaneously (batch mode), the input becomes an N × CHW matrix and the output becomes an N × M matrix:
+$$chw = H W c + W h + w.$$
 
-$$O_{n,m} = I_{n,chw} \times F_{m,chw}$$
+Then:
 
-This is a standard **matrix–matrix multiply** — the same operation that dense linear algebra libraries (cuBLAS, MKL) are highly optimized for. This equivalence is why FC layers on GPUs often achieve near-peak arithmetic throughput at inference time (for large N), while CONV layers typically cannot match it because of the more complex address pattern imposed by the filter's receptive field.
+$$O_m = I_{chw} \times F_{m,chw}.$$
 
-The Einsum for the flattened FC with batch:
+This is matrix-vector multiplication. The weight tensor becomes a matrix with shape $M \times CHW$, the input becomes a vector of length $CHW$, and the output is a vector of length $M$.
 
-$$O_{n,m} = I_{n,chw} \times F_{m,chw}$$
+For example, if $C=2$, $H=2$, $W=2$, and $M=3$, then $CHW=8$. The FC layer multiplies a $3 \times 8$ weight matrix by an $8$-element input vector to produce a $3$-element output vector. It performs $M \times CHW = 24$ multiplications.
 
-is directly analogous to generic matrix multiplication $C_{m,n} = A_{m,k} \times B_{k,n}$ with the index mapping k ↔ chw. The reduction is over the chw rank; the free ranks are n and m.
+**Hardware implication:** At batch size 1, each weight is typically used once for one input example. This can make FC layers memory-bandwidth intensive even when their loop structure is simpler than CONV.
 
-> **Why it matters:** Recognizing FC as a special CONV case unifies the hardware design: the same PE array and memory hierarchy that runs CONV can run FC. At the same time, FC's low compute intensity (each weight is used for only one output) makes it memory-bandwidth-bound at batch size 1 — a hardware challenge distinct from CONV's bandwidth challenges.
+### Batching Turns FC into Matrix-Matrix Multiplication
+
+If the batch size is $N$, the input is $N \times CHW$ and the output is $N \times M$:
+
+$$O_{n,m} = I_{n,chw} \times F_{m,chw}.$$
+
+This is equivalent to matrix-matrix multiplication, with reduction over $chw$. In typical matrix multiplication notation:
+
+$$C_{m,n} = A_{m,k} \times B_{k,n},$$
+
+where $k$ corresponds to $chw$.
+
+Batching improves weight reuse: the same weight matrix $F$ is used across $N$ input examples. This is one reason large-batch FC layers can achieve high arithmetic utilization on dense linear algebra hardware.
+
+**Source note:** Lecture 02 slides 85-102 derive FC as a CONV variant, flatten it to matrix-vector multiplication, and show that batch size $N$ turns the computation into matrix-matrix multiplication.
+
+---
+
+## Worked Examples
+
+### Example 1: CONV Shape and Work Count
+
+Suppose a layer has:
+
+- $N=1$,
+- $C=3$,
+- $H=W=32$,
+- $R=S=3$,
+- $M=16$,
+- stride $U=1$,
+- padding $A_h=A_w=1$.
+
+The output size is:
+
+$$P=Q=\left\lfloor \frac{32 + 2 - 3}{1} \right\rfloor + 1 = 32.$$
+
+The output tensor has:
+
+$$N \times M \times P \times Q = 1 \times 16 \times 32 \times 32 = 16{,}384$$
+
+output activations.
+
+Each output activation reduces over:
+
+$$C \times R \times S = 3 \times 3 \times 3 = 27$$
+
+products.
+
+The layer therefore performs:
+
+$$1 \times 16 \times 32 \times 32 \times 3 \times 3 \times 3 = 442{,}368$$
+
+multiplications.
+
+Hardware meaning: the filter tensor has only $M \times C \times R \times S = 432$ weights, but those weights support 442,368 multiplications. A good accelerator tries to avoid fetching those same 432 weights from expensive memory over and over.
+
+### Example 2: Output Partial Sum Lifetime
+
+For the same layer, one output value $O_{0,5,10,12}$ is not produced by one multiplication. It is an accumulation over $C \times R \times S = 27$ products:
+
+$$O_{0,5,10,12} = B_5 + \sum_{c=0}^{2}\sum_{r=0}^{2}\sum_{s=0}^{2} I_{0,c,10+r,12+s}F_{5,c,r,s}.$$
+
+Until all 27 products have been accumulated, the output is a **partial sum**. If the partial sum stays in a register or local buffer, the hardware avoids repeatedly loading and storing it. If it spills to DRAM after each product, memory traffic explodes.
+
+This is why later lectures care so much about output-stationary dataflow.
+
+### Example 3: FC Batch Reuse
+
+Suppose an FC layer has $CHW=1024$ input values and $M=100$ outputs. For one input example, it performs:
+
+$$1024 \times 100 = 102{,}400$$
+
+multiplications and uses $1024 \times 100 = 102{,}400$ weights.
+
+If the batch size is $N=16$, the same weight matrix is reused across 16 examples. The multiplication count becomes:
+
+$$16 \times 1024 \times 100 = 1{,}638{,}400.$$
+
+The weight traffic can ideally be amortized across the batch if the weight matrix or tiles of it remain close to the compute units. This is why batch size changes the hardware behavior of FC layers, even though the mathematical layer is the same.
+
+---
+
+## Key Equations and How to Read Them
+
+### Matrix-Vector Einsum
+
+$$Z_m = A_{k,m} \times B_k.$$
+
+Read this as: for each $m$, sum over $k$. The output index is $m$; the reduction index is $k$.
+
+### Best-Case Compute Intensity
+
+$$\mathrm{CI}_{\text{best}} = \frac{K \times M}{K \times M + K + M}.$$
+
+Read this as: the numerator is the work; the denominator is the minimum number of values accessed under the simple model used in the lecture.
+
+### Achieved Compute Intensity for the Lecture's Loop Order
+
+$$\mathrm{CI}_{\text{achieved}} = \frac{K \times M}{3KM - M + K}.$$
+
+Read this as: the same mathematical work has lower CI because the implementation repeatedly moves partial sums.
+
+### No-Padding CONV Output Shape
+
+$$P = \left\lfloor \frac{H-R}{U} \right\rfloor + 1,\qquad
+Q = \left\lfloor \frac{W-S}{U} \right\rfloor + 1.$$
+
+Read this as: count how many legal top-left filter positions fit in the input.
+
+### Padded CONV Output Shape
+
+$$P = \left\lfloor \frac{H + 2A_h - R}{U} \right\rfloor + 1,\qquad
+Q = \left\lfloor \frac{W + 2A_w - S}{U} \right\rfloor + 1.$$
+
+Read this as: padding increases the effective input size before the same legal-window count is applied.
+
+### CONV Einsum
+
+$$O_{n,m,p,q} = B_m +
+\sum_{c=0}^{C-1}\sum_{r=0}^{R-1}\sum_{s=0}^{S-1}
+I_{n,c,U p+r,U q+s}F_{m,c,r,s}.$$
+
+Read this as: each output activation is one bias plus a reduction over input channels and filter positions.
+
+### CONV Work Count
+
+$$\text{multiplications} = N \times M \times P \times Q \times C \times R \times S.$$
+
+Read this as: number of output activations times number of products per output activation.
+
+### FC Flattening
+
+$$O_m = I_{c,h,w} \times F_{m,c,h,w}
+\quad \Longrightarrow \quad
+O_m = I_{chw} \times F_{m,chw}.$$
+
+Read this as: flatten the input-channel and spatial ranks into one reduction rank.
+
+---
+
+## Hardware Implications
+
+### Data Reuse Is the Central Resource
+
+The lecture's CI examples and CONV equations point to the same hardware issue: efficiency improves when values are reused near compute.
+
+CONV has three major reuse opportunities:
+
+- **Weight reuse:** one weight $F_{m,c,r,s}$ contributes to many output positions and batch elements.
+- **Input reuse:** one input activation can be used by multiple overlapping windows and multiple filters.
+- **Output reuse:** one partial sum is updated many times before it becomes a final output value.
+
+The accelerator's mapping decides which reuse is easiest to exploit.
+
+### Partial Sums Are Data, Too
+
+Beginners often count only input activations and weights as memory traffic. That misses partial sums. A partial sum may be read and written many times if the mapping cannot keep it local. The achieved-CI example in the first half of the lecture is deliberately chosen to show this.
+
+### More Parallelism Is Not Always More Throughput
+
+The Roofline Model explains why. If the implementation sits on the memory-bandwidth slope, more MAC lanes can sit idle waiting for data. The right fix may be tiling, a different loop order, more local buffering, better reuse, compression, or a different dataflow.
+
+### Shape Parameters Are Hardware Parameters
+
+Changing $R,S,C,M,P,Q,N,U$ changes more than neural-network accuracy. It changes loop bounds, buffer capacity needs, interconnect traffic, and reuse. For example:
+
+- increasing $M$ increases output channels and filter count,
+- increasing $C$ increases reduction work per output,
+- increasing $R$ and $S$ increases receptive field and products per output,
+- increasing $U$ reduces output spatial size,
+- increasing $N$ can improve weight reuse but increases activation and output storage.
+
+### FC and CONV Stress Memory Differently
+
+CONV often has rich spatial reuse due to sliding windows. FC after flattening has a simpler dense matrix structure, but at batch size 1 its weights may have little reuse. With larger batch size, FC becomes matrix-matrix multiplication and can reuse weights across examples.
+
+---
+
+## Common Misconceptions
+
+### Misconception: An Einsum Is a Loop Nest
+
+An Einsum defines the mathematical computation and iteration space. A loop nest chooses a traversal order. Many loop nests can implement the same Einsum, and they can have very different memory traffic.
+
+### Misconception: Compute Intensity Is a Fixed Property of a Layer
+
+Best-case CI is a theoretical upper bound under a traffic model. Achieved CI depends on mapping, buffering, and hardware behavior. The same layer can have different achieved CI on different accelerators.
+
+### Misconception: Convolution Means the Filter Is Mathematically Flipped
+
+Many deep-learning libraries implement cross-correlation while calling it convolution. For this hardware lecture, the important issue is not the signal-processing convention but the sliding-window multiply-accumulate pattern and its data reuse.
+
+### Misconception: Stride Only Reduces Compute
+
+Stride reduces output size and therefore compute, but it also changes sampling and overlap reuse. A larger stride can reduce the number of partial sums while also reducing how much neighboring windows share input data.
+
+### Misconception: FC Is Completely Different From CONV
+
+FC is a special case of CONV with $R=H$ and $S=W$. The difference is not a new kind of arithmetic; it is the shape and reuse pattern.
+
+### Misconception: Activation, NORM, and POOL Are Architecturally Irrelevant
+
+They usually do not dominate MAC count like CONV, but they can still affect fusion, buffering, memory traffic, precision, and control. A good accelerator often handles them near the CONV/FC datapath to avoid extra memory round trips.
+
+---
+
+## Paper and Source Bridge
+
+### Local PDF Note
+
+The repository currently includes local PDFs for Batch Normalization and TeAAL, but not for the original Roofline CACM 2009 paper. BatchNorm and TeAAL are treated as paper-verified bridges; Roofline remains slide-anchored.
+
+### Paper Bridge: Batch Normalization
+
+**Bibliographic identity:** Sergey Ioffe and Christian Szegedy, *Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift*, ICML 2015. Local PDF: `papers/L02_BatchNorm_Ioffe_ICML2015.pdf`.
+
+**Problem addressed:** Deep networks are hard to train partly because the distribution of a layer's inputs changes as earlier layers update. The paper names this effect **internal covariate shift** and proposes to stabilize layer inputs during training.
+
+**Core idea:** For each mini-batch, normalize activations using mini-batch mean and variance, then apply learned scale and shift parameters. In the paper notation, a normalized activation is transformed by learned $\gamma$ and $\beta$ so the layer can still represent useful scales, including the identity-like case when needed.
+
+**Relevance to this lecture:** L02 introduces DNN components beyond CONV and FC. BatchNorm is a good example of a layer whose MAC count is not the main story: it changes training behavior, inference-time computation, fusion opportunities, and memory traffic around adjacent layers.
+
+**Key claims used here:**
+
+- The paper defines internal covariate shift as a change in the distribution of network activations caused by changing network parameters during training. Source anchor: Section 2.
+- The mini-batch transform computes mini-batch mean and variance, normalizes the activation, then applies learned scale and shift. Source anchor: Algorithm 1.
+- During inference, BatchNorm should not depend on the current mini-batch; the paper uses population statistics and a fixed linear transform. Source anchor: Section 3 and Algorithm 2.
+- For convolutional layers, the paper applies normalization over both mini-batch examples and spatial locations for a feature map. Source anchor: Section 3.2.
+
+**What students should remember:** BatchNorm is not just another arithmetic layer. It changes the training/inference distinction and often becomes a fusion target in hardware or compiler implementations because repeatedly materializing BN outputs can waste memory bandwidth.
+
+**Limitations and assumptions:** BatchNorm's training benefit is paper-derived and optimizer/model dependent. For accelerator design in this chapter, the important point is not the exact training-speed claim, but that non-CONV components can affect scheduling, fusion, storage, and inference datapaths.
+
+**Suggested insertion points:** Read this bridge after the chapter's discussion of activation, normalization, and pooling layers. It explains why "non-CONV layers" still matter architecturally.
+
+### Source Bridge: TeAAL and HiFiber
+
+**Bibliographic identity:** *TeAAL: A Declarative Framework for Modeling Sparse Tensor Accelerators*, MICRO 2023. Local PDF: `papers/TeAAL.pdf`.
+
+**Problem addressed:** Accelerator design needs concise workload descriptions and precise implementation descriptions. Without separation of concerns, it is hard to compare mappings, formats, and hardware bindings systematically.
+
+**Core idea:** Use Einsums to describe tensor algebra workloads, then separately describe mapping, format, and binding.
+
+**Relevance to this lecture:** Lecture 02 uses TeAAL to introduce the course methodology and to justify why Einsum is the input format for workload modeling tools.
+
+**Key claims used here:**
+
+- TeAAL expresses computations as extended Einsums and leaves iteration order to mapping. Source anchor: paper Section 2.2.
+- Mapping includes loop order, rank partitioning, and work scheduling. Source anchor: paper Section 2.3.
+- TeAAL specifications include computation, mapping, format, architecture, and binding information that can be lowered into performance models. Source anchor: paper Sections 3-4.
+- The lecture's design flow of architecture description, workload development, evaluation, comparison, and optimization is the course-facing version of this specification discipline. Source anchor: Lecture 02 slides 4-8, 21, and 44.
+
+**What students should remember:** TeAAL is not introduced as a software detail. It is introduced to discipline architectural thinking: specify the computation first, then explore mappings and hardware.
+
+### Source Bridge: Roofline Model
+
+**Bibliographic identity:** Lecture 02 slides cite Williams, Waterman, and Patterson, *Roofline: An Insightful Visual Performance Model for Multicore Architectures*, Communications of the ACM, 2009. No local PDF is present in this repository.
+
+**Problem addressed:** Designers need a simple way to decide whether performance is limited by memory bandwidth or compute throughput.
+
+**Core idea:** Plot achievable throughput as a function of compute intensity. The maximum is limited by either the bandwidth slope or the compute roof.
+
+**Relevance to this lecture:** The model explains why CI matters: low-CI implementations cannot use more compute lanes unless memory traffic is reduced or bandwidth increases.
+
+**Key claims used here:**
+
+- Roofline visualizes throughput using memory bandwidth, compute parallelism, and compute intensity (Lecture 02 slides 42-43).
+- When memory-bound, increasing the number of lanes does not necessarily increase throughput (Lecture 02 slide 43).
+
+**What students should remember:** Roofline is not merely a graph. It is a design diagnostic: it tells you which resource to optimize first.
+
+---
+
+## Connections
+
+### Connection to L01
+
+L01 motivates DNN accelerators by discussing AI demand, energy cost, and the need for specialized architectures. L02 gives the vocabulary needed to make that motivation precise: tensors, Einsums, compute intensity, memory traffic, and CNN layer shapes.
+
+### Connection to L03 and L04
+
+L03 and L04 extend the tensor-algebra language. The matrix-vector and CONV Einsums here are the first examples. Later lectures apply similar reasoning to more complex operations, including transformer and attention computations.
+
+### Connection to L05 and L06
+
+L05 and L06 are about mapping, dataflow, and partitioning. The seven-loop CONV nest in this lecture is the object being mapped. Output-stationary, weight-stationary, and input-stationary dataflows are different answers to the question: which tensor should stay close to the PEs?
+
+### Connection to L07-L10
+
+The dense work count $NMPQCRS$ becomes the baseline for sparsity. Sparse accelerators try to skip zeros in weights or activations, but they must pay for metadata, irregular traversal, and load balancing.
+
+### Connection to L11-L13
+
+The FC-as-matrix-multiply view becomes important for advanced technologies and precision. Matrix-vector and matrix-matrix kernels are common demonstrations for reduced precision and compute-in-memory ideas.
 
 ---
 
 ## Standalone Study Guide
 
-### What to master before moving on
+### How to Study This Lecture Without Video
 
-- Translate FC and CONV layers into Einsum notation and loop nests.
-- Identify the tensor ranks in a convolution: batch, channel, filter, output spatial, input spatial, and kernel spatial ranks.
-- Explain how stride, padding, filter size, and channel count change both work and data movement.
-- Use arithmetic intensity and Roofline reasoning to compare layers, not just full networks.
+1. First, make sure you can explain $Z_m = A_{k,m} \times B_k$ in words. Identify $m$ as free and $k$ as reduced.
+2. Re-derive the best-case and achieved CI formulas. Do not memorize the final numbers; understand which data movement terms appear and why.
+3. Draw a $5 \times 5$ input and a $3 \times 3$ filter. Count legal filter positions for stride 1 and stride 2.
+4. Memorize the CNN decoder-ring variables only after you understand which tensor each variable belongs to.
+5. Write the CONV Einsum and point to the output indices $n,m,p,q$ and reduction indices $c,r,s$.
+6. Explain FC as CONV with $R=H,S=W$, then flatten $C,H,W$ into $CHW$.
+7. For each equation, ask: what values are reused, where could partial sums live, and what would happen if they spilled to DRAM?
 
-### Self-check questions
+### Self-Check Questions
 
-1. Why is a fully-connected layer a special case of convolution?
-2. In a 2-D convolution, which ranks are free output ranks and which ranks are reduction ranks?
-3. Why can a layer with fewer MACs still be harder to accelerate efficiently?
+1. In $Z_m = A_{k,m} \times B_k$, why is $k$ a reduction index and $m$ a free index?
+2. Why is the iteration-space size for the matrix-vector example $K \times M$?
+3. What data movement terms appear in the best-case CI denominator, and why?
+4. Why does the achieved-CI example include $(K-1) \times M$ loads of $Z_m$?
+5. What does the Roofline Model say if an implementation is on the memory-bandwidth slope?
+6. For a $7 \times 7$ input, $3 \times 3$ filter, stride $1$, and no padding, what are $P$ and $Q$?
+7. For a $5 \times 5$ input, $3 \times 3$ filter, stride $1$, and padding $1$, why does the output remain $5 \times 5$?
+8. In the CONV Einsum, which indices define the output tensor shape?
+9. Why does each CONV output activation require $C \times R \times S$ products?
+10. Why does batching make FC closer to matrix-matrix multiplication?
 
 ### Exercises
 
-1. Write the Einsum for a batched matrix-vector FC layer and then for the same layer with batch processed as matrix-matrix multiply.
-2. For a simple CONV layer, list every tensor touched by the innermost loop and state which values are reused across adjacent output pixels.
-3. Choose one CNN architecture from the slides and explain which design choices reduce spatial size, channels, or filters.
-
-### Common traps
-
-- Treating "CONV becomes matrix multiplication" as meaning the data movement is automatically the same. The lowering can duplicate or reorder data.
-- Forgetting that `C` is a reduction rank while `M` is an output rank.
-- Ignoring batch size when comparing FC and CONV efficiency.
+1. **Conceptual:** Explain why "more parallelism" is not a complete accelerator optimization strategy. Use Roofline vocabulary.
+2. **Calculation:** Let $K=64$ and $M=32$ for $Z_m = A_{k,m} \times B_k$. Compute $\mathrm{CI}_{\text{best}}$ and $\mathrm{CI}_{\text{achieved}}$ using the lecture's formulas.
+3. **Shape reasoning:** A CONV layer has $N=4$, $C=16$, $H=W=28$, $R=S=3$, $M=32$, stride $U=1$, and padding $1$. Compute $P$, $Q$, output tensor size, and multiplication count.
+4. **Data reuse:** For the layer in exercise 3, list one reuse opportunity for weights, inputs, and output partial sums.
+5. **Design tradeoff:** Suppose a mapping keeps weights stationary but spills output partial sums frequently. Which traffic term might grow, and how would that affect CI?
+6. **FC bridge:** For $C=8$, $H=W=4$, $M=10$, and batch size $N=1$, write the FC matrix-vector shape. Then repeat for $N=16$ as matrix-matrix multiplication.
+7. **Source bridge:** Read Lecture 02 slides 42-43. Explain in your own words why a workload can be far from the roof even if its CI is high enough to be compute-bound.
 
 ---
 
 ## Key Terms
 
-| Term | Gloss |
+| Term | Definition |
 |---|---|
-| **Tensor** | A multi-dimensional array; characterized by its number of ranks and the shape of each rank. |
-| **Rank** | One dimension of a tensor (this course's preferred term over "dimension"). |
-| **Einsum** | Einstein summation notation: a compact expression specifying what computation is performed, without fixing loop order. Indices appearing only on the right are summed over. |
-| **Iteration space** | The Cartesian product of all legal index values in an Einsum; its size equals the number of multiplications. |
-| **Compute intensity (CI)** | Multiplications per value accessed; measures the potential for data reuse. |
-| **Best-case CI** | CI achieved when every value is accessed the minimum number of times (maximum reuse). |
-| **Achieved CI** | CI realized by a specific loop order / mapping; always ≤ best-case CI. |
-| **Roofline Model** | A visual model showing achievable throughput as a function of CI, memory bandwidth, and compute parallelism. |
-| **CONV layer** | Convolutional layer: slides R×S×C filters across an H×W×C input to produce P×Q×M output. |
-| **FC layer** | Fully-Connected layer: a special CONV with R=H, S=W; equivalent to matrix–vector (or matrix–matrix) multiply. |
-| **Input fmap** | Input feature map — the activation tensor input to a layer. |
-| **Output fmap** | Output feature map — the activation tensor produced by a layer. |
-| **Filter / kernel / weight** | The learned weight tensor for a CONV or FC layer. |
-| **Stride (U)** | Step size of the sliding window; stride > 1 downsamples the output. |
-| **Zero padding** | Zeros added around the input boundary to control output spatial size. |
-| **N, C, H, W, R, S, M, P, Q, U** | The ten canonical CONV loop variables (CNN decoder ring). |
-| **Partial sum (psum)** | An intermediate accumulation result in the CONV inner loop; must be stored until the full sum over c, r, s is complete. |
-| **Batch size (N)** | Number of images/samples processed simultaneously; N > 1 promotes FC to matrix–matrix multiply. |
-| **Receptive field** | The region of the input fmap that contributes to one output activation; grows with depth and filter size. |
-| **Cascade of Einsums** | A sequence of Einsums describing the full forward pass of a network (TeAAL workload specification). |
-| **Stationarity** | Keeping a data operand stationary in a register across multiple MACs to exploit reuse (e.g., keeping B[k] in a register across the m-loop). |
+| Tensor | A multi-dimensional array of values. In this course, tensors describe activations, weights, outputs, and other DNN data. |
+| Rank | One named dimension of a tensor, such as $C$, $H$, or $W$. |
+| Rank shape | The number of elements along a rank. |
+| Tensor size | The product of all rank shapes. |
+| Einsum | A compact notation for tensor algebra; it specifies the computation without fixing loop order. |
+| Free index | An index that appears in the output; it names output coordinates. |
+| Reduction index | An index that appears on the right-hand side but not the output; values are summed over it. |
+| Iteration space | The Cartesian product of all legal index values in an Einsum. Its size is the amount of loop work. |
+| Mapping | The traversal policy for the iteration space, including loop order, tiling, and parallelism. |
+| Format | The data representation, such as dense or sparse encoding. |
+| Binding | The assignment of mapped computation and data to hardware resources. |
+| Compute intensity (CI) | Multiplications per value accessed. It indicates how much arithmetic is obtained per data movement. |
+| Best-case CI | Theoretical upper-bound CI under a minimum-traffic assumption. |
+| Achieved CI | CI produced by a specific implementation, mapping, and storage behavior. |
+| Roofline Model | A throughput model that compares compute intensity, memory bandwidth, and peak compute throughput. |
+| CNN | Convolutional neural network, a deep network built largely from convolutional layers plus auxiliary layers. |
+| CONV layer | A layer that applies learned filters over local input regions and sums products to produce output feature maps. |
+| Feature map (fmap) | An activation tensor, often viewed as channels of spatial maps. |
+| Filter / kernel | The learned weight tensor used by a CONV layer. |
+| Receptive field | The input region that contributes to one output activation. |
+| Stride ($U$) | The step size between neighboring filter positions. |
+| Zero padding | Zeros added around input boundaries to control output size. |
+| Channel ($C$ or $M$) | A feature dimension; $C$ is input channels and $M$ is output channels in this course's CONV notation. |
+| Batch size ($N$) | The number of examples processed together. |
+| Partial sum (psum) | An intermediate output accumulation before all reduction products have been added. |
+| Activation | A pointwise nonlinear operation, often applied after CONV or FC. |
+| NORM | A normalization layer used to control activation statistics. |
+| POOL | A downsampling layer over local spatial regions. |
+| FC layer | Fully connected layer; equivalent to CONV with $R=H$ and $S=W$, and to matrix-vector/matrix-matrix multiplication after flattening. |
 
 ---
 
 ## Takeaways
 
-- The **TeAAL five-step methodology** (describe architecture → develop workload → evaluate → compare → optimize) is the structured approach to accelerator design used throughout this course.
-- An **Einsum** precisely specifies what a DNN layer computes without imposing any loop order. The loop order is the **mapping** — a separate, hardware-critical decision.
-- **Compute intensity (multiplications/value)** is the workload's fundamental characterization. The gap between best-case CI and achieved CI directly reflects unexploited data reuse.
-- The **Roofline Model** reveals whether a design is **memory-bound** (CI too low → add reuse, not lanes) or **compute-bound** (CI high enough → add parallelism).
-- **CONV layers dominate CNN computation (>90%)**: seven nested loops over N, M, P, Q, C, R, S; total work = N × M × P × Q × C × R × S MACs.
-- **Stride** controls spatial downsampling; **zero padding** controls output size preservation. Both appear in the output-size formula P = (H − R + U) / U.
-- An **FC layer is CONV with R = H, S = W** (filter covers the full input). With batch size N, it reduces to **matrix–matrix multiply** — a well-studied high-throughput kernel.
+1. Lecture 02 is not just a CNN overview. It establishes the tensor-algebra language used throughout the course.
+2. An Einsum specifies computation; a mapping specifies traversal. Confusing these two hides the real accelerator design space.
+3. Compute intensity links workload structure to memory traffic and throughput.
+4. The gap between best-case and achieved CI is a concrete way to see unexploited reuse.
+5. Roofline reasoning tells the architect whether to optimize bandwidth/reuse or compute parallelism first.
+6. CONV dominates typical CNN computation and has the key loop structure $N,M,P,Q,C,R,S$.
+7. Stride and padding are not cosmetic neural-network details; they change output shape, work, reuse, and buffer needs.
+8. FC is a special CONV case and becomes matrix-matrix multiplication when batched.
+9. Partial sums are first-class hardware data; failing to keep them local can dominate traffic.
+10. This lecture prepares the ground for dataflow, partitioning, sparsity, precision, and advanced accelerator technologies.
 
 ---
 
-## Connections to Later Lectures
+## Appendix
 
-- **Einsums as the universal workload language** → **L03–L04** (memory traffic analysis, Einsum for other DNN operations including transformers and attention). The Einsum framework introduced here is the standard input to all modeling tools used in the labs.
-- **Compute intensity and the Roofline Model** → **L03** (memory and metrics): the CI analysis begun here is extended to the full memory hierarchy and to realistic hardware bandwidth constraints.
-- **CONV mapping — which loop to tile and in what order** → **L05–L06** (dataflows and partitioning). The seven-nested-loop CONV is exactly the loop nest whose order and tiling are the central design variables of those lectures.
-- **Data reuse and stationarity** → **L05** (dataflows): weight-stationary, output-stationary, and input-stationary dataflows are strategies for keeping one of the three CONV tensors (weights F, output psum O, or input activations I) stationary in the register file to maximize reuse.
-- **CONV operation counts and sparse CONV** → **L07–L10** (sparsity): once you know the dense operation count (N × M × P × Q × C × R × S), sparsity in weights or activations reduces the effective iteration space — but only if the hardware can find and skip the zeros.
-- **FC as matrix multiply** → **L11–L13** (reduced precision, compute-in-memory): the matrix–matrix multiply structure of batched FC is the canonical kernel for in-memory computing and reduced-precision arithmetic demonstrations.
+### Slide-to-Section Map
 
----
+| Slide range | Chapter section | Notes |
+|---|---|---|
+| L02-1-L02-2 | Title and outline | Used to frame the two-part lecture structure |
+| L02-3-L02-8 | Main Narrative: From Workload to Hardware | TeAAL methodology and separation of concerns |
+| L02-9-L02-20 | Tensors, Ranks, and Einsums | Expanded with free/reduction index explanations |
+| L02-21-L02-26 | Compute Intensity and Roofline Reasoning | Best-case CI derivation |
+| L02-27-L02-40 | Compute Intensity and Roofline Reasoning | Mapping-dependent achieved traffic and stationarity |
+| L02-41 | Compute Intensity and Roofline Reasoning | Numerical CI example with $K=250$, $M=100$ |
+| L02-42-L02-43 | Compute Intensity and Roofline Reasoning; Paper and Source Bridge | Roofline Model |
+| L02-44 | Main Narrative | Methodology recap |
+| L02-45-L02-52 | DNN Workloads and CNN Components | CNN applications, layer types, CONV dominance |
+| L02-53-L02-64 | CONV Layer | Single-channel convolution and stride-1 worked example |
+| L02-65-L02-71 | CONV Layer | Stride examples and downsampling interpretation |
+| L02-72-L02-74 | CONV Layer | Zero padding and framework caveats |
+| L02-75 | CONV Layer | Depth and receptive-field growth |
+| L02-76-L02-80 | Multichannel CONV and Decoder Ring | $N,C,H,W,R,S,M,P,Q,U$ |
+| L02-81-L02-83 | CONV Einsum and Naive Loop Nest | Expanded with output/reduction index interpretation |
+| L02-84-L02-91 | Fully Connected Layers | FC as full-input CONV and flattening |
+| L02-92-L02-102 | Fully Connected Layers | Matrix-vector and matrix-matrix views |
 
-## Appendix — Slide-to-Section Map
+## Source Notes
 
-| Slides | Section |
-|---|---|
-| L02-1 | Title |
-| L02-2 | Outline |
-| L02-3 … L02-8 | Ch.1 — TeAAL design methodology and separation of concerns |
-| L02-9 … L02-20 | Ch.1 — Tensors, ranks, and Einsum definition (ODE) |
-| L02-21 … L02-43 | Ch.1 — Workload evaluation: compute intensity, Roofline Model |
-| L02-44 | Ch.1 — Full methodology recap |
-| L02-45 … L02-52 | Ch.2 — CNN structure and layer types |
-| L02-53 … L02-75 | Ch.3 — CONV layer anatomy, 2D worked example, stride, zero padding |
-| L02-76 … L02-83 | Ch.3 — Multi-channel CONV (C inputs, M outputs), decoder ring, Einsum, loop nest |
-| L02-84 … L02-91 | Ch.4 — FC layer definition and equivalence to CONV |
-| L02-92 … L02-102 | Ch.4 — FC as matrix-vector and matrix-matrix multiply, batch Einsum |
+- The lecture ordering and terminology follow Lecture 02 slides.
+- The TeAAL methodology and separation-of-concerns discussion is based on Lecture 02 slides 3-8, 21, 27-28, and 44 plus the local `papers/TeAAL.pdf`, especially Sections 2.2, 2.3, and 3-4.
+- The tensor, rank, Einsum, and ODE explanations are based on Lecture 02 slides 9-20.
+- The compute-intensity formulas and $K=250, M=100$ numerical values are based on Lecture 02 slides 23-26 and 38-41.
+- The Roofline discussion is based on Lecture 02 slides 42-43, which cite Williams, Waterman, and Patterson, CACM 2009.
+- The CNN component taxonomy and CONV dominance claim are based on Lecture 02 slides 45-52.
+- The CONV shape, stride, padding, decoder-ring, and Einsum material is based on Lecture 02 slides 53-83.
+- The FC-to-matrix-vector and FC-to-matrix-matrix derivations are based on Lecture 02 slides 85-102.
+- Worked examples not directly shown in the slides are original teaching examples derived from the slide equations.
+
+## Uncertainty Notes
+
+- This chapter reconstructs the likely spoken explanation from slides and source anchors; the live lecture may have emphasized some examples differently.
+- The chapter uses standard floor-form convolution output formulas as background explanation. Lecture 02 presents a simplified exact-division formula on slides 64, 69, 70, and 74.
+- The chapter does not embed slide images. Existing local assets may still contain slide-derived images; a repository-level copyright audit should decide whether to keep, remove, or replace them.

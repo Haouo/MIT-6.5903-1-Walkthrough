@@ -1,345 +1,501 @@
-# L04 — Einsums and Transformers
+# L04 - Einsums and Transformers
 
-> **Course:** 6.5930/1 — Hardware Architectures for Deep Learning
-> **Instructors:** Joel Emer & Vivienne Sze (MIT EECS)
-> **Lecture date:** February 13, 2026 · **Slides:** 198 · **Source:** [`Lecture/L04-Einsums+Transformers.pdf`](../../Lecture/L04-Einsums+Transformers.pdf)
+> **Course:** 6.5930/1 - Hardware Architectures for Deep Learning
+> **Instructors:** Joel Emer and Vivienne Sze (MIT EECS)
+> **Lecture date:** February 13, 2026. **Slides:** 198. **Source:** [`Lecture/L04-Einsums+Transformers.pdf`](../../Lecture/L04-Einsums+Transformers.pdf)
 >
-> *This is a conceptual walkthrough that reconstructs the lecture's narrative from the slides. The deck is animation-heavy (198 physical pages condense to roughly 50 unique concept slides, with the remainder being incremental build states of the same figure). This walkthrough synthesizes each build sequence into a single, complete explanation. Each section cites the slide range it draws from so you can follow along with the original deck.*
+> This chapter reconstructs the missing lecture narration from the public slides. It is not a slide summary. L04 is animation-heavy, especially in the FC/CONV lowering section, so slide ranges are used as source anchors while the explanation is organized as a self-contained textbook chapter.
 
 ---
 
 ## TL;DR
 
-The course's notation for describing DNN computations is the **Einsum** — a compact algebraic expression that names every tensor operand, every rank (index), and the arithmetic operator, but deliberately says *nothing* about the order in which the computation is carried out. This lecture defines Einsums precisely through an **Operational Definition (ODE)**, shows how rank variables encode contracted vs. uncontracted dimensions, and demonstrates that **every canonical DNN layer** — matrix–vector multiply, matrix–matrix multiply, fully connected (FC), and 2-D convolution (CONV) — can be expressed as, and reduced to, a single Einsum. The second half pivots to **Transformer attention**: Einsums spell out every step of the Q/K/V computation chain, making the structure of self-attention as transparent as a matrix multiply. The central hardware insight is that the *Einsum* is the "Compute" specification at the top of the TeAAL pyramid — it answers *what* is computed but leaves *how* (mapping, dataflow, tiling) entirely open for later lectures.
+L04 deepens the course's formal compute language: **Einsum**. An Einsum describes tensor computation by naming operands, ranks, and arithmetic relationships, but it deliberately does not choose a loop order, dataflow, tiling, or memory placement. In hardware terms, an Einsum is the contract for *what* must be computed; later mapping lectures decide *how* to execute it.
+
+The lecture has three connected messages. First, rank variables tell us which tensor dimensions are preserved and which are reduced. A rank that appears on the right-hand side but not on the left-hand side is a **contracted rank**; it becomes a summation. Second, common DNN kernels can be rewritten into matrix multiplication by **flattening** or **partitioning** ranks. Fully connected layers flatten naturally. Convolution can be lowered to matrix multiplication by exposing its sliding-window, Toeplitz-like structure. Third, Transformer self-attention is also a cascade of Einsums: projections form $Q$, $K$, and $V$; $QK^T$ creates attention scores; $\mathrm{softmax}$ normalizes them; $AV$ combines value vectors; and a final projection produces the output.
+
+The hardware lesson is not "everything is just GEMM." The lesson is sharper: once computation is expressed as ranks and contractions, an architect can reason about reuse, movement, parallelism, intermediate storage, and reductions systematically. L05, L06, L09, and L13 all depend on this rank-level view.
+
+---
+
+## What Problem This Lecture Solves
+
+L02 introduced DNN layers as tensor operations, and L03 introduced the memory/metric reason that computation alone is not enough. L04 solves the representation problem that sits between those ideas:
+
+> How can we write FC, CONV, and self-attention in one notation that is precise enough for hardware mapping but abstract enough not to prematurely choose an implementation?
+
+Ordinary layer names hide too much. "Convolution" tells us a filter slides over an input, but not which loop ranks exist or which rank is reduced. "Attention" tells us tokens interact dynamically, but not which matrix products create the $M \times M$ score tensor. A hardware architect needs the rank structure, because ranks become loops, loops become schedules, and schedules determine movement through the memory hierarchy.
+
+The solution is to use Einsums as the compute-level interface. The same notation can express $Z_{m,n} = \sum_k A_{m,k}B_{k,n}$, $O_q = \sum_s I_{q+s}F_s$, and $AV_{p,f} = \sum_m A_{m,p}V_{m,f}$. These look different as neural-network layers, but they are the same kind of object for mapping: named output ranks, named reduction ranks, and tensor accesses.
+
+---
+
+## Why This Lecture Matters
+
+For a student without the lecture video, the most important transition is this: L04 is not trying to teach linear algebra for its own sake. It is teaching the notation that later lets the course ask hardware questions rigorously.
+
+The same mathematical Einsum can be executed in many orders. For $Z_{m,n} = \sum_k A_{m,k}B_{k,n}$, a CPU loop nest might iterate $m$, then $n$, then $k$. A systolic array might stream $A$ and $B$ in different directions. A tensor compiler might tile all three ranks. All are valid if they visit the same iteration space and accumulate the same contracted rank. The numerical result is fixed; data movement is not.
+
+This distinction matters for:
+
+- **Energy:** rank order controls whether operands are reused from RF, SRAM, or DRAM.
+- **Bandwidth:** tensor lowering can create regular GEMM traffic, but may duplicate data.
+- **Latency:** reductions and softmax create dependencies that cannot always be parallelized away.
+- **Area:** supporting large intermediates such as the attention matrix $A \in \mathbb{R}^{M \times M}$ requires storage or fusion.
+- **Utilization:** flattened and partitioned ranks expose different parallel loops to a PE array.
+- **Correctness:** contracted ranks must be accumulated exactly once per legal coordinate, even if the loop order changes.
+
+---
+
+## Prerequisites and Mental Model
+
+You should bring three ideas from earlier lectures.
+
+First, from L02, tensors have named dimensions. A 2-D convolution uses output channels, input channels, output spatial ranks, and filter spatial ranks. These are not just shapes; they are the loops a machine must eventually execute.
+
+Second, from L03, memory movement is expensive and evaluation must include data movement, not only MAC count. L04 does not yet choose mappings, but it exposes the ranks that mappings will reorder and tile.
+
+Third, from L03's first introduction to Einsum, the expression specifies a mathematical computation, not an execution order.
+
+The mental model for this chapter is:
+
+```text
+Einsum expression
+    -> ranks and tensor accesses
+    -> legal iteration space
+    -> many possible loop nests
+    -> many possible data-movement costs
+```
+
+When you see an Einsum, ask four questions:
+
+1. Which ranks appear on the output?
+2. Which ranks appear only on the right-hand side and are therefore reduced?
+3. Do any tensor accesses combine ranks, such as $q+s$ or $U \times p+r$?
+4. Which ranks could be flattened, partitioned, tiled, or parallelized later?
 
 ---
 
 ## Learning Objectives
 
-After this lecture you should be able to:
+After studying this chapter, you should be able to:
 
-- State the **Operational Definition for Einsums (ODE)** and apply it to evaluate any Einsum.
-- Distinguish **contracted** and **uncontracted ranks** in an Einsum and identify which determines reduction vs. iteration.
-- Recognize that Einsum expressions for the **same computation** can be written in multiple equivalent forms (different index letter names, different rank orderings).
-- Describe **partitioning** (splitting a rank into two) and **flattening** (merging two ranks into one) as complementary operations that leave the underlying computation unchanged.
-- Write the Einsum for a **1-D convolution**, a **2-D CONV layer**, and an **FC layer**, and convert any of them to a matrix multiplication.
-- Trace all seven Einsum steps of **basic self-attention** (embedding → Q/K projection → QK product → softmax → V projection → AV product → output projection).
-- Extend single-head attention to **multi-head attention (MHA)** by adding an H rank.
-- Explain why the number of MACs in attention **scales quadratically** with the sequence length M.
-
----
-
-## Chapter 1 — The Einsum: A Precise Language for DNN Computation
-
-> *Slides: L04-1 … L04-19*
-
-### The Operational Definition for Einsums (ODE)
-
-The lecture opens with a motivating example:
-
-$$Z_{m,n} = A_{m,k} \times B_{n,k}$$
-
-This expression is an **Einsum**. Every subscript is a **rank variable** (an index ranging over some dimension). The lecture defines evaluation via the **Operational Definition for Einsums (ODE)**:
-
-1. Traverse **all points** in the space of all legal rank-variable values — the **iteration space**.
-2. At each point, compute the right-hand side using the operand values at the specified rank coordinates.
-3. **Assign** the result to the left-hand operand at the specified rank coordinates — unless that operand is non-zero, in which case **reduce** (accumulate) the value into it.
-
-![Einsum ODE — example Einsum and operational definition](../../assets/L04/L04-p04-ode-example-einsum.png)
-
-The ODE is deliberately order-agnostic. It tells you *what* to compute (the result at every point in iteration space) but says nothing about the sequence of operations. That freedom is the whole point: the same Einsum can be evaluated by any legal loop nest, and different loop nests correspond to different hardware **dataflows** — the subject of L05–L06.
-
-### Contracted vs. uncontracted ranks
-
-In the matrix–matrix multiply `Z_{m,n} = A_{m,k} × B_{k,n}`:
-
-- `k` appears on the right-hand side only, *not* on the left. It is a **contracted rank**: its values are summed over (reduced) to produce each output element.
-- `m` and `n` appear on both sides. They are **uncontracted ranks**: each distinct (m, n) pair yields one independent output element.
-
-The distinction is fundamental. Contracted ranks determine the arithmetic work for each output point; uncontracted ranks determine the shape of the output tensor.
-
-### Tensor references and rank naming
-
-The slides introduce a notation for specifying rank names and rank shapes independently of the index letters used as variables. A tensor `A_{k,m}` with rank names "K", "M" and rank shapes K, M can also be written `A^{K,M}_{k,m}` to be explicit. Crucially, **the order of rank variables in the subscript does not affect what the Einsum computes** — the pairing of variable to rank is positional but the iteration space is the Cartesian product regardless of listing order.
-
-### Einsum patterns: the whole DNN zoo in one slide
-
-Slide 8 catalogs the main pattern families:
-
-| Einsum | Operation |
-|---|---|
-| `Z_{m,n} = A_{m,k} × B_{k,n}` | Matrix–matrix multiply (k contracted) |
-| `Z_m = A_{k,m} × B_k` | Matrix–vector multiply |
-| `Z_{m,n} = A_m × B_n` | Cartesian (outer) product |
-| `Z_m = A_m × B_m` | Element-wise multiply |
-| `Z_m = A_m + B_m` | Element-wise addition (operator is + not ×) |
-
-The key observation: the *name* of the rank variables is irrelevant (`Z_{p,q} = A_{p,r} × B_{q,r}` is still matrix–matrix multiply). What matters is which variables are shared, which appear only on the right (contracted), and which appear on both sides (uncontracted).
-
-![Einsum patterns — matrix-matrix multiply and its variants](../../assets/L04/L04-p08-einsum-patterns.png)
-
-### Rank variable patterns: tuples as single indices
-
-When two or more rank variables always appear together as a coordinate pair — `Z_{i,j} = A_{i,j} × B_{i,j}` — they can be flattened into a single compound index `ij = i × J + j`, yielding `Z_{ij} = A_{ij} × B_{ij}`. This is a pure notational convenience; the iteration space is the same.
-
-### Partitioning: splitting one rank into two
-
-Given `Z_i = A_i × B_i`, if we substitute `i = i1 × I0 + i0`, we obtain:
-
-$$Z_{i1,i0} = A_{i1,i0} \times B_{i1,i0}$$
-
-This is a **partitioned Einsum**. The original vector index `i` has been split into a coarse index `i1` and a fine index `i0`. The computation is identical; we have only changed how we *label* elements of the iteration space. **Partitioning always adds a rank.** Flattening always removes a rank. Together they are inverses.
-
-![Partitioned tensor visualization — vector A split into tiles along i1, i0](../../assets/L04/L04-p12-partitioned-tensor.png)
-
-> **Why it matters:** Partitioning is the algebraic foundation of **tiling** — the mapping technique (L05–L06) that breaks a large computation into chunks that fit in a small buffer. The Einsum notation makes tiling explicit and correct by construction.
+- State the Operational Definition for Einsums (ODE) and use it to evaluate a small expression.
+- Distinguish rank variables, rank names, and rank shapes.
+- Identify contracted and uncontracted ranks in matrix multiplication, convolution, and attention.
+- Explain why renaming rank variables does not change the computation.
+- Explain partitioning and flattening as inverse rank transformations.
+- Convert a fully connected layer to matrix-vector or matrix-matrix multiplication by flattening ranks.
+- Explain how convolution lowering creates a Toeplitz/im2col tensor and why that tensor may duplicate input values.
+- Trace the self-attention cascade as Einsums: embedding, $Q/K/V$ projections, $QK$, $\mathrm{softmax}$, $AV$, and output projection.
+- Explain why standard attention scales quadratically with sequence length $M$.
+- Connect the L04 rank notation to L05 dataflows, L06 partitioning, sparse traversal, and L13 data-movement analysis.
 
 ---
 
-## Chapter 2 — Convolution as an Einsum
+## 1. Einsum Is a Compute Contract
 
-> *Slides: L04-15 … L04-18*
+**Source anchor:** slides L04-4 to L04-9.
 
-### 1-D convolution
+The lecture begins with an example: $Z_{m,n} = A_{m,k} \times B_{n,k}$. The slides define the **Operational Definition for Einsums (ODE)**:
 
-The simplest case is one-dimensional convolution with input `I`, filter `F`, and output `O`:
+> Traverse all legal rank-variable values in the iteration space. At each point, compute the right-hand side at those rank values. Assign the result to the left-hand side coordinate, unless that coordinate already has a value, in which case reduce into it.
 
-$$O_q = I_{q+s} \times F_s$$
+For multiply-based contractions, "reduce" usually means add. Therefore, $Z_{m,n} = A_{m,k} \times B_{n,k}$ should be read as $Z_{m,n} = \sum_k A_{m,k}B_{n,k}$.
 
-The output rank `q` (position in the output) is uncontracted. The filter rank `s` (position within the filter) is contracted. The input is accessed at a *shifted* index `q+s` — capturing the sliding-window nature of convolution.
+### Intuition
 
-With rank shapes made explicit this becomes:
+An Einsum is like a precise recipe with the cooking order removed. It lists every ingredient and every destination, but it does not say whether to prepare one output at a time, one reduction rank at a time, or one tile at a time. This is why it is useful for hardware: the same computation can later be mapped to a CPU loop nest, GPU kernel, systolic array, or custom accelerator.
 
-$$O_q^Q = I_{q+s}^W \times F_s^S$$
+### Precise meaning
 
-where Q = W − S + 1 (valid convolution).
+A **rank variable** is an index such as $m$, $n$, or $k$. A **rank name** is the semantic dimension name such as $M$ or $K$. A **rank shape** is the size of that dimension. In $A^{K,M}_{k,m}$, the rank variables are $k,m$, the rank names are $K,M$, and the rank shapes are the extents of those dimensions.
 
-![1-D convolution — filter weights, inputs, output, and the Einsum O_q = I_{q+s} × F_s](../../assets/L04/L04-p15-convolution-1d.png)
+A rank is **uncontracted** if it appears on the left-hand side. It identifies output coordinates. A rank is **contracted** if it appears on the right-hand side but not on the left-hand side. Its values are reduced away.
 
-The rank-shape slide (slide 18) also introduces a general graphical example: an adjacency matrix `G^{S=6,D=6}` — showing that Einsums can describe graph operations just as naturally as convolutions.
+### Worked example: reading a small Einsum
 
-> **Why it matters:** The `q+s` index dependency (a Toeplitz structure) is what distinguishes convolution from a plain matrix multiply. When we later convert CONV to matmul (Chapter 3), the key step is precisely "breaking out" this Toeplitz relationship.
+Let $Z_{m,n} = \sum_k A_{m,k}B_{n,k}$ with $M=2$, $N=2$, and $K=3$. To compute $Z_{1,0}$, hold the output ranks fixed at $m=1,n=0$ and traverse the contracted rank $k$:
+
+$Z_{1,0} = A_{1,0}B_{0,0} + A_{1,1}B_{0,1} + A_{1,2}B_{0,2}$.
+
+The output shape is $M \times N$ because $m,n$ are uncontracted. The amount of work per output is $K$ multiply-accumulates because $k$ is contracted.
+
+### Equivalent forms
+
+Slides L04-8 to L04-9 show that $Z_{m,n} = A_{m,k}B_{k,n}$, $Z_{n,m} = A_{k,m}B_{n,k}$, and $Z_{p,q} = A_{p,r}B_{q,r}$ are all matrix multiplication patterns. The letters are not the meaning. The pattern of shared, output, and reduction ranks is the meaning.
+
+### Hardware implication
+
+The ODE creates a correctness boundary. A mapper may reorder loops, tile ranks, or parallelize work, but it must preserve the same set of rank tuples and the same reductions. This is the formal reason L05 can compare output-stationary, weight-stationary, and input-stationary loop nests without changing the layer's mathematical result.
+
+### Common misconception
+
+**Misconception:** An Einsum is just a compact way to write a matrix equation.
+
+**Correction:** In this course, an Einsum is the compute specification consumed by mapping and analysis tools. It exposes loop ranks and reductions explicitly, which is exactly what a hardware schedule must manipulate.
 
 ---
 
-## Chapter 3 — Kernel Computation: FC and CONV as Matrix Multiplications
+## 2. Rank Transformations: Flattening and Partitioning
 
-> *Slides: L04-20 … L04-172*
+**Source anchor:** slides L04-10 to L04-14.
 
-This is the longest section of the deck, driven by incremental animation. The core idea is that both FC and CONV layers can be **algebraically reduced to matrix multiplication** through rank flattening — with profound implications for how hardware executes them.
+L04 next studies transformations that change how ranks are named without changing the underlying computation.
 
-### Fully connected (FC) as Einsum and matrix–vector multiply
+### Flattening
 
-An FC layer maps input activations of shape (C, H, W) to M output neurons. Its Einsum is:
+If two coordinates always move together, they can be treated as one compound coordinate. For a 2-D elementwise multiply, $Z_{i,j} = A_{i,j}B_{i,j}$ can be flattened into $Z_{ij} = A_{ij}B_{ij}$ by defining $ij = i \times J + j$.
 
-$$O_m = I_{c,h,w} \times F_{m,c,h,w}$$
+Flattening removes ranks. It is the algebraic reason a tensor of shape $C \times H \times W$ can become a vector of length $CHW$.
 
-(`c`, `h`, `w` are contracted ranks; `m` is uncontracted.) A loop-nest implementation:
+### Partitioning
 
-```
+Partitioning does the opposite. A single rank $i$ can be split into $i_1$ and $i_0$ by $i = i_1 \times I_0 + i_0$. Then $Z_i = A_iB_i$ becomes $Z_{i_1,i_0} = A_{i_1,i_0}B_{i_1,i_0}$.
+
+Partitioning adds ranks. It is the algebraic basis of tiling: $i_1$ names the tile, and $i_0$ names the position inside the tile.
+
+### Worked example: split and recover an index
+
+Suppose a vector has length 8 and we choose $I_0=4$. Then $i = i_1 \times 4 + i_0$.
+
+| Original $i$ | $i_1$ | $i_0$ |
+|---:|---:|---:|
+| 0 | 0 | 0 |
+| 3 | 0 | 3 |
+| 4 | 1 | 0 |
+| 7 | 1 | 3 |
+
+No data changed. Only the coordinate system changed. In hardware, however, this coordinate change is powerful: $i_1$ can become an outer memory tile loop, while $i_0$ can fit inside a local buffer.
+
+### Hardware implication
+
+Flattening often makes a computation look like GEMM, which is convenient for hardware that already has efficient matrix engines. Partitioning often makes a computation fit a memory hierarchy or PE array. Neither transformation is physically free. Flattening changes address generation and may obscure locality; partitioning adds loop structure and may require boundary handling.
+
+### Common misconception
+
+**Misconception:** If two computations flatten to the same matrix multiplication, they must have the same hardware cost.
+
+**Correction:** The flattened algebra may match, but the data layout, reuse pattern, and cost of forming the flattened tensor can differ. Convolution lowering is the most important example.
+
+---
+
+## 3. Convolution as an Einsum
+
+**Source anchor:** slides L04-15 to L04-18 and L04-42 to L04-59.
+
+The simplest convolution in the slides is one-dimensional: $O_q = \sum_s I_{q+s}F_s$. The output rank $q$ is preserved. The filter rank $s$ is contracted. The input access $q+s$ is the key. It says that output position $q$ sees a shifted window of the input.
+
+### Worked example: 1-D convolution
+
+Let $I=[2,1,3,0]$ and $F=[4,5]$ with valid convolution. The output length is $Q=W-S+1=3$.
+
+$O_0 = I_0F_0 + I_1F_1 = 2 \times 4 + 1 \times 5 = 13$.
+
+$O_1 = I_1F_0 + I_2F_1 = 1 \times 4 + 3 \times 5 = 19$.
+
+$O_2 = I_2F_0 + I_3F_1 = 3 \times 4 + 0 \times 5 = 12$.
+
+The filter values are reused across output positions, and input values can also be reused by overlapping windows. L05 will turn this observation into dataflow choices.
+
+### 2-D convolution
+
+For a batch $N$, output channel $M$, input channel $C$, output spatial ranks $P,Q$, filter ranks $R,S$, and stride $U$, the dense 2-D convolution is:
+
+$$O_{n,m,p,q} = B_m + \sum_{c,r,s} I_{n,c,U \times p+r,U \times q+s}F_{m,c,r,s}.$$
+
+The contracted ranks are $c,r,s$. The output ranks are $n,m,p,q$. The combined input indices $U \times p+r$ and $U \times q+s$ are what make convolution a sliding-window operation rather than a plain dense layer.
+
+### Hardware implication
+
+The expression reveals reuse directly. A weight $F_{m,c,r,s}$ can be used for many output positions $p,q$ and many batch elements $n$. An input activation $I_{n,c,h,w}$ can contribute to several nearby outputs because multiple pairs $(p,r)$ and $(q,s)$ may map to the same $h,w$. A partial sum $O_{n,m,p,q}$ receives many updates over $c,r,s$. These are exactly the three operand classes L05 will try to keep stationary.
+
+### Common misconception
+
+**Misconception:** Convolution is fundamentally different from matrix multiplication, so matrix-multiply hardware is irrelevant.
+
+**Correction:** Convolution has a special indexing pattern, but it can be lowered into matrix multiplication. The important question is whether the lowering is materialized in memory or represented implicitly by address generation.
+
+---
+
+## 4. FC and CONV Lowering to Matrix Multiplication
+
+**Source anchor:** slides L04-20 to L04-172. This section synthesizes a long animation sequence; the slide text is sparse because many pages are visual build states.
+
+### Fully connected layer
+
+For an input activation tensor $I_{c,h,w}$ and $M$ output neurons, a fully connected layer computes:
+
+$$O_m = \sum_{c,h,w} I_{c,h,w}F_{m,c,h,w}.$$
+
+Here $m$ is uncontracted, while $c,h,w$ are contracted. Flatten the input coordinates into $chw$, and the expression becomes $O_m = \sum_{chw} I_{chw}F_{m,chw}$, a matrix-vector multiply.
+
+With a batch rank $n$, the same layer becomes:
+
+$$O_{n,m} = \sum_{chw} I_{n,chw}F_{m,chw}.$$
+
+This is matrix-matrix multiplication. The batch rank turns many independent matrix-vector products into one larger matrix computation.
+
+### Loop nest view
+
+The FC Einsum corresponds to a loop nest such as:
+
+```text
 for m in [0, M):
-  o[m] = 0
+  O[m] = 0
   for c in [0, C):
     for h in [0, H):
       for w in [0, W):
-        o[m] += i[c][h][w] * f[m][c][h][w]
+        O[m] += I[c,h,w] * F[m,c,h,w]
 ```
 
-If we **flatten** the three input ranks C, H, W into a single compound rank `chw = H×W×c + W×h + w`, the Einsum becomes:
+This code block is not the definition of the Einsum. It is one legal traversal order. Other loop orders compute the same output but create different reuse.
 
-$$O_m = I_{chw} \times F_{m,chw}$$
+### Convolution lowering
 
-This is now a **matrix–vector multiply** (Filters: M×CHW; Input: CHW×1; Output: M×1).
+For convolution, flattening alone is not enough because the input uses $p+r$ and $q+s$. The standard lowering idea is to create a patch tensor:
 
-With a batch of N input samples, the input becomes I_{n,chw} (shape N×CHW) and the output O_{n,m} (N×M), converting the computation into a **matrix–matrix multiply**:
+$$T_{n,p,q,c,r,s} = I_{n,c,U \times p+r,U \times q+s}.$$
 
-$$O_{n,m} = I_{n,chw} \times F_{m,chw}$$
+Then the convolution becomes:
 
-The slide explicitly notes: "For Einsum, the order of ranks does not matter" — `O_{n,m} = I_{n,chw} × F_{m,chw}` and the typical lab notation `Z_{m,n} = A_{m,k} × B_{k,n}` describe the same abstract computation with different rank-name conventions.
+$$O_{n,m,p,q} = \sum_{c,r,s} T_{n,p,q,c,r,s}F_{m,c,r,s}.$$
 
-### Convolution (CONV) as Einsum
+Flatten $(c,r,s)$ into $crs$ and flatten $(n,p,q)$ into $npq$:
 
-The full 2-D CONV layer with batch N, M output channels, C input channels, output spatial size P×Q, and filter spatial size R×S has Einsum:
+$$O_{m,npq} = \sum_{crs} F_{m,crs}T_{npq,crs}.$$
 
-$$O_{n,m,p,q} = B_m + I_{n,c,\,U \times p+r,\,U \times q+s} \times F_{m,c,r,s}$$
+This is matrix multiplication: a filter matrix of shape $M \times CRS$ multiplies a patch matrix of shape $NPQ \times CRS$ after transposition/convention choices.
 
-(U is stride; B is bias, ignored for simplicity.) The key structural fact: the input is indexed by a *combined* expression `U×p+r` for height and `U×q+s` for width. This is the Toeplitz relationship that distinguishes CONV from FC — in FC, every output sees every input; in CONV, each output sees only the local patch of the input determined by the filter position.
+### Worked example: 2-D im2col
 
-![Convolution Einsum — algebraic and Einsum notation for the full CONV layer](../../assets/L04/L04-p43-convolution-einsum.png)
+Take a single-channel $3 \times 3$ input and a $2 \times 2$ filter with stride 1. The output has $P=2,Q=2$, so there are four output positions. The patch matrix has four rows, one for each output position, and four columns, one for each filter coordinate:
 
-### Converting CONV to matrix multiplication (im2col / Toeplitz)
+```text
+input coordinates in each row of T[pq,rs]
 
-The conversion from CONV to matmul proceeds in three steps:
+pq=00: (0,0) (0,1) (1,0) (1,1)
+pq=01: (0,1) (0,2) (1,1) (1,2)
+pq=10: (1,0) (1,1) (2,0) (2,1)
+pq=11: (1,1) (1,2) (2,1) (2,2)
+```
 
-1. **Extract the Toeplitz structure:** Define a Toeplitz tensor `T_{c,p,q,r,s} = I_{c,p+r,q+s}` that pre-populates each patch of the input.
-2. **Flatten ranks:** Compress `(c,r,s)` → `crs` and `(p,q)` → `pq`.
-3. **The resulting Einsum** is:
+Notice the duplication. Input coordinate $(1,1)$ appears in all four rows. Materialized im2col makes GEMM easy but can increase memory traffic and storage. A convolution accelerator may instead generate the same addresses on the fly and avoid storing $T$ explicitly.
 
-$$O_{m,pq} = T_{pq,crs} \times F_{m,crs}$$
+### Hardware implication
 
-This is a matrix multiplication: Filters (M×CRS) × Toeplitz-input (PQ×CRS) = Output (M×PQ).
-
-![CONV layer as matrix multiplication — O_{m,pq} = T_{pq,crs} × F_{m,crs}, P=H-R+1, Q=W-S+1](../../assets/L04/L04-p167-conv-to-matmul.png)
-
-Including batch N: `O_{m,pqn} = T_{pqn,crs} × F_{m,crs}` — still a matrix multiply.
-
-### The summary insight
-
-The "Summary" slide (p. 172 / slide 153) states the takeaway cleanly:
-
-- We have shown how FC and CONV can be converted into matrix multiplication.
-- There are **many ways** to compute this matrix multiplication (MACs can be performed in any order and produce the same output).
-- However, the **processing order impacts hardware metrics** such as energy and latency — specifically, processing order determines how much data must be moved.
-
-This is the bridge from the Einsum (what to compute) to the mapping problem (how to compute it) that dominates L05–L06.
-
-> **Why it matters:** Any hardware that can execute a general matrix multiply can execute FC and CONV. But *how* it executes that matmul — which loop runs in the innermost position, what data is cached where — determines whether energy cost is near the RF floor or approaches the DRAM ceiling.
+Lowering explains why GEMM engines are broadly useful, but it also reveals a tradeoff. A lowered matrix can regularize compute and improve PE utilization, but materializing the patch matrix can amplify memory traffic. A custom convolution dataflow can exploit the same mathematics without physically duplicating input values. This is the bridge into L05's question: which traversal order and storage placement minimizes movement for the same Einsum?
 
 ---
 
-## Chapter 4 — From Convolution to Attention
+## 5. From Convolution to Attention
 
-> *Slides: L04-174 … L04-178*
+**Source anchor:** slides L04-174 to L04-178.
 
-Before deriving Transformer Einsums, the lecture provides motivation: why is attention preferred over convolution for certain tasks?
+The lecture then changes workload family. Convolution uses a fixed local receptive field: an output position sees the region determined by the filter shape $R \times S$. Attention uses a dynamic global receptive field: a token can assign high weight to any other token, regardless of distance.
 
-### Convolution vs. attention
+Slides L04-175 to L04-177 state the motivation in three parts:
 
-| | Convolution | Attention |
-|---|---|---|
-| Dependency range | Local neighbors only (R×S filter) | Global — any token to any other |
-| Region of interest | Fixed (determined by filter position) | Dynamic (query-dependent) |
-| Cost | Linear in input size | Quadratic in sequence length |
+- Convolution models spatial-neighbor dependencies naturally, but the filter window is fixed.
+- Attention is used to model long-range dependencies, with the slide quoting Vaswani et al. 2017 that it allows modeling global dependencies without regard to distance.
+- Inputs are broken into tokens: words for text, image patches for vision, and spectrogram patches for audio.
 
-The quote from Vaswani et al. (NeurIPS 2017): **"Allows modeling of global dependencies without regard to their distance."** Attention biases compute toward the most *informative* parts of the input rather than a fixed spatial window.
+### Teaching interpretation
 
-### Transformers — where attention lives
+Attention is not "more connected convolution." It changes the dependency rule. In convolution, the dependency is determined by geometry: output $(p,q)$ reads a fixed window. In attention, the dependency is determined by data: a query vector compares against all key vectors, and $\mathrm{softmax}$ turns those scores into weights.
 
-The Transformer architecture (Vaswani, NeurIPS 2017) is built from attention blocks. It has been applied to:
+### Hardware implication
 
-- Natural language processing (GPT-3, Brown et al., NeurIPS 2020)
-- Audio (AST, Gong et al., Interspeech 2021)
-- Vision (ViT, Dosovitskiy et al., ICLR 2021)
-
-Input is broken into **tokens** (words for text, image patches for vision, spectrogram patches for audio). The attention mechanism allows each token to dynamically weight every other token.
-
-![Convolution vs. attention — local fixed receptive field vs. global dynamic dependencies](../../assets/L04/L04-p175-conv-vs-attention.png)
+This dynamic global dependency creates an $M \times M$ attention tensor for sequence length $M$. That intermediate can dominate storage and traffic for long sequences. The hardware problem is therefore not only multiplying matrices quickly; it is also deciding whether to materialize, tile, stream, fuse, sparsify, or approximate the score and attention tensors.
 
 ---
 
-## Chapter 5 — Self-Attention as Einsums
+## 6. Self-Attention as Einsums
 
-> *Slides: L04-179 … L04-198*
+**Source anchor:** slides L04-179 to L04-198.
 
-This section derives the full Einsum chain for self-attention. Every step is one Einsum; together they form the complete computation.
+The self-attention part of L04 writes each stage as a tensor expression. The slides omit some constant scaling factors, so this chapter follows the slide-level computation and marks the omission in the source notes.
 
-### Diagram conventions
-
-The slides use a consistent visual language:
-- **Rounded box** → tensor (e.g., A, Q, K, V, Z)
-- **Hexagonal box** → operation (×, softmax)
-- **Vertical-lined box** → projection (multiplication by a weight matrix W)
-
-### Step 0 — Input embedding
-
-Convert raw one-hot tokens IR (shape M×C) to dense embeddings I (shape M×D):
-
-$$I_{m,d} = IR_{m,c} \times WI_{c,d}$$
-
-(Only applies to the first layer; subsequent layers receive the previous layer's output.)
-
-### Step 1 — Project to Query (Q) and Key (K)
-
-Project embeddings from D-space into E-space for both Q and K:
-
-$$Q_{m,e} = I_{m,d} \times WQ_{d,e}$$
-$$K_{m,e} = I_{m,d} \times WK_{d,e}$$
-
-Both are matrix multiplies of shape (M×D) × (D×E) → (M×E). WQ and WK are **static** (shared across all inputs at inference time).
-
-### Step 2 — Compute QK (pre-softmax attention scores)
-
-$$QK_{m,p} = Q_{p,e} \times K_{m,e}$$
-
-Note: p is an alias for m (both index the sequence length M). This computes the dot product between every query vector and every key vector — an (M×E) × (E×M) → (M×M) matrix multiply. The cost is O(M² E).
-
-### Step 3 — Softmax to form attention weights A
-
-$$SN_{m,p} = \exp(QK_{m,p})$$
-$$SD_p = \sum_m SN_{m,p}$$
-$$A_{m,p} = SN_{m,p} / SD_p$$
-
-The softmax normalizes each row of QK into a probability distribution over the M keys. A is the **attention tensor** (shape M×M).
-
-### Step 4 — Project to Value (V)
-
-$$V_{m,f} = I_{m,d} \times WV_{d,f}$$
-
-Projects embeddings from D-space into F-space (shape M×F). WV is also static.
-
-### Step 5 — Weighted sum of values (AV)
-
-$$AV_{p,f} = A_{m,p} \times V_{m,f}$$
-
-Multiply the attention weights by the value vectors. Shape: (M×M) × (M×F) → (M×F). This is the step that "attends" — it takes a weighted combination of all value vectors for each output position.
-
-### Step 6 — Output projection
-
-$$Z_{p,g} = AV_{p,f} \times WZ_{f,g}$$
-
-Projects from F-space to G-space (the output embedding dimension, often equal to D). Shape: (M×F) × (F×G) → (M×G). WZ is static.
-
-![Basic self-attention encoder computation — full data-flow diagram of all tensors and operations](../../assets/L04/L04-p182-basic-self-attention.png)
-
-### Full cascade
-
-Putting all six steps together:
-
-![Full attention cascade — all seven Einsums in one slide](../../assets/L04/L04-p189-full-cascade.png)
-
-The five weight matrices WI, WQ, WK, WV, WZ are **static** (do not change with input). All other tensors (I, Q, K, V, QK, SN, SD, A, AV, Z) are **dynamic** (recomputed for every input sequence).
-
-### Computation properties
-
-- **Total matrix multiplications:** 5 (WI, WQ, WK for projections; QK dot product; AV weighted sum) + 1 output projection (WZ) = 6 in total.
-- **Parallelism:** The Q, K, V projections are independent and can run in parallel.
-- **Sequential dependency:** QK must precede AV (AV depends on A which depends on QK); projections must precede the core attention computation.
-- **Quadratic scaling:** The QK matrix multiply is M×E × E×M = O(M²E). The AV multiply is M×M × M×F = O(M²F). Both scale **quadratically** with sequence length M — the dominant cost in long-context scenarios.
-
-### Batched attention
-
-Adding a batch rank B is straightforward: every tensor gains a leading B dimension and all Einsums gain a `b` subscript. The weight tensors WQ, WK, WV, WZ remain 2-D (they are shared across batch elements).
-
-### Multi-head attention (MHA)
-
-Different attention heads can learn to attend to different aspects (e.g., local vs. global dependencies) by using separate Q/K/V projections per head:
-
-$$K_{b,h,m,e} = I_{b,m,d} \times WK_{d,h,e}$$
-$$Q_{b,h,m,e} = I_{b,m,d} \times WQ_{d,h,e}$$
-$$V_{b,h,m,f} = I_{b,m,d} \times WV_{d,h,f}$$
-
-The head rank H is added throughout. After computing per-head attention outputs, they are **concatenated** across H and F dimensions, then projected:
-
-$$C_{b,p,h \times F + f} = AV_{b,h,p,f}$$
-$$Z_{b,p,d} = C_{b,p,f} \times WZ_{g,d}$$
-
-![Multi-head attention — all per-head Einsums and the final concatenation and output projection](../../assets/L04/L04-p194-multi-head-attention.png)
-
-### Rank name glossary (slides 195–198)
+### Rank names
 
 | Rank | Meaning |
 |---|---|
-| **M** | Sequence length (query/key/value) |
-| **P** | Alias for M (output sequence position) |
-| **C** | Dictionary size (vocabulary) |
-| **D** | Global embedding (d_model) |
-| **E** | Q/K local embedding (d_k) |
-| **F** | V local embedding (d_v) |
-| **G** | Output embedding |
-| **B** | Batch size |
-| **H** | Number of heads (MHA) |
+| $M$ | Sequence length for query, key, and value in self-attention |
+| $P$ | Alias for sequence length on the query/output side of $QK$ |
+| $C$ | Dictionary or vocabulary size |
+| $D$ | Input/global embedding dimension, often $d_{\text{model}}$ |
+| $E$ | Query/key local embedding dimension, often $d_k$ |
+| $F$ | Value local embedding dimension, often $d_v$ |
+| $G$ | Output embedding dimension |
+| $B$ | Batch size |
+| $H$ | Number of attention heads |
 
-> **Why it matters:** Expressing attention as Einsums reveals its structure with the same clarity as any other matrix multiply. Every optimization available for GEMM — tiling, pipelining, sparsity exploitation — potentially applies here. This is the foundation for accelerators like FuseMax (mentioned in L01) that target attention specifically.
+### Single-head computation
+
+For the first layer, one-hot or raw token input $IR_{m,c}$ is embedded by $I_{m,d} = \sum_c IR_{m,c}WI_{c,d}$. Later layers already receive dense $I$.
+
+Queries and keys are projections into $E$-dimensional space:
+
+$$Q_{m,e} = \sum_d I_{m,d}WQ_{d,e}, \qquad K_{m,e} = \sum_d I_{m,d}WK_{d,e}.$$
+
+The pre-softmax score tensor compares every query position $p$ with every key position $m$:
+
+$$QK_{m,p} = \sum_e Q_{p,e}K_{m,e}.$$
+
+The slide convention normalizes over $m$ for each fixed $p$:
+
+$$SN_{m,p} = \exp(QK_{m,p}), \qquad SD_p = \sum_m SN_{m,p}, \qquad A_{m,p} = SN_{m,p}/SD_p.$$
+
+Values are projected by $V_{m,f} = \sum_d I_{m,d}WV_{d,f}$. The attention output is a weighted sum of values:
+
+$$AV_{p,f} = \sum_m A_{m,p}V_{m,f}.$$
+
+Finally, $Z_{p,g} = \sum_f AV_{p,f}WZ_{f,g}$ projects back to the output embedding space.
+
+### Worked example: two-token attention scores
+
+Let $M=2$ and $E=2$. Suppose $Q_0=[1,0]$, $Q_1=[0,1]$, $K_0=[1,1]$, and $K_1=[2,0]$. For query position $p=0$, the scores are:
+
+$QK_{0,0}=Q_0 \cdot K_0=1$ and $QK_{1,0}=Q_0 \cdot K_1=2$.
+
+The normalized attention weights for this query are:
+
+$A_{0,0}=e^1/(e^1+e^2)$ and $A_{1,0}=e^2/(e^1+e^2)$.
+
+Then $AV_{0,f}=A_{0,0}V_{0,f}+A_{1,0}V_{1,f}$. This is the core meaning of attention: the output at position 0 becomes a data-dependent weighted mixture of value vectors from all token positions.
+
+### Computation properties
+
+Slides L04-190 to L04-191 state the important scheduling properties:
+
+- The $Q$, $K$, and $V$ projections are independent and can be computed in parallel.
+- Within attention, $QK$ must be computed before $\mathrm{softmax}$, and $\mathrm{softmax}$ must be computed before $AV$.
+- $WQ$, $WK$, $WV$, and $WZ$ are static at inference time; $Q$, $K$, $V$, $QK$, $A$, $AV$, and $Z$ are dynamic.
+- MAC count scales quadratically with token count because $QK$ costs proportional to $M^2E$ and $AV$ costs proportional to $M^2F$.
+
+### Batched attention
+
+Adding batch is mechanical. Prepend a batch rank $b$ to dynamic tensors: $QK_{b,m,p} = \sum_e Q_{b,p,e}K_{b,m,e}$, $A_{b,m,p}=SN_{b,m,p}/SD_{b,p}$, and $AV_{b,p,f}=\sum_m A_{b,m,p}V_{b,m,f}$. Weight matrices are shared across batch elements.
+
+### Multi-head attention
+
+Multi-head attention adds a head rank $h$ so each head can use separate projections:
+
+$$Q_{b,h,m,e} = \sum_d I_{b,m,d}WQ_{d,h,e}, \quad K_{b,h,m,e} = \sum_d I_{b,m,d}WK_{d,h,e}, \quad V_{b,h,m,f} = \sum_d I_{b,m,d}WV_{d,h,f}.$$
+
+Each head computes its own $QK$, $\mathrm{softmax}$, and $AV$. The per-head outputs are concatenated along the head/value dimensions, for example $C_{b,p,h \times F+f}=AV_{b,h,p,f}$, then projected by $Z_{b,p,d}=\sum_g C_{b,p,g}WZ_{g,d}$, with $g$ representing the flattened head-value dimension.
+
+### Hardware implication
+
+Attention has both favorable and difficult hardware properties. The projection matrices are static and reusable, which suits weight reuse. The $QK$ and $AV$ products are dense matrix multiplications, which suits array compute. But the score and attention tensors are dynamic, sequence-length dependent, and often large. Softmax introduces exponentiation, reduction, division, and ordering constraints. Attention accelerators and fused attention kernels exist because materializing $QK$ and $A$ naively can waste bandwidth.
+
+### Common misconception
+
+**Misconception:** Multi-head attention is just bigger single-head attention.
+
+**Correction:** It adds an explicit head rank $H$. That rank exposes parallelism and independent projections, but it also changes storage layout, concatenation, and the final projection. A mapper must decide whether heads are processed in parallel, sequentially, or tiled.
+
+---
+
+## 7. Paper and Source Bridge
+
+**Source anchor:** slides L04-175 to L04-178 and L04-193 to L04-194.
+
+### Paper Bridge: Attention Is All You Need
+
+**Bibliographic identity:** Ashish Vaswani et al., *Attention Is All You Need*, NeurIPS 2017. Local PDF: `papers/Transformer (Attention).pdf`.
+
+**Problem addressed:** Sequence transduction models traditionally relied on recurrence or convolution to propagate information across positions. The paper asks whether a model can use attention mechanisms alone to connect positions and build sequence representations.
+
+**Core idea:** The Transformer replaces recurrence with stacked self-attention and position-wise feed-forward layers. Its scaled dot-product attention computes $\mathrm{softmax}(QK^T/\sqrt{d_k})V$, and multi-head attention runs several projected attention heads in parallel before combining them.
+
+**Relevance to L04:** L04 uses Transformer attention as the second major workload, after convolution, for practicing Einsum thinking. The paper supplies the semantic meaning of $Q$, $K$, $V$, scaled dot-product attention, multi-head attention, and the reason token-token interaction creates a different hardware problem from convolution.
+
+**Key claims used in this chapter:**
+
+- Attention maps a query and key-value pairs to an output. Source anchor: Section 3.2.
+- Scaled dot-product attention is defined as $\mathrm{softmax}(QK^T/\sqrt{d_k})V$. Source anchor: Section 3.2.1, Equation 1.
+- Multi-head attention projects queries, keys, and values into multiple subspaces and performs attention in parallel. Source anchor: Section 3.2.2.
+- Self-attention connects all positions with constant sequential path length, while its per-layer complexity is $O(n^2d)$ for sequence length $n$ and representation dimension $d$. Source anchor: Section 4 and Table 1.
+- The paper uses positional encodings because the model lacks recurrence or convolution to encode position by default. Source anchor: Section 3.5.
+
+**What students should remember:** Attention is not just a new neural-network layer. It changes the tensor shape of the workload: the intermediate attention matrix scales with token-token pairs, which is why hardware discussions later worry about materialization, tiling, fusion, and long-sequence memory pressure.
+
+**Limitations and assumptions:** The paper is used here to support the mathematical structure of attention, not to reproduce translation benchmark claims. L04 follows the slide convention for rank names, which may transpose indices relative to the paper's matrix notation.
+
+**Suggested insertion points:** Read this bridge before Section 6 if $Q$, $K$, $V$, or multi-head attention feel like unexplained names.
+
+### Paper Bridge: Squeeze-and-Excitation Networks
+
+**Bibliographic identity:** Jie Hu, Li Shen, Samuel Albanie, Gang Sun, Enhua Wu, *Squeeze-and-Excitation Networks*, CVPR 2018. Local PDF: `papers/L03_SENet_Hu_CVPR2018.pdf`.
+
+**Problem addressed:** Standard convolution mixes spatial and channel information locally, but it does not explicitly model global channel interdependencies.
+
+**Core idea:** An SE block first **squeezes** each channel into a global descriptor, then **excites** channels with learned, input-dependent weights. The block recalibrates feature maps by multiplying channels by these learned gates.
+
+**Relevance to L04:** L04 contrasts convolution's fixed local receptive field with attention-like mechanisms that allocate emphasis dynamically. SENet is not Transformer self-attention, but it gives a concrete CNN example of data-dependent weighting: the network changes channel importance based on the current input.
+
+**Key claims used in this chapter:**
+
+- The paper frames the SE block as explicitly modeling channel interdependencies and adaptively recalibrating channel-wise feature responses. Source anchor: Abstract.
+- The squeeze stage uses global information to form a channel descriptor. Source anchor: Section 3.1.
+- The excitation stage maps the descriptor to channel weights and applies channel-wise scaling. Source anchor: Section 3.2.
+- The paper reports that SE blocks can be added to existing architectures with slight additional computational cost. Source anchor: Abstract and Section 4.
+
+**What students should remember:** Attention is not only a Transformer equation. The broader architectural idea is data-dependent emphasis. SENet emphasizes channels; Transformer attention emphasizes token-token interactions.
+
+**Limitations and assumptions:** SENet does not support the L04 equations for $QK^T$, softmax over token positions, or multi-head attention. It is included only to clarify the local-vs-dynamic-emphasis concept raised by the slides.
+
+### Other slide-stated examples
+
+Slides L04-176 and L04-178 cite GPT-3 (Brown et al., NeurIPS 2020), AST (Gong et al., Interspeech 2021), ViT (Dosovitskiy et al., ICLR 2021), Jalammar's illustrated Transformer, and Dive into Deep Learning as examples or figure sources. This chapter does not reproduce their figures and does not rely on paper-specific quantitative claims from them.
+
+---
+
+## Hardware Implications
+
+The main hardware implications of L04 are:
+
+- **Einsum separates compute from schedule.** This allows a mapper to search loop orders without changing the mathematical layer.
+- **Contracted ranks are reduction work.** They affect accumulator lifetime, reduction trees, and partial-sum storage.
+- **Uncontracted ranks are output space.** They often expose parallel work, but the best parallel rank depends on hardware shape and data reuse.
+- **Flattening regularizes compute.** It can expose GEMM structure, but it may change address generation and hide original locality.
+- **Partitioning is the algebra of tiling.** It creates tile ranks that later map to memory levels or PE array dimensions.
+- **CONV lowering trades regularity for possible duplication.** Materialized im2col can expand traffic; implicit lowering can preserve storage but requires more specialized address generation.
+- **Attention introduces large dynamic intermediates.** The $M \times M$ score and attention tensors create storage and bandwidth pressure, especially for long sequences.
+- **Softmax is a scheduling boundary.** It contains reductions and normalization, so it constrains fusion and parallel execution.
+
+---
+
+## Common Misconceptions
+
+### Misconception: The left-hand side tells the whole cost.
+
+The output shape is only part of the story. The contracted ranks determine how many products contribute to each output, and tensor access functions determine reuse. $O_{n,m,p,q}$ says nothing by itself about the cost of summing over $c,r,s$ or moving $I$ and $F$.
+
+### Misconception: Lowering convolution to GEMM means im2col must be materialized.
+
+The algebraic lowering defines a patch matrix $T$. Hardware may materialize $T$, generate its elements on demand, or use a direct convolution dataflow that never names $T$ in storage.
+
+### Misconception: Softmax is a small detail after matrix multiplication.
+
+Softmax changes the scheduling problem. To normalize over $m$ for each $p$, the machine needs the relevant score values, their exponentials or a numerically stable equivalent, a denominator, and then normalized weights before $AV$ can finish.
+
+### Misconception: Attention's quadratic cost is caused by the embedding projection.
+
+The projections scale like $MDE$, $MDF$, or $MFG$. The quadratic terms come from token-token interactions: $QK$ scales like $M^2E$ and $AV$ scales like $M^2F$.
+
+---
+
+## Connections
+
+- **L02:** Supplies the DNN layer vocabulary: FC, CONV, channels, batches, filters, and tokens.
+- **L03:** Introduces memory hierarchy and the first Einsum/attention examples. L04 makes the rank manipulation more explicit.
+- **L05:** Uses the same Einsums and asks which loop order creates output-stationary, weight-stationary, or input-stationary reuse.
+- **L06:** Turns partitioning into temporal and spatial tiling, including distributed matrix multiplication and attention.
+- **L07-L10:** Sparse tensors are still tensors in an Einsum. The difference is that formats and traversal must skip or represent missing coordinates.
+- **L12:** Precision choices apply to operands and accumulators inside these Einsums; reductions often require wider accumulators.
+- **L13:** Converts ranks, tensor accesses, and schedules into formal spaces and maps for exact data-movement calculation.
 
 ---
 
@@ -347,108 +503,101 @@ $$Z_{b,p,d} = C_{b,p,f} \times WZ_{g,d}$$
 
 ### What to master before moving on
 
-- Convert an ordinary loop nest into an Einsum and back again.
-- Explain partitioning and flattening as rank transformations, not changes to the mathematical tensor.
-- Derive how FC and CONV can be expressed as matrix-vector or matrix-matrix operations.
-- Explain why attention has quadratic token interaction while convolution has fixed local receptive fields.
+- Given an Einsum, mark output ranks and contracted ranks.
+- Explain the ODE in your own words without mentioning any particular loop order.
+- Flatten and unflatten a small coordinate such as $(i,j)$.
+- Convert $O_m = \sum_{c,h,w} I_{c,h,w}F_{m,c,h,w}$ into matrix-vector form.
+- Explain why $O_q = \sum_s I_{q+s}F_s$ has sliding-window reuse.
+- Describe the difference between materialized im2col and implicit convolution lowering.
+- Trace the attention chain from $I$ to $Z$ and identify which tensors are static or dynamic.
 
 ### Self-check questions
 
-1. What does a repeated index on the right-hand side mean in an Einsum?
-2. When convolution is converted to matrix multiplication, where does the Toeplitz-like structure come from?
-3. Why is softmax the main non-linear operation in the attention pipeline, and where does it sit relative to the Einsums?
+1. In $Z_{m,n} = \sum_k A_{m,k}B_{n,k}$, which ranks determine output shape and which determine work per output?
+2. Why does changing rank-variable names not change an Einsum?
+3. If $i=i_1 \times I_0+i_0$, what are $i_1$ and $i_0$ for $i=11,I_0=4$?
+4. In $O_q = \sum_s I_{q+s}F_s$, which values are reused across neighboring $q$?
+5. What data duplication can appear when a $3 \times 3$ input is lowered for a $2 \times 2$ filter?
+6. Why does $QK_{m,p} = \sum_e Q_{p,e}K_{m,e}$ create an $M \times M$ tensor?
+7. Which attention operations can be parallelized before the core attention step, and which must be sequential?
+8. Why is softmax not merely an elementwise operation in this context?
 
 ### Exercises
 
-1. Write a loop nest for `Z[m,n] = A[m,k] * B[k,n]`, then identify the corresponding free and reduction ranks.
-2. Flatten a 2-D coordinate `(r,s)` into a single rank and show how to recover `r` and `s`.
-3. Draw the data dependency chain for a single attention head, including Q, K, V, attention weights, and output projection.
-
-### Common traps
-
-- Assuming flattening is free in hardware. It changes address generation and can change locality.
-- Losing track of rank names when moving between FC, CONV, and attention examples.
-- Treating attention as "just matmul"; the dynamic score matrix and softmax change the dataflow constraints.
+1. Write a loop nest for $Z_{m,n} = \sum_k A_{m,k}B_{k,n}$. Then write a second loop nest with a different order and explain why both are valid.
+2. Flatten $(c,h,w)$ into one rank $chw$ for $C=2,H=3,W=4$. Compute the flat index for $(c,h,w)=(1,2,3)$ using $chw=c \times H \times W+h \times W+w$.
+3. For $I=[1,2,0,3,4]$ and $F=[2,-1,1]$, compute valid 1-D convolution outputs.
+4. Build the im2col coordinate table for a single-channel $4 \times 4$ input and a $2 \times 2$ filter with stride 1. How many rows and columns does the patch matrix have?
+5. For $M=4,E=8,F=8$, count the MACs in $QK$ and $AV$. Then repeat for $M=8$. What changed?
+6. Design question: If an accelerator cannot store the full $M \times M$ attention matrix, what two implementation strategies could avoid materializing it?
 
 ---
 
 ## Key Terms
 
-| Term | Gloss |
+| Term | Meaning |
 |---|---|
-| **Einsum** | A compact algebraic notation for DNN computations specifying operands, ranks, and the operator — but not the order of evaluation. |
-| **ODE (Operational Definition for Einsums)** | The definition: traverse all points in the iteration space; at each point, compute the RHS and assign/reduce into the LHS. |
-| **Rank variable** | An index over one dimension of a tensor (e.g., m, n, k). |
-| **Rank name** | The semantic name of a dimension (e.g., "M", "K"); distinct from the rank variable letter. |
-| **Rank shape** | The size (extent) of a dimension. |
-| **Contracted rank** | A rank that appears only on the right-hand side; its values are summed (reduced) over. |
-| **Uncontracted rank** | A rank that appears on both sides; each value yields an independent output element. |
-| **Partitioning** | Splitting one rank into two (e.g., i → i1, i0 where i = i1×I0 + i0). Always adds a rank. |
-| **Flattening** | Merging two or more ranks into one compound index. Always removes a rank. |
-| **FC layer** | Fully connected layer; Einsum O_m = I_{c,h,w} × F_{m,c,h,w}; equivalent to matrix–vector multiply after flattening. |
-| **CONV layer** | 2-D convolution; Einsum O_{n,m,p,q} = I_{n,c,Up+r,Uq+s} × F_{m,c,r,s}; equivalent to matmul after Toeplitz conversion. |
-| **Toeplitz tensor / im2col** | The pre-populated patch tensor T_{pq,crs} = I_{c,p+r,q+s} that converts CONV to matmul. |
-| **Attention** | A mechanism that dynamically selects regions of interest; "allows modeling of global dependencies" (Vaswani 2017). |
-| **Token** | The basic input unit of a Transformer (word, image patch, spectrogram patch). |
-| **Q, K, V** | Query, Key, Value — the three linear projections of the input in self-attention. |
-| **Attention tensor A** | The M×M softmax-normalized matrix of dot-product scores between every query and key. |
-| **Self-attention** | Attention where Q, K, and V all derive from the same input sequence. |
-| **Multi-head attention (MHA)** | Attention with H independent Q/K/V heads, enabling multiple parallel "views" of the input. |
-| **Quadratic scaling** | The QK and AV matrix multiplies both grow as O(M²) with sequence length M. |
-| **Static tensors** | Weight matrices (WQ, WK, WV, WZ) that do not change with each input. |
-| **Dynamic tensors** | All intermediate activations (Q, K, V, QK, A, AV, Z) that are recomputed per input. |
+| **Einsum** | A tensor expression that specifies operands, ranks, and reductions without choosing an execution order. |
+| **Operational Definition for Einsums (ODE)** | The rule that evaluates every legal rank tuple, computes the right-hand side, and assigns or reduces into the left-hand side. |
+| **Rank variable** | The index symbol used in an expression, such as $m$ or $k$. |
+| **Rank name** | The semantic name of a dimension, such as $M$ for output channels or sequence length depending on context. |
+| **Rank shape** | The extent of a rank. |
+| **Contracted rank** | A rank that appears on the right-hand side but not on the left-hand side, so it is reduced. |
+| **Uncontracted rank** | A rank that appears on the output and identifies output coordinates. |
+| **Iteration space** | The set of all legal rank-variable tuples traversed by the ODE. |
+| **Flattening** | Combining multiple ranks into one compound rank, such as $(c,h,w) \rightarrow chw$. |
+| **Partitioning** | Splitting one rank into multiple ranks, such as $i \rightarrow (i_1,i_0)$. |
+| **Toeplitz/im2col lowering** | Rewriting convolution as matrix multiplication by forming an input patch tensor or equivalent address pattern. |
+| **Static tensor** | A tensor such as a trained weight matrix that does not change across input examples during inference. |
+| **Dynamic tensor** | An activation or intermediate tensor recomputed for each input. |
+| **Self-attention** | Attention where $Q$, $K$, and $V$ are all derived from the same input sequence. |
+| **Attention tensor** | The softmax-normalized $M \times M$ tensor $A$ that weights value vectors for each query position. |
+| **Multi-head attention** | Attention with an added head rank $H$, allowing separate projections and attention patterns per head. |
+| **Quadratic scaling** | The $M^2$ growth in standard attention's token-token products as sequence length $M$ increases. |
 
 ---
 
 ## Takeaways
 
-- An **Einsum** has a precise operational semantics (the ODE): traverse the iteration space, compute, assign/reduce. It is completely **order-agnostic**.
-- The single most important structural concept: a rank that appears only on the right-hand side is **contracted** (summed over); a rank on both sides is **uncontracted** (produces a distinct output element).
-- **Partitioning** and **flattening** are complementary: they change the algebraic form of an Einsum without changing the result, and they are the algebraic basis for hardware tiling.
-- Both **FC** (flattened) and **CONV** (via Toeplitz / im2col) reduce to **matrix multiply** — the universal primitive for DNN accelerator design.
-- The CONV-to-matmul reduction shows why "the processing order impacts hardware metrics": the same matmul result can be achieved with wildly different data movement patterns depending on which dimension is innermost.
-- **Self-attention** in Transformers is a sequence of six Einsum steps; five of them are matrix multiplies, plus a softmax. Total: 6 matrix multiplies (including the output projection), with quadratic dependence on sequence length.
-- **Multi-head attention** adds an H rank to all per-head tensors and concatenates outputs before the final projection.
-- Expressing attention as Einsums puts it on the same footing as CONV and FC: the same mapping, tiling, and sparsity analysis tools apply.
+- Einsum is the course's precise language for compute: it specifies ranks, tensor accesses, and reductions while leaving schedule open.
+- Contracted ranks are the key to reading work and reductions; uncontracted ranks are the key to reading output shape.
+- Flattening and partitioning are not cosmetic. They are the algebraic tools behind GEMM lowering, tiling, and spatial mapping.
+- FC layers flatten directly into matrix-vector or matrix-matrix multiplication.
+- CONV lowers to matrix multiplication by exposing a patch tensor, but materializing that tensor can duplicate input data.
+- Attention is a cascade of matrix-like Einsums plus $\mathrm{softmax}$; its token-token products create $M^2$ work and intermediates.
+- Static weights and dynamic intermediates should be separated in hardware reasoning because they have different reuse opportunities.
+- L04 prepares the formal rank language needed for mapping, partitioning, sparse traversal, precision choices, and exact data-movement analysis.
 
 ---
 
-## Connections to Later Lectures
+## Appendix - Slide-to-Section Map
 
-- **Mapping and dataflow (L05–L06):** The Einsum is the "Compute" input to the Mapping layer of the TeAAL pyramid. L05–L06 enumerate all valid loop orderings over the ranks of an Einsum and measure their data-movement implications.
-- **Sparsity (L07–L10):** Attention weight matrices (A) are often sparse after softmax thresholding; activations in CONV/FC have structured sparsity. The Einsum's Format layer (sparsity representation) interacts directly with how contracted ranks are traversed.
-- **Advanced techniques / precision (L11–L12):** Reduced-precision arithmetic applies per-Einsum-operand; Einsum structure determines what approximations are safe.
-- **FuseMax (L01 case study):** FuseMax exploits the Einsum structure of attention to fuse operations across the softmax boundary, eliminating intermediate DRAM traffic. The Einsum for attention (specifically AV_{p,f} = A_{m,p} × V_{m,f}) is the direct target of that optimization.
+| Slide range | Chapter section | Notes |
+|---|---|---|
+| L04-1 to L04-3 | Header and source context | Title and acknowledgements |
+| L04-4 to L04-9 | Sections 1, Key Terms | ODE, tensor references, matrix/einsum patterns |
+| L04-10 to L04-14 | Section 2 | Rank tuples, partitioning, flattening, matrix-multiply variants |
+| L04-15 to L04-18 | Section 3 | 1-D convolution and rank-shape examples |
+| L04-20 to L04-41 | Section 4 | FC animation sequence synthesized into FC lowering explanation |
+| L04-42 to L04-159 | Sections 3 and 4 | CONV visual build sequence synthesized; no slide images embedded |
+| L04-160 to L04-172 | Section 4 | Toeplitz/im2col and CONV-to-matmul summary |
+| L04-174 to L04-178 | Sections 5 and 7 | Convolution vs. attention, Transformers, tokens, source examples |
+| L04-179 to L04-189 | Section 6 | Attention mechanism as Einsums, full cascade |
+| L04-190 to L04-192 | Sections 6 and Hardware Implications | Computation properties, static/dynamic tensors, batched attention |
+| L04-193 to L04-194 | Section 6 | Multi-head attention |
+| L04-195 to L04-198 | Section 6 and Key Terms | Rank names and tensor glossary |
 
----
+## Source Notes
 
-## Appendix — Slide-to-Section Map
+- The lecture ordering, formulas, and attention rank names follow `Lecture/L04-Einsums+Transformers.pdf`.
+- The ODE wording is paraphrased from slide L04-4.
+- The convolution and CONV-to-matmul explanation is reconstructed from slides L04-15 to L04-18 and L04-42 to L04-172; many of those slides are animation frames with little extractable text.
+- The attention formulas follow slides L04-183 to L04-194. The slides note that some constant scaling steps are not illustrated; this chapter follows the slide scope and does not add the omitted scaling factor.
+- The examples using small vectors, small im2col coordinate tables, and two-token attention are original teaching examples.
+- The paper bridges for Vaswani et al. 2017 and Hu et al. 2018 use the local PDFs `papers/Transformer (Attention).pdf` and `papers/L03_SENet_Hu_CVPR2018.pdf`; Brown et al. 2020, Gong et al. 2021, Dosovitskiy et al. 2021, Jalammar, and D2L remain slide-stated examples rather than independently reviewed paper sources.
 
-| Slides (PDF page) | Section |
-|---|---|
-| L04-1 | Title — "Einsums + Transformers", February 13, 2026 |
-| L04-2 | Section divider — "Extended Einsums" |
-| L04-3 | Acknowledgements |
-| L04-4 … L04-18 | Ch.1 — Einsum ODE, tensor references, rank patterns, partitioning, flattening |
-| L04-19 | Blank animation frame |
-| L04-20 | Second lecture title — "Kernel Computation", February 9, 2026 |
-| L04-21 … L04-41 | Ch.3 — FC computation: Einsum, loop nest, matrix–vector and matrix–matrix multiply |
-| L04-42 … L04-59 | Ch.3 — CONV layer visualization (animation build) |
-| L04-60 … L04-159 | Ch.3 — CONV animation builds (incremental); rank shape and Toeplitz derivation |
-| L04-160 … L04-171 | Ch.3 — 2-D Toeplitz Einsum and CONV → matrix multiplication |
-| L04-172 | Ch.3 — Summary (FC and CONV → matmul; processing order matters) |
-| L04-173 | Blank animation frame |
-| L04-174 | Section divider — "Attention" |
-| L04-175 | Ch.4 — Convolution vs. Attention |
-| L04-176 | Ch.4 — Transformers overview (Vaswani 2017, GPT-3, ViT, AST) |
-| L04-177 | Ch.4 — Format of input (tokens) |
-| L04-178 | Ch.4 — Multi-head attention diagram (jalammar.github.io) |
-| L04-179 | Section divider — "Attention Mechanisms as Einsums" |
-| L04-180 | Ch.5 — Diagram conventions |
-| L04-181 | Ch.5 — Overall encoder structure |
-| L04-182 … L04-188 | Ch.5 — Basic self-attention steps (embed, Q/K, QK, softmax, V, AV, Z) |
-| L04-189 | Ch.5 — Full cascade (all Einsums in one slide) |
-| L04-190 … L04-191 | Ch.5 — Computation properties (parallelism, dependencies, quadratic cost, static vs. dynamic) |
-| L04-192 | Ch.5 — Batched attention |
-| L04-193 … L04-194 | Ch.5 — Multi-head attention (MHA) |
-| L04-195 … L04-198 | Ch.5 — Rank name glossary (word/token ranks, embedding ranks, other ranks) |
+## Uncertainty Notes
+
+- The live lecture may have emphasized particular animation frames differently; this chapter reconstructs the likely narration from the slide sequence.
+- Some CONV lowering details are teaching interpretation because the corresponding slide pages are mostly visual builds.
+- The attention notation follows the slide convention where $A_{m,p}$ normalizes over key/source position $m$ for each query/output position $p$. Other textbooks often transpose this convention.

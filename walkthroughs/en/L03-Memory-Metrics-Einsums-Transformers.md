@@ -1,529 +1,971 @@
-# L03 — Memory, Metrics, Einsums and Transformers
+# L03 - Memory, Metrics, Einsums, and Transformers
 
-> **Course:** 6.5930/1 — Hardware Architectures for Deep Learning
-> **Instructors:** Joel Emer & Vivienne Sze (MIT EECS)
-> **Lecture date:** February 9, 2026 · **Slides:** 127 · **Source:** [`Lecture/L03-Memory+Metrics+Einsums+Transformers.pdf`](../../Lecture/L03-Memory+Metrics+Einsums+Transformers.pdf)
+> **Course:** 6.5930/1 - Hardware Architectures for Deep Learning
+> **Instructors:** Joel Emer and Vivienne Sze (MIT EECS)
+> **Lecture date:** February 9, 2026. **Slides:** 127. **Source:** [`Lecture/L03-Memory+Metrics+Einsums+Transformers.pdf`](../../Lecture/L03-Memory+Metrics+Einsums+Transformers.pdf)
 >
-> *This is a conceptual walkthrough that reconstructs the lecture's narrative from the slides. The deck combines four sub-modules — memory technology, evaluation metrics, the Einsum notation for DNN kernels, and attention/Transformer computation — each introduced in its own section. The walkthrough is organized by idea, not slide-by-slide, and every slide range cited can be verified against the original PDF.*
+> This chapter reconstructs the missing lecture narration from the public slides. It is not a slide summary. Slide page references are used as source anchors; equations and examples are rewritten for self-study.
 
 ---
 
 ## TL;DR
 
-Three facts dominate this lecture and will recur throughout the course:
+L03 connects four ideas that will drive the rest of the course.
 
-1. **Data movement costs far more energy than arithmetic.** A 32-bit DRAM read costs 640 pJ; a 32-bit floating-point multiply costs 3.7 pJ — a 170× gap. Everything about how you design or map a DNN accelerator is, at heart, a strategy to keep data closer and move it less.
+First, DNN hardware is often limited by **data movement**, not arithmetic. The lecture uses Horowitz's energy table: a 32-bit DRAM read is 640 pJ, while a 32-bit floating-point multiply is 3.7 pJ. That slide-stated ratio is about 170x. The architect's job is therefore not only to add MAC units, but to arrange memory hierarchy and computation order so weights, activations, and partial sums move as little as possible.
 
-2. **A single number (GOPS/W) is not a metric.** Evaluating a DNN processor requires a coordinated suite — accuracy, throughput, latency, energy, hardware cost, and flexibility — and each metric must be measured with care (batch size, dataset, off-chip bandwidth included).
+Second, accelerator evaluation needs a **set of metrics**, not a single number such as GOPS/W. Accuracy, throughput, latency, energy, power, cost, flexibility, and scalability answer different questions. A design can look excellent under one metric and fail the application under another.
 
-3. **Every DNN computation can be written as an Einsum.** This compact notation captures what is computed without prescribing order, making it the formal language for the rest of the course. Fully-connected layers, convolutions, and every step of Transformer self-attention all reduce to matrix multiplications expressed as Einsums.
+Third, the course needs a notation that says **what** a DNN computation is without saying **how** it is scheduled. That notation is Einsum. An Einsum such as $Z_{m,n} = A_{m,k} B_{n,k}$ defines a tensor contraction and its iteration space, but does not prescribe loop order, tiling, data placement, or parallelization.
+
+Fourth, Transformer self-attention is not a separate kind of magic workload. It is a cascade of tensor contractions: input projection, $QK^T$, softmax, $AV$, and output projection. The key hardware warning is that ordinary self-attention materializes an $M \times M$ attention matrix for sequence length $M$.
+
+---
+
+## What Problem This Lecture Solves
+
+Earlier lectures introduced deep learning workloads and accelerator motivation. L03 supplies the common language needed to compare and map those workloads.
+
+The problem is that "a DNN layer" is too vague for hardware design. A hardware architect needs to know:
+
+- What tensors exist?
+- Which indices are preserved in the output?
+- Which indices are reduced?
+- How many bytes move between memory levels?
+- Which metric is being optimized?
+- Whether a reported result is a real system result or a proxy such as weight count or peak TOPS?
+
+L03 solves this by building three bridges:
+
+| Bridge | From | To | Why it matters |
+|---|---|---|---|
+| Memory hierarchy | Physical memory technologies | DNN data movement cost | Explains why local reuse is valuable |
+| Evaluation metrics | Model/application goals | Hardware comparison | Prevents misleading one-number claims |
+| Einsum notation | Neural-network layers | Loop nests and mapping | Lets later lectures discuss dataflow precisely |
+
+The final part of the lecture applies the same Einsum language to Transformer attention, because modern DNN accelerators must handle more than CNNs.
+
+---
+
+## Why This Lecture Matters
+
+The naive mental model is: "A neural network is mostly matrix multiplication, so the best accelerator is the one with the most multiply units." L03 corrects that model.
+
+The multiplication units matter, but they are only useful when the system can feed them. If every MAC fetches operands from DRAM, the system spends far more energy moving data than multiplying it. If a benchmark reports peak TOPS but does not report PE utilization, batch size, off-chip bandwidth, or accuracy, the result may not describe a deployable system.
+
+The same correction appears in the notation. A formula such as $O = AB$ is not enough. Hardware design needs to know whether $A$ and $B$ are weights, activations, or intermediate tensors; whether the reduced rank can be tiled; whether an intermediate is materialized; and whether a loop order exposes reuse.
+
+L03 is therefore the "language and measurement" lecture. L05 and L06 will ask how to map an Einsum onto hardware. L07 and later lectures will ask how sparsity, precision, and specialized architectures change the same cost model.
+
+---
+
+## Prerequisites and Mental Model
+
+You should bring three ideas.
+
+First, a DNN layer is a tensor computation. A tensor is an array with named dimensions, such as channel, height, width, batch, sequence position, or embedding dimension.
+
+Second, a DNN accelerator has a memory hierarchy. A useful simplified picture is:
+
+```text
+DRAM -> global buffer / SRAM -> PE-local RF or registers -> MAC units
+```
+
+The farther data travels away from the MAC unit, the more energy and latency it tends to cost. This is a source-based hardware principle from the memory slides, not merely a software locality slogan.
+
+Third, many DNN computations are reductions. A dot product, matrix multiplication, convolution, and attention score all compute products and then sum over at least one rank. Einsum gives the course a way to name those ranks cleanly.
+
+The mental model for this lecture is:
+
+```text
+mathematical layer -> Einsum -> possible loop orders -> memory traffic -> metrics
+```
+
+The Einsum fixes the mathematical contract. Mapping, introduced later, chooses the loop order and data placement. Metrics tell us whether the resulting system is useful.
 
 ---
 
 ## Learning Objectives
 
-After this lecture you should be able to:
+After studying this chapter, you should be able to:
 
-- Explain the **memory hierarchy** design rationale and the tradeoffs among latches, SRAM, DRAM, and Flash in terms of density, latency, bandwidth, and energy.
-- Quantify why **data movement dominates energy** using the Horowitz energy table (e.g., 32-bit DRAM read = 640 pJ vs. 32-bit FP multiply = 3.7 pJ).
-- List the **seven key evaluation metrics** (accuracy, throughput, latency, energy/power, hardware cost, flexibility, scalability) and explain what specification details must accompany each.
-- Understand why **indirect metrics (OPs, weights) do not directly predict latency or energy** and why comprehensive benchmarking (MLPerf) is needed.
-- Write and interpret **Einsum notation**: distinguish contracted vs. uncontracted ranks, recognize patterns (matrix-matrix, matrix-vector, element-wise, Cartesian product, convolution), and understand the Operational Definition.
-- Trace the Einsum for a **fully-connected (FC) layer**, show how it maps to matrix-vector and matrix-matrix multiplication (after flattening and adding batch), and explain the Toeplitz construction that converts convolution to matrix multiplication.
-- Decompose **self-attention** into its constituent Einsums (embedding → Q, K, V projections → QK product → softmax → AV product → output projection), name the rank variables, and extend to batched and multi-headed attention.
-
----
-
-## Chapter 1 — The Memory Hierarchy and Why It Exists
-
-> *Slides: L03-2 … L03-19 (physical pages 2–19)*
-
-### The central problem: memories cannot be both fast and large
-
-The memory hierarchy is one of the oldest ideas in computer architecture, and L03 gives it a precise quantitative grounding that is essential for DNN accelerator design.
-
-The starting observation is embarrassingly simple: **no single memory technology can simultaneously deliver large capacity, low latency, high bandwidth, and low energy per access.** The laws of physics — specifically, Energy = Capacitance × Voltage² — mean that larger arrays have longer bit-lines, larger capacitance, and therefore more energy per read. This creates an inescapable tradeoff.
-
-The solution is to build a **hierarchy** of memories at different sizes and positions:
-
-- **Latches / Flip-flops** (< 0.5 kB): 10+ transistors per bit, not dense, but extremely fast and located right next to the logic. Used for pipeline registers.
-- **SRAM** (kB–MB): 6 transistors per bit-cell, denser and slower than flip-flops. The peripheral circuits (word-lines, bit-lines, sense amplifiers) can account for significant area and energy — measured SRAM power is dominated 56% by sensing network and 22% by bit-lines. Bit-lines get longer (and more capacitive) as the array grows.
-- **DRAM** (GB): 1 transistor per bit-cell. Needs periodic refresh. Usually off-chip, meaning the interconnect has far higher capacitance than on-chip wiring. Hence the giant energy gap.
-- **Flash** (100 GB to TB): Non-volatile, denser than DRAM, but requires high-power writes (changing the threshold voltage of a transistor). Modern 3D NAND stacks have reached 512 Gb per die in 100+ layer, single-stack architecture (Samsung 6th-Gen V-NAND, 2022).
-
-![Energy cost hierarchy — 32-bit DRAM read costs 640 pJ, 170× a floating-point multiply](../../assets/L03/L03-p03-energy-cost-table.png)
-
-The Horowitz table (ISSCC 2014) that anchors this section is worth memorizing because it is the quantitative justification for almost every design decision in the course:
-
-| Operation | Energy (pJ) |
-|---|---|
-| 8-bit Add | 0.03 |
-| 32-bit Add | 0.1 |
-| 32-bit FP Add | 0.9 |
-| 8-bit Multiply | 0.2 |
-| 32-bit FP Multiply | 3.7 |
-| 32-bit SRAM Read (8 kB) | 5 |
-| **32-bit DRAM Read** | **640** |
-
-A DRAM read is **128× more expensive than an SRAM read** and **170× more expensive than a 32-bit FP multiply**. Speed follows the same ranking: memory access limits performance just as much as energy.
-
-### The design response: exploit locality
-
-The goal of the memory hierarchy is to **reduce access to large memories** by keeping frequently reused data in small, nearby memories. The two forms of locality exploited are:
-
-- **Temporal locality:** the same data element is used more than once. If it is kept in a small local buffer across those uses, only one expensive DRAM access is needed instead of many.
-- **Spatial locality:** nearby data elements are used together. Loading a whole cache line or tile at once amortizes the access cost.
-
-The key insight for DNN accelerators is that **processing order (loop nest ordering) does not change the mathematical result** — MACs are commutative — but it profoundly changes which data is reused at which buffer level, and therefore changes energy and latency. Choosing the right processing order to exploit reuse is the subject of the Mapping lectures (L05–L06).
-
-![Memory hierarchy — PE, L1, L2, DRAM; goal is to minimize access to large memories](../../assets/L03/L03-p04-memory-hierarchy.png)
-
-### Memory tradeoffs summary
-
-The tradeoffs across technologies can be organized into five attributes:
-
-- **Cost/bit:** circuit type (smaller transistor → cheaper)
-- **Latency:** circuit type (smaller → slower) *and* total capacity (smaller → faster)
-- **Bandwidth:** increases with parallelism
-- **Energy/access/bit:** total capacity (smaller → less energy) *and* circuit type (smaller → less energy)
-- **Density:** circuit type (smaller transistor → denser)
-
-Most attributes improve with technology scaling, lower supply voltage, and smaller capacitance — which is why every process node helps accelerator design, just not as dramatically as it once did.
-
-![Memory tradeoffs — cost, latency, bandwidth, energy, density across technologies](../../assets/L03/L03-p18-memory-tradeoffs.png)
-
-> **Why it matters:** The memory hierarchy is not an abstract concept — it is the physical reason why the DNN accelerator template (DRAM → Global Buffer → PE array → RF) looks the way it does, and it is the quantitative foundation for the claim that "data movement dominates energy." Every architectural decision in this course exists to keep data at the lowest, cheapest level of the hierarchy for as long as possible.
+- Explain why large memories are slower and more energy-intensive than small nearby memories.
+- Use the Horowitz table in the slides to compare arithmetic energy with SRAM and DRAM access energy.
+- Define accuracy, throughput, latency, energy, power, hardware cost, flexibility, and scalability as accelerator metrics.
+- Explain why weights and operation counts are proxy metrics rather than direct measurements of energy or latency.
+- Read an Einsum and identify output ranks, input ranks, and reduction ranks.
+- Explain the Operational Definition for Einsums as traversal of an iteration space.
+- Convert a fully connected layer into a matrix-vector or matrix-matrix multiplication by flattening ranks.
+- Explain how Toeplitz/im2col conversion turns convolution into a matrix multiplication and why that conversion repeats data.
+- Trace the self-attention cascade through $I$, $Q$, $K$, $V$, $QK$, softmax, $A$, $AV$, and $Z$.
+- Explain the hardware implications of an $M \times M$ attention matrix.
+- Distinguish slide-stated facts, paper/source-derived claims, standard background, and teaching interpretation.
 
 ---
 
-## Chapter 2 — Evaluation Metrics: Much More Than GOPS/W
+## 1. Memory Is a First-Class Design Constraint
 
-> *Slides: L03-40 … L03-56 (physical pages 40–56)*
+**Source anchor:** PDF pages 2-19. The energy table is attributed in the slides to Horowitz, ISSCC 2014.
 
-### Why a single efficiency number is dangerous
+### Intuition
 
-The slide titled "GOPS/W or TOPS/W?" delivers a pointed warning: a chip can achieve high GOPS/W with a **ring oscillator**. A ring oscillator has no compute capability whatsoever, but it toggles bits at a high rate and consumes some power, so the ratio can look impressive. This extreme example makes the point: **peak throughput divided by peak power tells you almost nothing about whether the chip is useful for your workload.**
+A memory is not just a passive container. It is a circuit. Larger memories usually have longer wires, larger capacitance, more peripheral circuitry, and more energy per access. The lecture states the physical rule as $E = C V^2$: for a fixed voltage, more capacitance means more energy.
 
-### The seven metrics you must report
+This is why memory hierarchy exists. We put small, fast, low-energy storage close to compute, and large, dense storage farther away.
 
-The lecture identifies a comprehensive set of metrics that together give a fair picture:
+### Precise meaning
 
-![Key metrics — accuracy, throughput, latency, energy/power, hardware cost, flexibility, scalability](../../assets/L03/L03-p42-key-metrics.png)
+The lecture compares four storage technologies.
 
-1. **Accuracy** — The quality of the result. Must specify dataset and task difficulty; a chip achieving 99% accuracy on MNIST is not comparable to one achieving 90% on ImageNet.
+| Storage | Typical role in this lecture | Strength | Cost |
+|---|---|---|---|
+| Latches / flip-flops | Very small local state, pipeline registers | Very low latency, near logic | Low density, many transistors per bit |
+| SRAM | Register files, buffers, on-chip memories | On-chip, reusable, faster than DRAM | More area than DRAM; peripheral circuits matter |
+| DRAM | Main memory, often off-chip | Large capacity, low cost per bit | High access energy and latency |
+| Flash | Persistent storage | Very dense, non-volatile | Writes are expensive and slow for compute use |
 
-2. **Throughput** — Operations or inferences per second. Required for analytics pipelines and real-time applications (e.g., video at 30 fps). Must be reported as *actual* throughput on a specific DNN, not just "peak TOPS."
+The important DNN point is not that every accelerator uses exactly these levels. The point is that capacity, latency, bandwidth, density, and energy pull against one another. A local buffer helps only if the computation reuses data before evicting it.
 
-3. **Latency** — Time from input to output. Critical for interactive applications (autonomous navigation, speech recognition). Has the additional constraint of requiring small batch sizes: batching helps throughput but hurts latency.
+### Quantitative anchor
 
-4. **Energy and Power** — Embedded devices have limited battery capacity; data centers have a power ceiling set by cooling cost. Power consumption limits the maximum number of MACs that can run in parallel (thermal envelope).
+The slide table gives these energy values:
 
-5. **Hardware Cost** — Chip area, process technology, and external interface cost. These determine the price.
+| Operation | Energy |
+|---|---:|
+| 8-bit add | 0.03 pJ |
+| 32-bit add | 0.1 pJ |
+| 32-bit floating-point add | 0.9 pJ |
+| 8-bit multiply | 0.2 pJ |
+| 32-bit multiply | 3.1 pJ |
+| 32-bit floating-point multiply | 3.7 pJ |
+| 32-bit SRAM read from an 8 kB SRAM | 5 pJ |
+| 32-bit DRAM read | 640 pJ |
 
-6. **Flexibility** — The range of DNN models and tasks efficiently supported. Because DNN algorithm designers cannot be guaranteed to use a specific model, hardware must handle variation in layer shapes, precision, and sparsity.
+Two ratios are worth reading carefully:
 
-7. **Scalability** — How performance scales with additional resources (PEs, memory bandwidth).
+- A 32-bit DRAM read costs $640 / 5 = 128$ times a 32-bit SRAM read in this table.
+- A 32-bit DRAM read costs $640 / 3.7 \approx 173$ times a 32-bit floating-point multiply in this table.
 
-### What to specify when measuring each metric
+These are slide-stated values from a particular technology context. They are not universal constants, but they are strong enough to justify the architectural direction: reduce large-memory traffic.
 
-The lecture is explicit about the specification details that accompany each metric:
+### Worked example: why one reused word matters
 
-- **Accuracy:** specify dataset, task difficulty, and training procedure.
-- **Throughput:** specify the number of PEs *with utilization* (not just peak), and report runtime for a specific DNN model.
-- **Latency:** specify batch size.
-- **Energy/Power:** report power for running specific DNN models, and report **off-chip memory access** (DRAM bandwidth). Without the DRAM bandwidth figure, a chip that just has multipliers can claim low chip power while the system power is dominated by DRAM accesses.
-- **Hardware Cost:** report on-chip storage, number of PEs, chip area, and process technology.
-- **Flexibility:** report performance across a wide range of DNN models.
+Suppose a weight is used by 16 MACs. If the system reads the weight from DRAM for every MAC, the weight traffic costs $16 \times 640 = 10{,}240$ pJ for that one 32-bit value in the Horowitz table.
 
-![Key design objectives — throughput, latency, energy; PE utilization and data reuse](../../assets/L03/L03-p45-key-design-objectives.png)
+If the system reads the weight once from DRAM and keeps it in local storage, the DRAM part costs $640$ pJ. Even if each local reuse costs an SRAM-like $5$ pJ, the 16 local reads cost $80$ pJ, for a total of $720$ pJ.
 
-### The evaluation process: a hierarchy of gates
+This toy example is not a full accelerator energy model. It deliberately ignores address generation, interconnect, control, and writes. Its purpose is to show the scale of the reuse opportunity.
 
-The lecture describes a natural ordering for evaluating a DNN system against an application:
+### Hardware implication
 
-1. **Accuracy** determines whether it can *perform* the task.
-2. **Latency and Throughput** determine whether it can run *fast enough* for real-time.
-3. **Energy and Power** dictate the form factor (phone, edge server, data center).
-4. **Cost** (area + interface) determines the price point.
-5. **Flexibility** determines the range of tasks it can serve.
+The memory hierarchy changes the mapping problem. A loop order that reuses a weight 16 times while it is in a PE-local register file can be much cheaper than a loop order that uses the same weight 16 times after repeatedly evicting and refetching it. The arithmetic is identical; the traffic is not.
 
-Missing any one metric can lead to a misleading or invalid comparison. The lecture gives two cautionary examples: (a) claiming "low power, high throughput" without accuracy means nothing if the model is trivial; (b) claiming "low chip power" without reporting off-chip bandwidth hides the system-level energy.
+### Common misconception
 
-### MLPerf: standardized benchmarking
+**Misconception:** Data movement is expensive only because DRAM is slow.
 
-MLPerf (first results December 2018, backed by 23 companies and 7 institutions) is the industry response: **a broad suite of DNN models covering image classification, object detection, translation, speech-to-text, recommendation, sentiment analysis, and reinforcement learning**, used as a common benchmark for hardware, software frameworks, and cloud platforms. It covers both training and inference, cloud and edge, closed and open divisions.
-
-### The warning about indirect metrics
-
-The lecture closes this section with an explicit warning: **fewer weights and fewer MACs do not directly translate to lower energy or lower latency.** Filter shape, batch size, and hardware mapping all matter. A model with fewer parameters can consume more energy on a given piece of hardware than one with more parameters, depending on how the data flows. This is why L03 demands direct metrics rather than proxy counts.
-
-> **Why it matters:** Accelerator papers routinely cherry-pick a single metric. Understanding the full suite — and knowing what specifications must accompany each — is essential for doing fair comparisons and for designing hardware that is actually useful in deployment.
+**Correction:** Latency matters, but energy is also central. Large memories and off-chip links have high capacitance. The lecture explicitly connects the energy cost to capacitance and voltage, then uses the Horowitz table to show that memory movement can dominate arithmetic.
 
 ---
 
-## Chapter 3 — Einsum Notation: The Formal Language of DNN Computation
+## 2. Efficient Models Are Not Automatically Efficient Hardware
 
-> *Slides: Extended Einsums 2/37 … 18/37 (physical pages 57–72)*
+**Source anchor:** PDF pages 20-39.
 
-### What is an Einsum and why use it?
+The lecture includes an efficient-CNN interlude before the metric section. This is not a detour. It sets up a warning: model-design papers often report number of weights and number of operations as "complexity," but those are indirect metrics.
 
-A DNN accelerator must perform a fixed set of algebraic operations — multiply-accumulate, reduction, element-wise ops — but those operations can be expressed in many different loop orderings without changing the result. To reason about *what* is computed independently of *how* (in what order), the course adopts **Einsum notation**.
+### What the model side tries to reduce
 
-An Einsum is written as:
+The slides list several ways CNN designers reduce apparent complexity:
 
-```
-Z_m,n = A_m,k × B_n,k
-```
+- Replace one large spatial filter with stacked smaller filters, such as replacing a $5 \times 5$ filter with two $3 \times 3$ filters.
+- Use $1 \times 1$ bottleneck convolutions to reduce channel count before an expensive layer.
+- Use grouped or depthwise convolutions so each filter sees only a subset of channels.
+- Reuse feature maps across layers, as in DenseNet-style connectivity.
+- Search architectures automatically with NAS.
 
-This is simultaneously a declaration of tensors (Z is indexed by m and n; A by m and k; B by n and k) and a computation rule. The **Operational Definition for Einsums (ODE)** states:
+The MobileNet slide gives a compact formula. A standard convolution has work proportional to $H W C R S M$. A depthwise-separable version has depthwise work $H W C R S$ plus pointwise work $H W C M$, so its work is proportional to $H W C (R S + M)$. The standard-to-depthwise-separable MAC ratio is therefore:
 
-> Traverse all points in the space of all legal rank variable values (the **iteration space**). At each point: compute the value on the right-hand side at those rank variable values; assign (or reduce) it into the left-hand side operand at its specified indices. If the left-hand side is non-zero, *reduce* (accumulate) the value into it.
+$$
+\frac{H W C R S M}{H W C (R S + M)} = \frac{R S M}{R S + M}.
+$$
 
-![Example Einsum Z_m,n = A_m,k × B_n,k with Operational Definition for Einsums](../../assets/L03/L03-p59-einsum-example-ode.png)
+This is a real algorithmic reduction, source-anchored to the MobileNets slide. But the lecture immediately warns that fewer operations do not automatically imply lower latency or energy.
 
-This definition is deceptively simple but extremely powerful: it specifies *what* to compute — the mathematical relation — without saying *in what order* to traverse the iteration space. Any traversal order that visits every point in the iteration space produces the same result.
+### Why the hardware answer is more subtle
 
-### Ranks, rank names, and rank shapes
+An operation count ignores at least five hardware facts:
 
-Einsum uses precise terminology:
+- Whether the reduced operation exposes enough parallelism to fill the PE array.
+- Whether the smaller tensors still have good reuse.
+- Whether grouped/depthwise layers create awkward memory access patterns.
+- Whether metadata, layout conversion, or kernel launch overhead appears.
+- Whether the hardware was designed for dense GEMM-like work or for many small irregular kernels.
 
-- **Rank variable** (e.g., k, m): the loop index.
-- **Rank name** (e.g., "K", "M"): a label for the dimension.
-- **Rank shape** (e.g., K, M): the size (range) of the dimension.
+This is a teaching interpretation based on the slide warning on pages 36-37 and the metrics section on pages 40-56. The lecture's point is not that efficient CNN techniques are bad. The point is that algorithmic complexity and hardware cost must be connected through a real mapping and measurement method.
 
-The notation `A^{K,M}_{k,m}` means tensor A has rank names K and M with rank variables k and m ranging over K and M values respectively. When concrete values are specified (e.g., `A^{K=X, M=X}_{k,m}`), both dimensions are of size X.
+### Common misconception
 
-### Einsum patterns: a taxonomy
+**Misconception:** If a model has 50x fewer parameters, it should use 50x less energy.
 
-The lecture walks through a comprehensive taxonomy of patterns. Every DNN layer is one of these:
+**Correction:** Parameter count estimates storage for weights, but energy also depends on activations, outputs, partial sums, reuse, memory level, data layout, utilization, and batch size. The slides later use AlexNet versus SqueezeNet as a warning that proxy metrics can mislead.
 
-![Einsum patterns — matrix-matrix multiply, matrix-vector, Cartesian product, element-wise](../../assets/L03/L03-p63-einsum-patterns.png)
+---
 
-**Contracted (reduced) rank:** a rank variable that appears on the right-hand side but *not* on the left-hand side. The dimension is summed (reduced) away. In `Z_{m,n} = A_{m,k} × B_{k,n}`, rank k is contracted.
+## 3. Evaluation Metrics: What Must Be Reported
 
-**Uncontracted rank:** a rank that appears on both sides and is preserved in the output.
+**Source anchor:** PDF pages 40-56.
 
-The patterns:
+### Intuition
 
-| Einsum | Pattern | Notes |
+One metric answers one question. It cannot answer every question.
+
+For example, throughput asks "how many inputs per second?" Latency asks "how long does one input wait?" Energy asks "how much work per joule?" Accuracy asks "is the result useful?" A system that wins one of these may lose another.
+
+The lecture makes this concrete with the ring-oscillator example: high TOPS/W can be manufactured by a circuit that toggles quickly but performs no useful DNN inference. Peak arithmetic divided by peak power is not enough.
+
+### The metric set
+
+| Metric | What it asks | Required context |
 |---|---|---|
-| `Z_{m,n} = A_{m,k} × B_{k,n}` | Matrix-matrix multiply | k contracted |
-| `Z_{m,n} = A_{k,m} × B_{k,n}` | Matrix-matrix multiply | same, index order irrelevant |
-| `Z_m = A_{k,m} × B_k` | Matrix-vector multiply | k contracted |
-| `Z_{m,n} = A_m × B_n` | Cartesian product | no contraction |
-| `Z_m = A_m × B_m` | Element-wise multiply | no contraction, no expansion |
-| `Z_m = A_m + B_m` | Element-wise addition | different operator (not reduce-multiply) |
+| Accuracy | Does the model solve the task? | Dataset, task difficulty, training/evaluation procedure |
+| Throughput | How many operations or inferences per second? | Actual model, PE count, utilization, batch size |
+| Latency | How long from input to output? | Batch size and end-to-end path |
+| Energy and power | How much energy per inference and power while running? | Model, memory traffic, off-chip bandwidth, measurement/simulation method |
+| Hardware cost | How expensive is the implementation? | Area, process node, on-chip storage, PE count, external interfaces |
+| Flexibility | How many workloads run efficiently? | Range of models, shapes, precisions, sparsity, and layer types |
+| Scalability | What happens when resources increase? | Scaling variable and bottleneck, such as PEs or memory bandwidth |
 
-Note: the *names* of rank variables do not matter — `Z_{p,q} = A_{p,r} × B_{q,r}` is still a matrix-matrix multiply.
+### Throughput, latency, and batch size
 
-### Rank variable patterns: tuples, partitioning, and flattening
+Throughput and latency are related but not identical. A batch of 64 may improve throughput because the same weights are reused across more inputs, but it can increase the waiting time for a single input. This is why the slides explicitly state that low latency has the additional constraint of small batch size.
 
-The lecture explores two further operations:
+### Energy and off-chip memory
 
-**Partitioning:** a single rank i can be split into a higher-order pair (i₁, i₀) where `i = i₁ × I₀ + i₀`. This adds a rank. The Einsum `Z_i = A_i × B_i` becomes `Z_{i₁,i₀} = A_{i₁,i₀} × B_{i₁,i₀}` after partitioning.
+The metrics slides emphasize off-chip memory access. If a paper reports only chip power, it may hide the energy of DRAM traffic outside the accelerator core. A design with many multipliers and insufficient local storage can look cheap on-chip while pushing cost into the memory system.
 
-**Flattening (the inverse):** `Z_{(i₁,i₀)} = A_{(i₁,i₀)} × B_{(i₁,i₀)}` — a tuple of rank variables can be treated as a single coordinate where `ij = i × J + j`. This collapses two ranks into one.
+### Worked example: operational intensity
 
-These two operations are the formal basis for **tiling** (in the Mapping lectures, L05–L06): tiling *is* partitioning of rank variables, and understanding it at the Einsum level is what allows the course to reason about tiling independently of any particular hardware.
+Operational intensity is commonly read as $\text{ops}/\text{byte}$. The lecture references the Roofline paper in the metrics references; this chapter uses the idea as standard background.
 
-### Convolution as an Einsum
+Suppose a tiny kernel performs 1024 MACs. If we count one MAC as one operation for this toy example, and the kernel reads 2048 bytes from DRAM, then its operational intensity is:
 
-The 1-D convolution `O_q = I_{q+s} × F_s` is the prototype for all convolution Einsums. The key feature is the **change of variables**: there is a relationship between the input index and the output and filter indices (`h = U×p + r`, `w = U×q + s` in 2D, where U is the stride). This structural coupling is absent in fully-connected layers and is what makes convolution somewhat special.
+$$
+\text{OI} = \frac{1024\ \text{ops}}{2048\ \text{bytes}} = 0.5\ \text{ops/byte}.
+$$
 
-![Convolution Einsum — 1D and generalization to 2D with stride relationship](../../assets/L03/L03-p70-convolution-einsum.png)
+If a different loop order reuses local data and reads only 512 bytes from DRAM for the same 1024 MACs, then:
 
-The full 2-D convolution with batches:
+$$
+\text{OI} = \frac{1024}{512} = 2\ \text{ops/byte}.
+$$
 
-```
-O_{n,m,p,q} = B_{m} + I_{n,c,(U×p+r),(U×q+s)} × F_{m,c,r,s}
-```
+The arithmetic did not change. The memory traffic changed. A higher operational intensity usually means each fetched byte supports more computation, which is exactly what local reuse tries to accomplish.
 
-where N = batch, M = output channels, P×Q = output spatial, C = input channels, R×S = filter size.
+### Source bridge: MLPerf, Accelergy, and AccelForge
 
-> **Why it matters:** Einsum is the formal backbone of this course. The TeAAL framework's "Compute" layer is precisely the Einsum being evaluated. Without a way to express computations abstractly — independent of order — it is impossible to talk about mapping, tiling, or dataflow in a principled way.
+The lecture points to three kinds of evaluation infrastructure.
 
----
+| Source/tool | Problem addressed | Relevance to L03 |
+|---|---|---|
+| MLPerf | Standardized benchmarking across models and platforms | Reduces cherry-picking by using common workloads and divisions |
+| Accelergy, Wu et al., ICCAD 2019 | Architecture-level energy estimation | Connects components and actions to estimated energy |
+| AccelForge | DNN mapping and performance simulation | Produces action counts that can feed an energy estimator |
 
-## Chapter 4 — Einsums for Fully-Connected and Convolution Layers
+The chapter uses these as source bridges, not as full paper summaries. The key takeaway is that fair accelerator evaluation needs workload shape, architecture description, mapping, action counts, and energy modeling, not just peak TOPS.
 
-> *Slides: Kernel Computation 1 … 37 (physical pages 73–109)*
+### Common misconception
 
-### Fully-connected layer: from nested loops to matrix multiplication
+**Misconception:** GOPS/W is the same as energy efficiency for a useful application.
 
-A **fully-connected (FC) layer** computes `O_m = I_{c,h,w} × F_{m,c,h,w}` (summing over input channels c and spatial dimensions h, w). The Einsum captures this with no loop ordering.
-
-![Einsum for flattened FC — O_m = I_chw × F_{m,chw} showing matrix-vector structure](../../assets/L03/L03-p85-einsum-for-fc.png)
-
-The lecture shows explicitly how to convert this to matrix multiplication:
-
-1. **Flatten** the (C, H, W) dimensions into a single CHW index: `I_{c,h,w} → I_{chw}` and `F_{m,c,h,w} → F_{m,chw}`.
-2. The Einsum becomes `O_m = I_{chw} × F_{m,chw}` — a **matrix-vector multiply** (reduction on rank chw).
-3. With a **batch of N inputs**: `O_{n,m} = I_{n,chw} × F_{m,chw}` — a **matrix-matrix multiply**.
-
-This is the standard lab notation: `C_{m,n} = A_{m,k} × B_{k,n}` with reduction on k. The order of ranks in an Einsum does not matter; only which ranks are contracted matters.
-
-### Convolution: Toeplitz conversion and the im2col trick
-
-Convolution can also be converted to matrix multiplication — but it requires a structural intermediate step.
-
-For 1-D convolution `O_q = I_{q+s} × F_s`, the conversion is:
-1. **Toeplitz conversion (Step 1):** `T_{q,s} = I_{q+s}` — create a 2D Toeplitz matrix T by indexing into the input with offset `q+s`.
-2. **Matrix multiply (Step 2):** `O_q = T_{q,s} × F_s`.
-
-The key observation is that the Toeplitz matrix contains **repeated data** — input elements appear in multiple rows shifted by one position. This data replication is what the im2col (image-to-column) transformation does in frameworks like PyTorch.
-
-For 2-D convolution, the dimensions of the matrix multiply are:
-
-```
-Filters [M × CRS] × Input_Toeplitz [CRS × PQN] = Output [M × PQN]
-```
-
-where P = H−R+1, Q = W−S+1, N = batch size.
-
-![Full convolution → matrix multiply via Toeplitz: M × CRS times CRS × PQN = M × PQN](../../assets/L03/L03-p107-conv-to-matmul.png)
-
-The 2-D Toeplitz Einsum is:
-
-```
-T_{q,p,s,r} = I_{p+(r),q+(s)}    (Toeplitz conversion)
-T_{qp,sr}  = T_{q,p,s,r}          (flatten ranks)
-O_{m,qp}   = T_{qp,sr} × F_{m,sr} (matrix multiply)
-```
-
-The Convolution Einsum `O_{n,m,p,q} = I_{n,c,(U×p+r),(U×q+s)} × F_{m,c,r,s}` is therefore equivalent to a matrix-matrix multiplication after the Toeplitz/im2col transform — which is *why* matrix multiplication accelerators (like GPUs) can efficiently handle convolutions.
-
-> **Why it matters:** The conversion of FC and CONV layers to matrix multiplication is the analytical foundation for why DNN accelerators can be built around a general matrix-multiply (GEMM) engine. It also shows that there are *many* ways to compute the same matrix multiplication (many valid loop orderings), and that the choice of order affects how much data movement occurs at each memory level.
+**Correction:** GOPS/W can be meaningful only when the operations are useful, the workload is specified, utilization is measured, accuracy is preserved, and memory-system energy is included. Otherwise it is easy to optimize a ratio rather than the application.
 
 ---
 
-## Chapter 5 — Transformer Self-Attention as Einsums
+## 4. Einsum: The Contract for Tensor Computation
 
-> *Slides: Attention Einsums 20/37 … 37/37 (physical pages 110–127)*
+**Source anchor:** PDF pages 57-72.
 
-### The Transformer encoder structure
+### Intuition
 
-The Transformer encoder alternates between two sub-layers: **self-attention** (with Add+Norm residual) and **feed-forward** (with Add+Norm residual). The lecture focuses on the self-attention sub-layer.
+Einsum separates two questions:
 
-![Overall Transformer encoder structure — Self-Attention → Add+Norm → Feed Forward → Add+Norm](../../assets/L03/L03-p113-encoder-structure.png)
+- What values must be multiplied, added, or otherwise combined?
+- In what order should a machine perform those operations?
 
-The encoder is a cascade of Einsums. The lecture identifies each step with its Einsum, its rank variables, and the tensor dimensions involved.
+The first question is the Einsum. The second question is mapping.
 
-### The computation graph of basic self-attention
+For example, $Z_{m,n} = A_{m,k} B_{n,k}$ says that each output element $Z_{m,n}$ sums products over $k$. It does not say whether the loop over $m$, $n$, or $k$ should run first, nor whether $m$ and $n$ should be parallelized.
 
-The data flow through one self-attention block (for a single head, no batch) involves eight operations, each expressible as an Einsum:
+### Operational Definition for Einsums
 
-![Basic self-attention encoder computation — I → Q, K, V → QK × softmax → AV → Z](../../assets/L03/L03-p114-self-attention-computation.png)
+The slides define an Einsum operationally:
 
-**Step 1 — Input embedding** (first layer only):
+1. Traverse all legal values of the rank variables. This set is the **iteration space**.
+2. At each point, compute the right-hand side at those rank-variable values.
+3. Assign the result into the left-hand-side tensor.
+4. If the target location already has a value, reduce into it, usually by addition.
 
+For $Z_{m,n} = A_{m,k} B_{n,k}$, the legal points are triples $(m,n,k)$. The output location is identified by $(m,n)$. Because $k$ appears only on the right-hand side, multiple iteration points contribute to the same $Z_{m,n}$, so $k$ is a reduction rank.
+
+### Precise vocabulary
+
+| Term | Meaning |
+|---|---|
+| Rank variable | The index used in the expression, such as $m$, $n$, or $k$ |
+| Rank name | The dimension label, such as $M$, $N$, or $K$ |
+| Rank shape | The extent of the dimension, such as $M=64$ |
+| Uncontracted rank | A rank appearing on both sides; it remains in the output |
+| Contracted rank | A rank appearing on the right but not the left; it is reduced |
+| Iteration space | The Cartesian product of all rank-variable ranges |
+
+### Common patterns
+
+| Einsum | Reading | Reduced rank |
+|---|---|---|
+| $Z_{m,n} = A_{m,k} B_{k,n}$ | Matrix-matrix multiply | $k$ |
+| $Z_m = A_{k,m} B_k$ | Matrix-vector multiply | $k$ |
+| $Z_{m,n} = A_m B_n$ | Cartesian product | none |
+| $Z_m = A_m B_m$ | Element-wise multiply | none |
+| $Z_m = A_m + B_m$ | Element-wise addition | none |
+
+The names of the variables are not special. $Z_{p,q} = A_{p,r} B_{q,r}$ is still a matrix-matrix-style contraction because $r$ is reduced and $p,q$ remain.
+
+### Partitioning and flattening
+
+The slides introduce a rank split: if $i = i_1 I_0 + i_0$, then one original rank $i$ can be represented by two ranks $(i_1,i_0)$. This is partitioning.
+
+Flattening is the inverse. A pair $(i_1,i_0)$ can be treated as one flattened coordinate $i$. This matters because later lectures describe tiling as rank partitioning, not as an ad hoc code trick.
+
+### Worked example: reading an Einsum
+
+Consider:
+
+$$
+Y_{b,m} = X_{b,k} W_{m,k}.
+$$
+
+The rank variables are $b$, $m$, and $k$. The output ranks are $b$ and $m$. The rank $k$ appears only on the right-hand side, so it is reduced. If $B=2$, $M=3$, and $K=4$, then the iteration space has $2 \times 3 \times 4 = 24$ points, and the output has $2 \times 3 = 6$ elements. Each output element accumulates 4 products.
+
+### Hardware implication
+
+Einsum gives the hardware architect a workload-independent way to talk about data reuse. If $k$ is reduced, partial sums for the left-hand-side tensor must be accumulated. If $m$ or $n$ is uncontracted, those ranks may expose parallel output elements. If a rank is partitioned, the tile size can be chosen to fit a buffer.
+
+### Common misconception
+
+**Misconception:** Einsum is just a compact way to write matrix multiplication.
+
+**Correction:** Matrix multiplication is one Einsum pattern. The point of the notation is broader: it describes tensor contractions, element-wise operations, Cartesian products, convolution index relationships, and attention projections without committing to a loop order.
+
+---
+
+## 5. Fully Connected and Convolution Layers as Matrix Multiplication
+
+**Source anchor:** PDF pages 73-109.
+
+### Fully connected layer
+
+A fully connected layer can be seen as a convolution whose filter covers the whole input spatial extent. The slide equation is:
+
+$$
+O_m = I_{c,h,w} F_{m,c,h,w}.
+$$
+
+The repeated ranks $c,h,w$ are reduced. To turn this into a matrix-vector multiply, flatten $(c,h,w)$ into one rank $chw$:
+
+$$
+O_m = I_{chw} F_{m,chw}.
+$$
+
+With batch size $N$, the input gets a batch rank $n$:
+
+$$
+O_{n,m} = I_{n,chw} F_{m,chw}.
+$$
+
+This is matrix-matrix multiplication in Einsum form. The output has ranks $(n,m)$, and $chw$ is the reduction rank.
+
+### Why flattening is not just notation
+
+Flattening changes how we view the memory layout. If the tensor is stored so that consecutive $chw$ elements are contiguous, the matrix-vector view can be efficient. If the layout is mismatched, the hardware may need strided accesses or layout conversion. The mathematical contraction is the same, but the memory behavior can differ.
+
+### Convolution and Toeplitz/im2col
+
+For a 1-D convolution:
+
+$$
+O_q = I_{q+s} F_s.
+$$
+
+The input index is not simply $q$ or $s$; it is $q+s$. That coupling is what makes convolution different from ordinary matrix multiplication.
+
+The slides break the conversion into two steps:
+
+$$
+T_{q,s} = I_{q+s}
+$$
+
+and then:
+
+$$
+O_q = T_{q,s} F_s.
+$$
+
+The first step creates a Toeplitz/im2col matrix of shifted input windows. The second step is a matrix multiplication.
+
+For 2-D convolution with batch, the slide-stated matrix dimensions are:
+
+$$
+\text{Filters }[M \times C R S] \times \text{Input-Toeplitz }[C R S \times P Q N] = \text{Output }[M \times P Q N],
+$$
+
+where $P = H - R + 1$ and $Q = W - S + 1$ for the no-padding, unit-stride case shown in the slides.
+
+### Worked example: tiny 1-D Toeplitz conversion
+
+Let the input be $I=[1,2,3,4,5]$ and the filter be $F=[a,b,c]$. A valid 1-D convolution has three output positions:
+
+$$
+O_0 = 1a + 2b + 3c,
+$$
+
+$$
+O_1 = 2a + 3b + 4c,
+$$
+
+$$
+O_2 = 3a + 4b + 5c.
+$$
+
+The Toeplitz matrix is:
+
+```text
+T = [1 2 3
+     2 3 4
+     3 4 5]
 ```
-I_{m,d} = IR_{m,c} × W^I_{c,d}
-```
 
-Convert the raw one-hot input IR (sequence length M, vocabulary size C) to a dense embedding I of size d_model (D).
+Then $O = T F$. The important hardware observation is that the input values are repeated in $T$. The value 3 appears in three windows. Materializing $T$ may make the operation look like GEMM, but it can increase memory traffic unless the implementation avoids physically writing all repeated entries.
 
-**Step 2 — Project to Query (Q) and Key (K):**
+### Hardware implication
 
-```
-Q_{m,e} = I_{m,d} × W^Q_{d,e}
-K_{m,e} = I_{m,d} × W^K_{d,e}
-```
+The conversion explains why GEMM engines can run FC and CONV layers. It also explains a tradeoff: im2col can produce regular matrix multiplication, but the regularity may come from duplicating data. Later mapping lectures ask whether the accelerator can exploit convolutional reuse without fully materializing the Toeplitz matrix.
 
-Project the input I from D-space into E-space (dk dimension) to form Q and K.
+### Common misconception
 
-**Step 3 — QK product (pre-softmax attention):**
+**Misconception:** Since convolution can be converted to matrix multiplication, convolution hardware only needs a generic GEMM block.
 
-```
-QK_{m,p} = Q_{p,e} × K_{m,e}    (reduction on rank E)
-```
+**Correction:** GEMM is a powerful abstraction, but the conversion may duplicate input data and change memory traffic. A convolution-aware mapping can exploit overlap directly, while a naive im2col implementation may spend energy moving repeated data.
 
-M and P are both aliases for sequence length; QK is the M×M attention logit matrix.
+---
 
-**Step 4 — Softmax:**
+## 6. Transformer Self-Attention as Einsums
 
-```
-SN_{m,p} = exp(QK_{m,p})
-SD_p      = Σ_m SN_{m,p}
-A_{m,p}   = SN_{m,p} / SD_p
-```
+**Source anchor:** PDF pages 110-127.
 
-The softmax is not an Einsum (it involves exp and division), but its components fit the Einsum framework for the summation step.
+### Mental model
 
-**Step 5 — Project to Value (V):**
+Self-attention takes a sequence of $M$ tokens. Each token starts as an embedding vector of dimension $D$. The block computes three projections:
 
-```
-V_{m,f} = I_{m,d} × W^V_{d,f}
-```
+- Query $Q$: what this position is asking for.
+- Key $K$: what each position offers for matching.
+- Value $V$: what information each position contributes if attended to.
 
-Project I from D-space to F-space (dv dimension).
-
-**Step 6 — AV product:**
-
-```
-AV_{p,f} = A_{m,p} × V_{m,f}    (reduction on rank M)
-```
-
-**Step 7 — Output projection:**
-
-```
-Z_{p,g} = AV_{p,f} × W^Z_{f,g}
-```
-
-Project from F-space to G-space (often same as D).
+The attention score between a query position and a key position comes from a dot product. The softmax turns scores into weights. The value vectors are mixed using those weights. Finally, an output projection returns the result to the model's embedding space.
 
 ### Rank dictionary
 
-The lecture provides an explicit name-to-dimension table:
-
 | Rank | Meaning |
 |---|---|
-| M | Sequence length (for Q, K, V in self-attention) |
-| P | Alias of sequence length (for the QK product) |
-| R | Sequence length for the query in cross-attention |
-| C | Dictionary / vocabulary size |
-| D | Global input embedding (d_model) |
-| E | Q and K local embedding (dk) |
-| F | V local embedding (dv) |
-| G | Output embedding |
-| B | Batch size |
+| $M$ | Sequence length for keys, values, and self-attention positions |
+| $P$ | Alias of sequence length used for query/output position in the slides |
+| $R$ | Query sequence length in non-self-attention |
+| $C$ | Vocabulary size |
+| $D$ | Input/global embedding dimension, often $d_{\text{model}}$ |
+| $E$ | Query/key projection dimension, often $d_k$ |
+| $F$ | Value projection dimension, often $d_v$ |
+| $G$ | Output embedding dimension |
+| $B$ | Batch size |
+| $H$ | Number of attention heads |
+
+The slides use $M$ and $P$ as aliases for sequence length so the two axes of the attention matrix can be named separately.
+
+### Single-head attention cascade
+
+For the first layer only, raw one-hot input $IR$ is embedded:
+
+$$
+I_{m,d} = IR_{m,c} W^I_{c,d}.
+$$
+
+Then the input is projected to key, query, and value spaces:
+
+$$
+K_{m,e} = I_{m,d} W^K_{d,e},
+$$
+
+$$
+Q_{m,e} = I_{m,d} W^Q_{d,e},
+$$
+
+$$
+V_{m,f} = I_{m,d} W^V_{d,f}.
+$$
+
+The pre-softmax score matrix is:
+
+$$
+QK_{m,p} = Q_{p,e} K_{m,e}.
+$$
+
+Here $e$ is reduced. For each query position $p$, the score compares that query with every key position $m$. The slides note that some constant scaling steps are not illustrated, so this chapter does not treat scaling as a source-stated equation.
+
+The softmax components in the slide convention are:
+
+$$
+SN_{m,p} = \exp(QK_{m,p}),
+$$
+
+$$
+SD_p = \sum_m SN_{m,p},
+$$
+
+$$
+A_{m,p} = SN_{m,p} / SD_p.
+$$
+
+Then values are mixed:
+
+$$
+AV_{p,f} = A_{m,p} V_{m,f}.
+$$
+
+Finally the output projection is:
+
+$$
+Z_{p,g} = AV_{p,f} W^Z_{f,g}.
+$$
+
+### Worked example: attention shapes
+
+Suppose $M=4$, $D=8$, $E=2$, and $F=3$ for a single head and no batch.
+
+| Tensor | Shape | Why |
+|---|---|---|
+| $I$ | $4 \times 8$ | Four tokens, eight-dimensional embeddings |
+| $W^Q$ and $W^K$ | $8 \times 2$ | Project from $D$ to $E$ |
+| $Q$ and $K$ | $4 \times 2$ | One 2-D query/key vector per token |
+| $QK$ | $4 \times 4$ | Every query position compares with every key position |
+| $W^V$ | $8 \times 3$ | Project from $D$ to $F$ |
+| $V$ | $4 \times 3$ | One value vector per token |
+| $AV$ | $4 \times 3$ | One mixed value vector per query position |
+
+The quadratic tensor is $QK$ or $A$: it has $M^2 = 16$ entries here. If $M$ doubles, this intermediate grows by about 4x, before considering batch or heads.
 
 ### Batched and multi-headed attention
 
-Adding **batch dimension B** is mechanical: prepend B to every tensor. The Einsums gain a b index, and the matrix multiplications become batched matrix multiplications.
+Batching adds a rank $b$:
 
-**Multi-headed attention** (H heads) adds an H rank to the weight tensors:
+$$
+QK_{b,m,p} = Q_{b,p,e} K_{b,m,e}.
+$$
 
-```
-K_{b,h,m,e} = I_{b,m,d} × W^K_{d,h,e}
-Q_{b,h,m,e} = I_{b,m,d} × W^Q_{d,h,e}
-V_{b,h,m,f} = I_{b,m,d} × W^V_{d,h,f}
-QK_{b,h,m,p} = Q_{b,h,p,e} × K_{b,h,m,e}
-AV_{b,h,p,f} = A_{b,h,m,p} × V_{b,h,m,f}
-```
+Multi-headed attention adds a head rank $h$:
 
-After all heads compute their AV, a **concatenation and flatten** step merges the H×F dimensions into a single G=H×F dimension:
+$$
+QK_{b,h,m,p} = Q_{b,h,p,e} K_{b,h,m,e}.
+$$
 
-```
-C_{b,p,h×F} = AV_{b,h,p,f}     (reshape/flatten)
-Z_{b,p,d}   = C_{b,p,f} × W^Z_{g,d}
-```
+Each head produces $AV_{b,h,p,f}$. The head and value dimensions are then concatenated or flattened before the output projection. In the slide convention:
 
-![Multi-headed attention Einsums — full cascade with B, H, M, E, F, G ranks](../../assets/L03/L03-p127-multi-headed-attention.png)
+$$
+C_{b,p,hF+f} = AV_{b,h,p,f},
+$$
 
-### The full cascade in one view
+followed by an output projection such as:
 
-The full set of Einsums for one attention layer:
+$$
+Z_{b,p,d} = C_{b,p,g} W^Z_{g,d}.
+$$
 
-![Full cascade of Einsums for a complete self-attention computation](../../assets/L03/L03-p125-full-cascade.png)
+### Hardware implication
 
-Each step is a matrix multiplication at its core: projection steps are M×D times D×E; QK is M×E times M×E (transposed) = M×M; AV is M×M times M×F = M×F. The Transformer is, computationally, a cascade of matrix multiplications with a non-linear softmax inserted in the middle of the attention computation.
+Attention has two different cost profiles in one block. The projection layers are GEMM-like and scale roughly with $M D E$, $M D F$, and $M F G$. The attention score and value-mixing steps create and consume tensors shaped by $M^2$. This means sequence length can dominate memory capacity and bandwidth even if embedding dimensions are moderate.
 
-> **Why it matters:** Expressing Transformer self-attention as Einsums gives the accelerator designer the same formal handle on Transformer workloads that L04 gives on convolution workloads. It is the prerequisite for mapping Transformer layers onto hardware (covered in L05–L06), optimizing attention for sparse or approximate computation (L07–L10), and designing attention-specific accelerators (projects). It also makes clear that the QK product creates an O(M²) intermediate, which is the root cause of the quadratic cost of standard attention.
+The hardware question is therefore not just "can the accelerator multiply matrices?" It is also "does it materialize the $M \times M$ attention matrix, where is it stored, and can softmax be fused with the surrounding operations?"
+
+### Common misconception
+
+**Misconception:** Transformer attention is fundamentally different from the tensor computations used for CNNs.
+
+**Correction:** The data dependencies differ, but the lecture expresses attention as the same kind of Einsum cascade used for FC and CONV. The new challenge is the shape and lifetime of intermediates, especially the $M \times M$ attention matrix and softmax normalization.
 
 ---
 
-## Standalone Study Guide
+## 7. Key Equations and How to Read Them
 
-### What to master before moving on
+### Energy ratio
 
-- Explain the memory hierarchy as a sequence of capacity, bandwidth, and energy trade-offs.
-- Distinguish latency, throughput, utilization, energy efficiency, area efficiency, and accuracy impact.
-- Use Einsum notation as the course's common representation for FC, CONV, and attention.
-- Trace the full self-attention cascade from input embeddings through Q/K/V, score computation, softmax, value mixing, and output projection.
+$$
+\frac{E_{\text{DRAM read, 32b}}}{E_{\text{FP multiply, 32b}}} = \frac{640}{3.7} \approx 173.
+$$
+
+Read this as a source-stated motivation for minimizing DRAM access. It is not a universal technology constant.
+
+### Operational intensity
+
+$$
+\text{Operational intensity} = \frac{\text{operations}}{\text{bytes moved from the measured memory level}}.
+$$
+
+The denominator must be specified. DRAM operational intensity and SRAM operational intensity are different measurements.
+
+### Matrix multiplication Einsum
+
+$$
+Z_{m,n} = A_{m,k} B_{k,n}.
+$$
+
+Ranks $m$ and $n$ remain in the output. Rank $k$ is reduced. A mapping may run the loops in many legal orders.
+
+### Fully connected layer
+
+$$
+O_m = I_{c,h,w} F_{m,c,h,w}
+$$
+
+becomes:
+
+$$
+O_m = I_{chw} F_{m,chw}.
+$$
+
+Flattening turns the input dimensions into one reduction rank.
+
+### Convolution
+
+$$
+O_{n,m,p,q} = I_{n,c,U p + r,U q + s} F_{m,c,r,s}.
+$$
+
+The ranks $c,r,s$ are reduced. The output ranks $n,m,p,q$ remain. The input spatial coordinates are derived from output location and filter offset.
+
+### Attention score
+
+$$
+QK_{m,p} = Q_{p,e} K_{m,e}.
+$$
+
+The rank $e$ is reduced. The result compares every query position $p$ with every key position $m$.
+
+---
+
+## 8. Hardware Implications
+
+- **Energy:** DRAM traffic can dominate arithmetic energy; local reuse is a first-order design goal.
+- **Bandwidth:** A PE array cannot reach peak throughput unless the memory system supplies operands fast enough.
+- **Latency:** Batching may improve throughput while hurting latency; low-latency applications require small-batch evaluation.
+- **Area:** More local SRAM/RF can reduce traffic, but it consumes area and may increase access energy if arrays become too large.
+- **Utilization:** Model shapes such as depthwise convolution may reduce MACs but also reduce dense parallel work available to a fixed array.
+- **Interconnect:** Tensor contractions create producer-consumer relationships; where intermediates are stored determines network traffic.
+- **Correctness:** Einsum reductions require correct accumulation. Changing loop order is legal only if the reduction semantics are preserved.
+- **Programmability:** Flexible hardware must handle CNNs, FC layers, attention, varying precision, sparsity, and layer shapes.
+
+---
+
+## 9. Common Misconceptions
+
+### Misconception: Data movement is a secondary detail after compute.
+
+Compute and movement are inseparable in accelerator design. The lecture's energy table shows that a DRAM read can cost orders of magnitude more than a multiply.
+
+### Misconception: Fewer MACs always means lower latency.
+
+Fewer MACs help only if the hardware bottleneck is arithmetic and the remaining work maps well to the hardware. If the bottleneck is memory bandwidth, layout conversion, synchronization, or poor utilization, latency may not fall proportionally.
+
+### Misconception: Accuracy is an algorithm metric, not a hardware metric.
+
+Hardware choices can constrain precision, sparsity support, model size, and memory capacity. If those choices change the model or numerical behavior, accuracy must be part of the evaluation.
+
+### Misconception: Einsum tells the accelerator how to run the loops.
+
+Einsum tells what must be computed. Mapping chooses loop order, tiling, storage placement, and parallelism.
+
+### Misconception: im2col is always efficient because it turns convolution into GEMM.
+
+im2col exposes regular GEMM structure, but it may duplicate input data. Efficient implementations often avoid materializing the full expanded matrix.
+
+### Misconception: Attention only needs matrix multiplication acceleration.
+
+Matrix multiplication is central, but the $M \times M$ score/attention matrix, softmax, memory capacity, and fusion opportunities are equally important.
+
+---
+
+## 10. Takeaways
+
+- The lecture's Horowitz table gives a 32-bit DRAM read as 640 pJ and a 32-bit floating-point multiply as 3.7 pJ, motivating data-movement-aware design.
+- A memory hierarchy exists because no memory is simultaneously large, fast, dense, cheap, and low-energy.
+- Efficient model techniques reduce proxy costs such as weights and OPs, but hardware efficiency depends on mapping, locality, utilization, and memory traffic.
+- Fair accelerator evaluation needs accuracy, throughput, latency, energy, power, cost, flexibility, and scalability, with enough context to reproduce the meaning of each metric.
+- Einsum is the course's mathematical contract for tensor computations. It fixes output, input, and reduction ranks without fixing loop order.
+- FC layers become matrix-vector or matrix-matrix multiplication by flattening ranks and adding batch.
+- Convolution becomes matrix multiplication through Toeplitz/im2col conversion, but that conversion can repeat data.
+- Transformer self-attention is an Einsum cascade with an $M \times M$ attention intermediate.
+
+---
+
+## 11. Connections to Previous and Later Lectures
+
+- **L01:** The accelerator motivation introduced in L01 becomes quantitative here through memory energy and evaluation metrics.
+- **L02:** CNN layer shapes and efficient model designs reappear in L03 as examples where proxy metrics can mislead.
+- **L04:** The Einsum formalism becomes the foundation for describing more DNN operations and tensor transformations.
+- **L05-L06:** Mapping takes the Einsum as input and chooses loop order, partitioning, data placement, and parallelism.
+- **Sparsity lectures:** Sparsity changes the tensors inside the same Einsum framework, but adds metadata, irregularity, and load-balancing issues.
+- **Precision lectures:** Bit width changes arithmetic energy and storage traffic, but must be evaluated with accuracy and system metrics.
+- **Attention accelerators:** The attention equations here explain why later systems try to fuse or avoid materializing $QK$ and $A$.
+
+---
+
+## 12. Source Bridge
+
+### Paper Bridge: Computing's Energy Problem
+
+**Bibliographic identity:** Mark Horowitz, *Computing's Energy Problem (and what we can do about it)*, ISSCC 2014. Local PDF: `papers/L07_ComputingsEnergyProblem_Horowitz_ISSCC2014.pdf`.
+
+**Problem addressed:** Technology scaling no longer gives architects enough automatic energy improvement. The paper asks how computing systems can keep improving when power and energy are first-order constraints.
+
+**Core idea:** Energy efficiency requires both low-energy operations and **extreme locality**. The paper emphasizes that memory-system energy can dwarf efficient computation and that specialization can be useful when it reduces movement and overhead.
+
+**Relevance to L03:** This is the paper-level support behind the lecture's memory-vs-compute argument. It explains why L03 treats memory hierarchy, action counts, and operational intensity as architectural concepts rather than bookkeeping details.
+
+**Key claims used in this chapter:**
+
+- DRAM accesses are orders of magnitude more expensive than internal cache accesses or simple functional operations. Source anchor: Section 5, "Don't Forget the Memory Energy."
+- Figure 1.1.9 gives rough energy costs for operations and memory accesses; the lecture's energy table is the slide-level presentation of this idea.
+- High energy efficiency requires data locality so one expensive memory access can support many operations. Source anchor: Sections 5-6.
+
+**What students should remember:** The memory hierarchy is not a secondary detail. It is the reason DNN accelerators care so much about reuse, tiling, and dataflow.
+
+**Limitations and assumptions:** The numeric energy values are technology-specific. Use them as order-of-magnitude motivation, not universal constants.
+
+### Paper Bridge: AlexNet
+
+**Bibliographic identity:** Alex Krizhevsky, Ilya Sutskever, Geoffrey Hinton, *ImageNet Classification with Deep Convolutional Neural Networks*, NeurIPS 2012. Local PDF: `papers/L03_AlexNet_Krizhevsky_NeurIPS2012.pdf`.
+
+**Problem addressed:** Train a large supervised CNN on ImageNet-scale data, where both model capacity and computation exceed what earlier small-scale CNN examples required.
+
+**Core idea:** Combine large convolutional/fully connected layers, ReLU activations, GPU implementation, data augmentation, and dropout to make a deep CNN trainable at ImageNet scale.
+
+**Relevance to L03:** AlexNet is a useful bridge from "DNNs are tensor programs" to "DNNs are hardware workloads." It shows why convolution, fully connected layers, memory capacity, GPU parallelism, and regularization all matter in the same design story.
+
+**Key claims used in this chapter:**
+
+- The model has eight learned layers and about 60 million parameters. Source anchor: Abstract and Section 3.5.
+- The paper explicitly discusses GPU memory limits and training across two GTX 580 GPUs. Source anchor: Introduction and Section 3.2.
+- ReLU nonlinearity is used to speed training compared with saturating nonlinearities. Source anchor: Section 3.1.
+- Dropout is applied to reduce overfitting in fully connected layers. Source anchor: Section 4.
+
+**What students should remember:** AlexNet is not just "a CNN." It is an early example where dataset scale, model size, GPU memory, and implementation choices all shaped the architecture.
+
+**Limitations and assumptions:** AlexNet's exact architecture is historically important, but later models changed the accuracy/efficiency tradeoff. L03 uses it as workload history and hardware motivation, not as a recommended modern design.
+
+### Paper Bridge: Deep Residual Learning
+
+**Bibliographic identity:** Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun, *Deep Residual Learning for Image Recognition*, CVPR 2016. Local PDF: `papers/L03_ResNet_He_CVPR2016.pdf`.
+
+**Problem addressed:** Simply making plain networks deeper can make optimization worse; the paper calls this the **degradation problem**, which is not just overfitting.
+
+**Core idea:** Learn a residual function $F(x) = H(x) - x$ and add the input back through a shortcut, so the block computes $F(x) + x$. Identity shortcuts let very deep networks learn perturbations around the identity mapping.
+
+**Relevance to L03:** ResNet supports the chapter's warning that model complexity cannot be reduced to layer count or MAC count. The graph structure introduces elementwise additions and skip paths that affect memory traffic, buffering, and fusion.
+
+**Key claims used in this chapter:**
+
+- The degradation problem is introduced in the paper's Introduction. Source anchor: Section 1.
+- The residual formulation $F(x)+x$ and identity shortcut are defined in the residual-learning section. Source anchor: Section 3.
+- The paper reports 18/34-layer comparisons and deeper bottleneck ResNets. Source anchor: Tables 1-4.
+
+**What students should remember:** Skip connections are mathematically simple but architecturally visible: tensors must be preserved or reloaded for the later addition.
+
+**Limitations and assumptions:** L03 does not use ResNet's accuracy numbers as current benchmark claims. It uses the paper to explain why modern layer graphs contain non-chain data dependencies.
+
+### Paper Bridge: MobileNets
+
+**Bibliographic identity:** Andrew Howard et al., *MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications*, 2017. Local PDF: `papers/L03_MobileNet_Howard_2017.pdf`.
+
+**Problem addressed:** Mobile and embedded systems need CNNs with lower computation and model size while preserving useful accuracy.
+
+**Core idea:** Replace standard convolution with **depthwise separable convolution**: a depthwise spatial filter per input channel followed by a $1 \times 1$ pointwise convolution that mixes channels. The paper also introduces width and resolution multipliers.
+
+**Relevance to L03:** MobileNet is the paper behind the chapter's efficient-CNN warning: reducing MACs is useful, but hardware still has to evaluate where the work moved. In MobileNet, much of the computation shifts to dense $1 \times 1$ convolution, which has different reuse and bandwidth behavior.
+
+**Key claims used in this chapter:**
+
+- Standard convolution cost is $D_K^2 M N D_F^2$ in the paper's notation. Source anchor: Section 3.1.
+- Depthwise separable convolution splits filtering and channel mixing, reducing computation and model size. Source anchor: Section 3.1.
+- For $3 \times 3$ filters, the paper states an 8-9x computation reduction with modest accuracy loss. Source anchor: Section 3.1.
+- Table 2 notes that MobileNet spends most computation in $1 \times 1$ convolution. Source anchor: Table 2.
+
+**What students should remember:** A lower-MAC model can move the bottleneck. Depthwise layers may be cheap arithmetically, while pointwise layers can dominate compute and memory traffic.
+
+**Limitations and assumptions:** The paper's accuracy/latency tradeoffs are tied to its training setup and hardware context. This chapter uses the operator decomposition, not the exact benchmark ranking, as the durable concept.
+
+### Paper Bridge: EfficientNet
+
+**Bibliographic identity:** Mingxing Tan and Quoc Le, *EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks*, ICML 2019. Local PDF: `papers/L03_EfficientNet_Tan_ICML2019.pdf`.
+
+**Problem addressed:** Scaling a CNN by only depth, only width, or only input resolution gives diminishing returns and requires manual tuning.
+
+**Core idea:** Compound scaling jointly scales depth, width, and resolution using a coefficient $\phi$, with $d=\alpha^\phi$, $w=\beta^\phi$, and $r=\gamma^\phi$ under a resource constraint.
+
+**Relevance to L03:** EfficientNet sharpens the chapter's message that model-level efficiency is multi-dimensional. Depth, width, and resolution change arithmetic, activation sizes, memory footprint, and achievable hardware utilization differently.
+
+**Key claims used in this chapter:**
+
+- Single-dimension scaling improves accuracy but saturates for larger models. Source anchor: Section 3.2 and Figure 3.
+- Compound scaling balances depth, width, and resolution. Source anchor: Section 3.3 and Equation 3.
+- The paper compares scaled EfficientNets against other ConvNets in accuracy, parameters, FLOPs, and latency. Source anchor: Tables 2 and 4.
+
+**What students should remember:** "Efficient" is not one scalar. A model can trade depth, channel width, resolution, parameter count, activation size, and latency in different ways.
+
+**Limitations and assumptions:** EfficientNet's reported performance depends on architecture search, training recipe, and evaluation hardware. L03 uses it to explain scaling dimensions and proxy metrics, not to make a current leaderboard claim.
+
+### Source Bridge: Evaluation Tools and Benchmarks
+
+**Bibliographic identity:** The slides cite MLPerf, Accelergy, Timeloop, and AccelForge as examples of benchmark and modeling infrastructure.
+
+**Relevance to L03:** These sources support the claim that realistic accelerator evaluation must specify workload, mapping, precision, batch size, memory hierarchy, and action counts.
+
+**Key claims used in this chapter:** the list of required metric specifications is taken from the L03 PDF page 48; attention equations and rank names are taken from PDF pages 115-127.
+
+**Limitations:** This bridge is slide-anchored. The corresponding original papers are not all present as local PDFs in this repository.
+
+---
+
+## 13. Standalone Study Guide
+
+### What to master
+
+- Be able to explain the memory hierarchy without saying only "data movement is expensive."
+- Memorize the qualitative ordering: local register-like storage is small and cheap to access; DRAM is large and expensive to access.
+- Practice reading an Einsum by marking output ranks and reduction ranks.
+- Practice converting FC and convolution into matrix multiplication while noting what data gets repeated.
+- Trace self-attention shapes from $I$ through $QK$ and $AV$.
 
 ### Self-check questions
 
-1. Why can a small local buffer reduce energy even if it adds another memory level?
-2. Which metrics would change if a design saves energy by gating zero MACs but does not skip cycles?
-3. In attention, which tensors depend on the token sequence at runtime and which tensors are learned weights?
+1. Why does a small local buffer reduce energy only when there is reuse?
+2. Why is batch size required context for a latency claim?
+3. In $Z_{m,n} = A_{m,k}B_{k,n}$, which rank is reduced and which ranks remain?
+4. Why can im2col increase memory traffic even though it enables GEMM?
+5. In the slide convention for attention, what does $QK_{m,p}$ store?
+6. Why might depthwise convolution have fewer MACs but still be awkward for a dense accelerator?
+7. Which metric would expose a design that reports low chip power but uses large off-chip bandwidth?
 
 ### Exercises
 
-1. Take one Einsum in the lecture and mark each rank as free, reduction, or derived.
-2. For the attention cascade, write the producer-consumer relationship between consecutive intermediate tensors.
-3. Compare two designs using at least three metrics, and explain why a single scalar metric hides a trade-off.
-
-### Common traps
-
-- Equating low latency with high throughput. They are related but not interchangeable.
-- Treating all memory accesses as equal. The whole course depends on the difference between RF, SRAM, global buffer, and DRAM.
-- Thinking of Einsum as just notation; here it is the contract used by mapping and architecture tools.
+1. **Conceptual:** Explain why a ring oscillator can produce a misleading TOPS/W-style number.
+2. **Small calculation:** Using the Horowitz table, compute the energy ratio between a 32-bit SRAM read and an 8-bit multiply.
+3. **Einsum reading:** For $Y_{b,p,f} = A_{b,m,p} V_{b,m,f}$, identify all output and reduction ranks.
+4. **Convolution:** Build the Toeplitz matrix for input $[2,4,6,8]$ and a length-2 filter.
+5. **Attention shapes:** If $B=2$, $H=8$, $M=128$, $E=64$, what is the shape of $QK$?
+6. **Design tradeoff:** Compare an im2col-based convolution implementation with a direct convolution implementation using energy, bandwidth, and programmability.
+7. **Paper/source bridge:** Read the Accelergy slide and explain why action counts are needed before energy can be estimated.
 
 ---
 
-## Key Terms
+## 14. Key Terms
 
-| Term | Gloss |
-|---|---|
-| **Memory hierarchy** | A multi-level structure (RF → SRAM → DRAM) that trades capacity for speed/energy, placing small fast memories near compute. |
-| **Temporal locality** | Reusing the same data element multiple times; if it stays in a nearby buffer, expensive large-memory accesses are avoided. |
-| **Spatial locality** | Nearby data elements are accessed together; loading a tile/block amortizes per-access cost. |
-| **SRAM** | 6-transistor on-chip memory; forms the Global Buffer and Register File layers of a DNN accelerator. |
-| **DRAM** | 1-transistor off-chip memory; massive capacity but 640 pJ per 32-bit read — the dominant energy cost. |
-| **Horowitz energy table** | The reference table (ISSCC 2014) quantifying energy in pJ for arithmetic operations and memory accesses. |
-| **Throughput** | Inferences or MACs per second; must be reported at actual utilization on a real DNN, not peak. |
-| **Latency** | Time from input to output; requires specifying batch size (small batch → low latency). |
-| **PE utilization** | Fraction of PEs actually doing useful work; 100% = peak performance. |
-| **MLPerf** | Industry DNN benchmarking suite covering training and inference across CNN, RNN, and other models. |
-| **Einsum** | An expression of the form `Z_ij = A_ik × B_jk` that specifies tensor contraction without enforcing loop order. |
-| **Iteration space** | The set of all legal (i₁, i₂, …, iₙ) tuples formed by rank variable ranges; Einsum traverses this set. |
-| **Contracted rank** | A rank variable appearing on the RHS but not the LHS; it is summed (reduced) away. |
-| **Uncontracted rank** | A rank variable appearing on both sides; it is preserved in the output. |
-| **Partitioning** | Splitting one rank i into (i₁, i₀) via `i = i₁×I₀ + i₀`; adds a dimension. The formal basis of tiling. |
-| **Flattening** | The inverse of partitioning; collapsing a tuple rank variable `(i₁, i₀)` into a single index. |
-| **Toeplitz matrix / im2col** | The structural transformation that converts a convolution into a matrix multiply by building a matrix of shifted input patches. |
-| **Q, K, V** | Query, Key, Value — the three projections of the input sequence in self-attention. |
-| **Attention matrix (A)** | The M×M softmax-normalized product of Q and K; each row is a probability distribution over positions. |
-| **d_model (D)** | Global embedding dimension of the Transformer model. |
-| **dk (E)** | Projection dimension for Q and K in each attention head. |
-| **Multi-headed attention** | Running H independent attention heads in parallel by adding an H rank to the weight tensors. |
+### Memory hierarchy
+
+A layered storage system that places small, fast, low-energy memories near compute and large memories farther away. In accelerator design, it exists to exploit reuse and reduce expensive traffic.
+
+### Data movement
+
+The transfer of weights, activations, partial sums, or intermediates between memory levels or PEs. It affects energy, bandwidth, latency, and utilization.
+
+### Operational intensity
+
+The ratio $\text{operations}/\text{bytes moved}$ at a specified memory boundary. It measures how much computation is supported by each byte fetched.
+
+### Throughput
+
+Work completed per unit time, such as inferences/s or operations/s. It must be reported for a real workload and with utilization context.
+
+### Latency
+
+Elapsed time from input to output. Batch size is essential context because large batches can improve throughput while increasing per-input waiting time.
+
+### PE utilization
+
+The fraction of processing elements doing useful work. Peak TOPS assumes high utilization; real workloads may not achieve it.
+
+### Einsum
+
+A tensor expression that names output, input, and reduction ranks without specifying traversal order. It is the mathematical contract used by later mapping lectures.
+
+### Rank variable
+
+An index variable in an Einsum, such as $m$, $n$, or $k$.
+
+### Contracted rank
+
+A rank that appears on the right-hand side but not on the left-hand side. It is reduced, usually by summation.
+
+### Uncontracted rank
+
+A rank that appears in the output and is preserved.
+
+### Partitioning
+
+Splitting one rank into multiple ranks, such as $i = i_1 I_0 + i_0$. Later lectures use this idea for tiling.
+
+### Flattening
+
+Collapsing multiple ranks into one rank, such as $(c,h,w)$ into $chw$.
+
+### Toeplitz / im2col
+
+A transformation that represents convolution as matrix multiplication by collecting shifted input windows into a matrix. It can expose GEMM structure but may duplicate data.
+
+### Query, Key, Value
+
+The three projections in attention. Queries ask, keys match, and values provide the information that is mixed by attention weights.
+
+### Attention matrix
+
+The softmax-normalized score tensor $A_{m,p}$ in the slide convention. It scales with sequence length squared.
 
 ---
 
-## Takeaways
+## 15. Appendix - Slide-to-Section Map
 
-- **A 32-bit DRAM read costs 640 pJ; a 32-bit FP multiply costs 3.7 pJ** — a 170× gap. This single fact motivates the entire DNN accelerator field.
-- The memory hierarchy (RF → SRAM → DRAM → Flash) exists because **no memory technology can be simultaneously large, fast, dense, and cheap**; the hierarchy places fast small memories near compute to exploit data reuse.
-- **Processing order does not change the result** (MACs commute), but it profoundly changes how data moves through the hierarchy. Choosing the right order is the mapping problem.
-- **GOPS/W alone is not a valid metric.** A comprehensive evaluation requires accuracy, throughput (with utilization), latency (with batch size), energy (with DRAM bandwidth), hardware cost, flexibility, and scalability.
-- **Fewer MACs and weights do not guarantee lower energy or latency** — filter shape, batch size, and hardware mapping all determine actual performance.
-- **Every DNN computation is an Einsum:** a contracted-rank tensor expression that specifies *what* to compute without specifying *how* (iteration order). FC layers are matrix-vector or matrix-matrix multiplies; convolutions are matrix multiplies after Toeplitz conversion; Transformer self-attention is a cascade of matrix multiplies with softmax.
-- Transformer self-attention creates an **O(M²) attention matrix**, which is the fundamental bottleneck that attention-specific accelerators (FuseMax, FlashAttention) target.
-
----
-
-## Connections to Later Lectures
-
-- **Einsum formalism deepens in L04** — the notation is extended to cover more DNN layer types (pooling, normalization) and edge cases.
-- **Mapping (L05–L06)** — given an Einsum and an architecture, mapping decides the loop order, tiling (= partitioning of rank variables), and data placement. The Einsum is the "what"; the mapping is the "how."
-- **Sparsity (L07–L10)** — sparsity is a property of the tensors in an Einsum (many elements are zero). Sparse architectures exploit this to skip MACs and reduce data movement.
-- **Precision (L12)** — reducing the bit-width of rank variables or tensor elements; precision interacts with energy per MAC and storage cost.
-- **Attention accelerators** — FuseMax (mentioned in L01) fuses the QK and AV steps to avoid materializing the M×M attention matrix in DRAM, directly applying the energy-movement principle from Chapter 1.
-- The **energy-cost hierarchy** introduced in Chapter 1 is the recurring justification for essentially every optimization discussed in L05 through L13.
+| PDF pages | Slide label in PDF | Chapter section | Notes |
+|---|---|---|---|
+| 1 | L02-1 | Title | PDF labels this lecture deck as L02 internally, but repository file is L03 |
+| 2-19 | L02-2 to L02-19 | Memory is a first-class design constraint | Expanded with reuse example and hardware implications |
+| 20-39 | L02-20 to L02-39 | Efficient models are not automatically efficient hardware | Treated as a metrics bridge, not a full CNN-model survey |
+| 40-56 | L02-40 to L02-56 | Evaluation metrics | Expanded with operational-intensity example and tool bridge |
+| 57-72 | Extended Einsums 2/37 to 18/37 | Einsum contract | Expanded with vocabulary and worked reading example |
+| 73-90 | Kernel Computation 1 to 18 | Fully connected as matrix multiplication | Explains flattening and batch |
+| 91-109 | Kernel Computation 19 to 37 | Convolution as matrix multiplication | Explains Toeplitz/im2col and data repetition |
+| 110-127 | Attention Einsums 20/37 to 37/37 | Transformer self-attention as Einsums | Expanded with shape example and hardware implications |
 
 ---
 
-## Appendix — Slide-to-Section Map
+## 16. Source Notes
 
-| Physical Pages | Slide Label | Section |
-|---|---|---|
-| 1 | L02-1 | Title — Memory and Evaluation Metrics |
-| 2–19 | L02-2 … L02-19 | Ch.1 — Memory Hierarchy |
-| 20–39 | L02-20 … L02-39 | (Efficient CNN models — background for L02) |
-| 40–56 | L02-40 … L02-56 | Ch.2 — Evaluation Metrics |
-| 57 | Einsums 2/37 | Ch.3 — Extended Einsums (title) |
-| 58–59 | Einsums 3/37 … 4/37 | Ch.3 — Einsum ODE, example |
-| 60–61 | Einsums 5/37 … 6/37 | Ch.3 — Matrix multiply traversal animations |
-| 62–69 | Einsums 7/37 … 13/37 | Ch.3 — Tensor references, patterns, rank variables, partitioning, flattening |
-| 69–72 | Einsums 14/37 … 18/37 | Ch.3 — MM variants, convolution Einsum, rank shapes |
-| 73 | Kernel 1 | Ch.4 — Kernel Computation (title) |
-| 74–85 | Kernel 2 … 13 | Ch.4 — FC computation, Einsum, flatten, matrix-vector |
-| 85–90 | Kernel 13 … 18 | Ch.4 — FC with batch → matrix-matrix multiply |
-| 91–109 | Kernel 19 … 37 | Ch.4 — CONV Einsum, Toeplitz, conv→matrix multiply |
-| 110 | Attention 20/37 | Ch.5 — Attention Einsums (title) |
-| 111–114 | Attention 21/37 … 24/37 | Ch.5 — Diagram conventions, encoder structure, basic self-attention |
-| 115–120 | Attention 25/37 … 30/37 | Ch.5 — I, Q, K, softmax, V, Z steps |
-| 121–123 | Attention 31/37 … 33/37 | Ch.5 — Rank names, input and weight tensors |
-| 124–125 | Attention 34/37 … 35/37 | Ch.5 — Intermediate tensors, full cascade |
-| 126 | Attention 36/37 | Ch.5 — Batched attention |
-| 127 | Attention 37/37 | Ch.5 — Multi-headed attention |
+- Direct slide-stated claims include the Horowitz energy table values, the memory hierarchy tradeoffs, the key metric list, the metric specification checklist, the MobileNets MAC ratio, the FC/CONV conversion dimensions, and the attention rank/equation cascade.
+- Paper/source-derived claims are limited to what the slides cite: Horowitz ISSCC 2014, MobileNets 2017, MLPerf, Accelergy, and related evaluation tools.
+- Standard background explanations include operational intensity, matrix multiplication reading, batch-vs-latency interpretation, and the explanation of query/key/value roles.
+- Teaching interpretations include the small energy-reuse example, the operational-intensity toy calculation, and the attention-shape example.
+- No slide figures or paper figures are embedded in this rewritten chapter. Existing `assets/L03/*.png` files remain in the repository but are not used here.
+
+---
+
+## 17. Uncertainty Notes
+
+- The public PDF labels many early pages as L02 even though the repository treats this as L03. This chapter cites PDF pages to avoid ambiguity.
+- The live lecture may have emphasized some efficient-CNN examples differently. This chapter uses pages 20-39 mainly to support the proxy-metric warning.
+- The Horowitz energy values are technology-specific; use them as order-of-magnitude guidance, not as universal constants.
+- The attention softmax axis follows the slide convention, where $p$ is the query/output position and normalization sums over $m$.
