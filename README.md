@@ -1,5 +1,7 @@
 # MIT 6.5930/1 — Hardware Architectures for Deep Learning · Bilingual Lecture Walkthroughs
 
+[![CI](https://github.com/Haouo/MIT-6.5903-1/actions/workflows/ci.yml/badge.svg)](https://github.com/Haouo/MIT-6.5903-1/actions/workflows/ci.yml)
+
 In-depth, **concept-organized walkthroughs** of the MIT 6.5930/1 lecture slides
 (Joel Emer & Vivienne Sze, Spring 2026), written in **English** and **Traditional Chinese (繁體中文)**.
 
@@ -115,6 +117,21 @@ Output defaults to 150 DPI; override with the `DPI` env var (e.g. `DPI=200 scrip
    technical terms in parentheses on first use), same structure and figures.
 5. **Update the index table** above (mark EN/ZH done).
 6. **Fidelity pass:** confirm every stat/claim in the prose traces to a real slide.
+7. **Run the checks locally:** `scripts/check_walkthroughs.sh` (same checks CI runs).
+
+---
+
+## Continuous Integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and pull request to `main`:
+
+- **ShellCheck** lints `scripts/*.sh`.
+- **`scripts/check_walkthroughs.sh`** validates the walkthroughs (no PDF tooling needed, so it runs anywhere):
+  1. **EN/ZH parity** — every English file has a Chinese twin with the same name.
+  2. **Image links** — every embedded `../../assets/…` path resolves.
+  3. **Template sections** — each file contains all required sections (language-appropriate headings).
+
+Run it locally before committing: `scripts/check_walkthroughs.sh`.
 
 ---
 

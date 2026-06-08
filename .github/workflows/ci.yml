@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate walkthroughs & scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: ShellCheck scripts
+        run: shellcheck scripts/*.sh
+
+      - name: Validate walkthroughs (parity, image links, sections)
+        run: scripts/check_walkthroughs.sh
