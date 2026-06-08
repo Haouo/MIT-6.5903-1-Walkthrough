@@ -293,6 +293,36 @@ CiMLoop 的函式庫包含光子元件的模型（波導、微環諧振器、光
 
 ---
 
+## 獨立學習指南（Standalone Study Guide）
+
+### 進入下一講前必須掌握
+
+- 說明 compute-in-memory 如何透過把 MAC 移向 storage 來攻擊資料搬移成本。
+- 描述 analog crossbar 的 multiply-accumulate 原語，以及 ADC/DAC overhead 為什麼重要。
+- 說出 Titanium Law：隨 resolution 與 array size 增加，ADC cost 可能主導 analog CiM 能耗。
+- 將 RAELLA 理解為 arithmetic reform，而不只是更好的 memory cell。
+- 把 CiMLoop 視為跨 devices、circuits、architectures、mappings、workloads 的 modeling bridge。
+
+### 自我檢核問題
+
+1. Crossbar 中哪個部分執行乘法？哪個部分執行累加？
+2. 為什麼把 ADC 納入後，analog CiM 可能失去能耗優勢？
+3. 比較 CiM designs 時，為什麼需要 apples-to-apples modeling framework？
+
+### 練習
+
+1. 追蹤一次 vector-matrix multiply 如何通過 resistive crossbar，包含 input delivery 與 output conversion。
+2. 列出三種 device-level nonidealities，並說明每一種如何表現為 model accuracy loss。
+3. 依 precision、density、programmability 比較 SRAM CiM、DRAM CiM、ReRAM CiM 與 photonic computing。
+
+### 常見誤區
+
+- 把 analog CiM 當成「免費 MAC」。Data conversion、input drivers 與 peripheral circuits 往往才是主成本。
+- 用 peak TOPS 比較論文，卻沒有 normalize precision、accuracy、technology node 與 array size。
+- 忘記 advanced technologies 只是移動限制，而不是消除限制。
+
+---
+
 ## 關鍵詞彙（Key Terms）
 
 | 詞彙 | 說明 |

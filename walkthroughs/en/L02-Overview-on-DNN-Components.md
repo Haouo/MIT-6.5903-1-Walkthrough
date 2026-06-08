@@ -271,6 +271,35 @@ is directly analogous to generic matrix multiplication $C_{m,n} = A_{m,k} \times
 
 ---
 
+## Standalone Study Guide
+
+### What to master before moving on
+
+- Translate FC and CONV layers into Einsum notation and loop nests.
+- Identify the tensor ranks in a convolution: batch, channel, filter, output spatial, input spatial, and kernel spatial ranks.
+- Explain how stride, padding, filter size, and channel count change both work and data movement.
+- Use arithmetic intensity and Roofline reasoning to compare layers, not just full networks.
+
+### Self-check questions
+
+1. Why is a fully-connected layer a special case of convolution?
+2. In a 2-D convolution, which ranks are free output ranks and which ranks are reduction ranks?
+3. Why can a layer with fewer MACs still be harder to accelerate efficiently?
+
+### Exercises
+
+1. Write the Einsum for a batched matrix-vector FC layer and then for the same layer with batch processed as matrix-matrix multiply.
+2. For a simple CONV layer, list every tensor touched by the innermost loop and state which values are reused across adjacent output pixels.
+3. Choose one CNN architecture from the slides and explain which design choices reduce spatial size, channels, or filters.
+
+### Common traps
+
+- Treating "CONV becomes matrix multiplication" as meaning the data movement is automatically the same. The lowering can duplicate or reorder data.
+- Forgetting that `C` is a reduction rank while `M` is an output rank.
+- Ignoring batch size when comparing FC and CONV efficiency.
+
+---
+
 ## Key Terms
 
 | Term | Gloss |

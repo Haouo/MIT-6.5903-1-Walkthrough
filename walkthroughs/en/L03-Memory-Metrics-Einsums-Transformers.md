@@ -422,6 +422,35 @@ Each step is a matrix multiplication at its core: projection steps are M×D time
 
 ---
 
+## Standalone Study Guide
+
+### What to master before moving on
+
+- Explain the memory hierarchy as a sequence of capacity, bandwidth, and energy trade-offs.
+- Distinguish latency, throughput, utilization, energy efficiency, area efficiency, and accuracy impact.
+- Use Einsum notation as the course's common representation for FC, CONV, and attention.
+- Trace the full self-attention cascade from input embeddings through Q/K/V, score computation, softmax, value mixing, and output projection.
+
+### Self-check questions
+
+1. Why can a small local buffer reduce energy even if it adds another memory level?
+2. Which metrics would change if a design saves energy by gating zero MACs but does not skip cycles?
+3. In attention, which tensors depend on the token sequence at runtime and which tensors are learned weights?
+
+### Exercises
+
+1. Take one Einsum in the lecture and mark each rank as free, reduction, or derived.
+2. For the attention cascade, write the producer-consumer relationship between consecutive intermediate tensors.
+3. Compare two designs using at least three metrics, and explain why a single scalar metric hides a trade-off.
+
+### Common traps
+
+- Equating low latency with high throughput. They are related but not interchangeable.
+- Treating all memory accesses as equal. The whole course depends on the difference between RF, SRAM, global buffer, and DRAM.
+- Thinking of Einsum as just notation; here it is the contract used by mapping and architecture tools.
+
+---
+
 ## Key Terms
 
 | Term | Gloss |

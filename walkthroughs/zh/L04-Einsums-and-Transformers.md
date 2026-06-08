@@ -343,6 +343,35 @@ $$Z_{b,p,d} = C_{b,p,f} \times WZ_{g,d}$$
 
 ---
 
+## 獨立學習指南（Standalone Study Guide）
+
+### 進入下一講前必須掌握
+
+- 將一般迴圈巢轉成 Einsum，並能由 Einsum 還原迴圈巢。
+- 把切分（partitioning）與展平（flattening）理解為秩轉換，而不是改變數學張量本身。
+- 推導 FC 與 CONV 如何表示成 matrix-vector 或 matrix-matrix operation。
+- 說明 attention 具有 token 間二次互動，而 convolution 具有固定局部 receptive field。
+
+### 自我檢核問題
+
+1. Einsum 右側重複出現的索引代表什麼？
+2. 卷積轉成矩陣乘法時，Toeplitz-like 結構從哪裡來？
+3. Softmax 為什麼是 attention pipeline 中主要的非線性操作？它位在 Einsum 串接的哪個位置？
+
+### 練習
+
+1. 為 `Z[m,n] = A[m,k] * B[k,n]` 寫出迴圈巢，並標出自由秩與 reduction rank。
+2. 將 2-D 座標 `(r,s)` 展平成單一秩，並展示如何還原 `r` 與 `s`。
+3. 畫出單一 attention head 的資料相依鏈，包含 Q、K、V、attention weights 與 output projection。
+
+### 常見誤區
+
+- 以為 flattening 在硬體上免費。它會改變位址產生方式，也可能改變 locality。
+- 在 FC、CONV、attention 範例間切換時混淆 rank names。
+- 把 attention 當成「只是 matmul」；動態 score matrix 與 softmax 會改變資料流限制。
+
+---
+
 ## 關鍵詞彙（Key Terms）
 
 | 詞彙 | 說明 |

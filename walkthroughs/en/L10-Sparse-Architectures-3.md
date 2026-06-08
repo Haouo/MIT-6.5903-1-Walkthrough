@@ -5,6 +5,8 @@
 > **Lecture date:** March 9, 2026 · **Slides:** 66 · **Source:** [`Lecture/L10-Sparse_Architectures-3.pdf`](../../Lecture/L10-Sparse_Architectures-3.pdf)
 >
 > *This is a conceptual walkthrough that reconstructs the lecture's narrative from the slides. It is organized by idea, not slide-by-slide. Each section cites the slide range it draws from so you can follow along with the original deck.*
+>
+> **Traceability note:** The PDF's internal slide labels are `L06-*` even though this repository treats the deck as Lecture 10. References below keep the PDF labels for exact source matching; file and asset names use `L10-*`.
 
 ---
 
@@ -277,6 +279,36 @@ The 7.5× peak arises at very high joint sparsity where both the IS and OS passe
 
 ---
 
+## Standalone Study Guide
+
+### What to master before moving on
+
+- Reconstruct the sequence from gating to single-sparse skipping to joint-sparse skipping.
+- Explain sparse-weight-only and sparse-input-only dataflows before attempting the joint case.
+- Describe SCNN's Cartesian-product multiplier and scatter backend.
+- Describe ISOSceles's IS-OS split, temporary tensor `T`, and swizzled traversal.
+- Read reported speedup and energy results as consequences of density, utilization, and routing overhead.
+
+### Self-check questions
+
+1. Why does Eyeriss gating reduce PE power without reducing latency?
+2. What makes the joint sparse case harder than sparse weights only?
+3. What hardware cost does SCNN pay that ISOSceles tries to avoid?
+
+### Exercises
+
+1. Starting from a dense 1-D convolution loop, rewrite it for sparse weights, sparse inputs, and both sparse.
+2. For a small set of non-zero inputs and weights, enumerate the SCNN Cartesian products and their output coordinates.
+3. Sketch the two ISOSceles passes and mark where `T` is written, swizzled, and read.
+
+### Common traps
+
+- Thinking "both sparse" simply means applying the two single-sparse tricks independently. It requires coordinate matching or scatter.
+- Reading peak speedup as average speedup. Sparsity varies across layers and networks.
+- Ignoring the cost of routing partial sums to irregular output positions.
+
+---
+
 ## Key Terms
 
 | Term | Gloss |
@@ -328,7 +360,7 @@ The 7.5× peak arises at very high joint sparsity where both the IS and OS passe
 
 ## Appendix — Slide-to-Section Map
 
-| Slides | Section |
+| PDF Slide Label | Section |
 |---|---|
 | L06-1 | Title — Sparse Architectures Part 3, March 9, 2026 |
 | L06-2 … L06-4 | Ch.1 — CONV layer review; 1-D output-stationary convolution loop nest |

@@ -343,6 +343,35 @@ $$Z_{b,p,d} = C_{b,p,f} \times WZ_{g,d}$$
 
 ---
 
+## Standalone Study Guide
+
+### What to master before moving on
+
+- Convert an ordinary loop nest into an Einsum and back again.
+- Explain partitioning and flattening as rank transformations, not changes to the mathematical tensor.
+- Derive how FC and CONV can be expressed as matrix-vector or matrix-matrix operations.
+- Explain why attention has quadratic token interaction while convolution has fixed local receptive fields.
+
+### Self-check questions
+
+1. What does a repeated index on the right-hand side mean in an Einsum?
+2. When convolution is converted to matrix multiplication, where does the Toeplitz-like structure come from?
+3. Why is softmax the main non-linear operation in the attention pipeline, and where does it sit relative to the Einsums?
+
+### Exercises
+
+1. Write a loop nest for `Z[m,n] = A[m,k] * B[k,n]`, then identify the corresponding free and reduction ranks.
+2. Flatten a 2-D coordinate `(r,s)` into a single rank and show how to recover `r` and `s`.
+3. Draw the data dependency chain for a single attention head, including Q, K, V, attention weights, and output projection.
+
+### Common traps
+
+- Assuming flattening is free in hardware. It changes address generation and can change locality.
+- Losing track of rank names when moving between FC, CONV, and attention examples.
+- Treating attention as "just matmul"; the dynamic score matrix and softmax change the dataflow constraints.
+
+---
+
 ## Key Terms
 
 | Term | Gloss |

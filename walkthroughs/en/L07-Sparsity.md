@@ -238,6 +238,35 @@ These are exactly the topics of L08–L10.
 
 ---
 
+## Standalone Study Guide
+
+### What to master before moving on
+
+- Separate activation sparsity, weight sparsity, and structural sparsity.
+- Explain why ReLU creates natural activation zeros while pruning creates model-weight zeros.
+- Describe the pruning pipeline: train, score, prune, fine-tune, and evaluate.
+- Explain the accuracy-hardware trade-off between unstructured and structured pruning.
+
+### Self-check questions
+
+1. Why does activation sparsity vary with input data while weight sparsity can be fixed after training?
+2. What is the difference between pruning a value, a channel, and a block?
+3. Why might the most accurate sparse model be hard for hardware to accelerate?
+
+### Exercises
+
+1. Sketch a pruning experiment for one CNN layer: choose a scoring rule, sparsity target, and fine-tuning step.
+2. Compare magnitude pruning and energy-aware pruning in terms of what objective each optimizes.
+3. Given a target sparsity, propose whether unstructured, block, channel, or N:M pruning is most hardware-friendly.
+
+### Common traps
+
+- Assuming sparsity automatically saves time. It saves time only when the hardware can skip work.
+- Comparing sparsity percentages without specifying granularity.
+- Forgetting that pruning can change accuracy and therefore belongs to model-hardware co-design.
+
+---
+
 ## Key Terms
 
 | Term | Gloss |

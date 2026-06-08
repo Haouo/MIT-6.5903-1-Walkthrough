@@ -271,6 +271,35 @@ $$O_{n,m} = I_{n,chw} \times F_{m,chw}$$
 
 ---
 
+## 獨立學習指南（Standalone Study Guide）
+
+### 進入下一講前必須掌握
+
+- 將 FC 與 CONV 層轉成 Einsum 記法與迴圈巢。
+- 辨認卷積中的張量秩：batch、channel、filter、輸出空間、輸入空間與 kernel 空間秩。
+- 說明 stride、padding、filter size 與 channel count 如何改變工作量與資料搬移。
+- 用 arithmetic intensity 與 Roofline 推理比較「層」，而不只比較整個網路。
+
+### 自我檢核問題
+
+1. 為什麼全連接層可以視為卷積的一個特例？
+2. 在 2-D convolution 中，哪些秩是自由輸出秩，哪些秩是 reduction rank？
+3. 為什麼 MAC 較少的層仍可能更難有效加速？
+
+### 練習
+
+1. 寫出 batched matrix-vector FC 層的 Einsum，再寫出同一層以 batch 形成 matrix-matrix multiply 時的 Einsum。
+2. 對一個簡單 CONV 層，列出最內層迴圈會碰到的每個張量，並說明哪些值會在相鄰輸出像素間重用。
+3. 從投影片選一個 CNN 架構，說明它透過哪些設計降低 spatial size、channels 或 filters。
+
+### 常見誤區
+
+- 以為「CONV 可化成矩陣乘法」就代表資料搬移自動相同。lowering 可能複製或重排資料。
+- 忘記 `C` 是 reduction rank，而 `M` 是輸出秩。
+- 比較 FC 與 CONV 效率時忽略 batch size。
+
+---
+
 ## 關鍵詞彙（Key Terms）
 
 | 詞彙 | 說明 |

@@ -23,9 +23,10 @@ figures extracted and embedded inline.
 - Every section cites its source slide range (e.g. `Slides: L01-26 … L01-35`) so you can follow along
   with the original PDF in [`Lecture/`](Lecture/).
 
-Each walkthrough follows a fixed 8-part template: **TL;DR → Learning Objectives → conceptual chapters
-(with embedded figures and a "Why it matters" note each) → Key Terms glossary → Takeaways →
-Connections to later lectures → Slide-to-Section map.**
+Each walkthrough follows a fixed standalone-study template: **TL;DR → Learning Objectives → conceptual chapters
+(with embedded figures and a "Why it matters" note each) → Standalone Study Guide (mastery checklist,
+self-check questions, exercises, common traps) → Key Terms glossary → Takeaways → Connections to later
+lectures → Slide-to-Section map.**
 
 ---
 
@@ -47,7 +48,7 @@ Connections to later lectures → Slide-to-Section map.**
 | L12 | Precision | [EN](walkthroughs/en/L12-Precision.md) | [ZH](walkthroughs/zh/L12-Precision.md) | ✅ Done |
 | L13 | Calculating (Data) Motion | [EN](walkthroughs/en/L13-Calculating-Motion.md) | [ZH](walkthroughs/zh/L13-Calculating-Motion.md) | ✅ Done |
 
-> All 13 lectures are complete in both languages. L01 was the pilot that established the style; L02–L13 follow the same pipeline and 8-section template.
+> All 13 lectures are complete in both languages. L01 was the pilot that established the style; L02–L13 follow the same pipeline and standalone-study template.
 >
 > **Note on L13:** the deck is titled "Calculating Data Motion" — a formal lecture on computing exact data-movement counts for a mapping using the Integer Set Library (ISL), with 1-D convolution as the running example. It is *not* about optical-flow/motion estimation.
 

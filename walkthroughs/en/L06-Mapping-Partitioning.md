@@ -293,6 +293,35 @@ L05 introduced the loop-nest representation of DNN computation and described **d
 
 ---
 
+## Standalone Study Guide
+
+### What to master before moving on
+
+- Treat partitioning as a rank split: `i -> (i1, i0)`, with the original coordinate recoverable from the pair.
+- Distinguish temporal partitioning for reuse from spatial partitioning for parallelism.
+- Explain why partitioning a reduction rank introduces a reduction across partitions.
+- Compare tensor, head, and data parallelism for attention by which rank is split.
+
+### Self-check questions
+
+1. What new loops appear when `k` and `m` are split in a matrix multiply?
+2. Why is splitting a free rank usually easier than splitting a reduction rank?
+3. In delayed reduction, what value is made explicit on the left-hand side before the final reduction?
+
+### Exercises
+
+1. Partition `Z[m] = A[k,m] * B[k]` by splitting both `k` and `m`, then write the new loop nest.
+2. Pick one attention partitioning strategy and list which tensors are replicated, sharded, or reduced.
+3. For a four-PE system, propose a partition of matrix multiply and identify the communication step.
+
+### Common traps
+
+- Treating tiling and parallelization as the same thing. They can use the same split but different loop annotations.
+- Forgetting that partitioning changes the rank structure seen by the mapper.
+- Assuming all parallel strategies are communication-free. Reduction-rank splits require communication.
+
+---
+
 ## Key Terms
 
 | Term | Gloss |

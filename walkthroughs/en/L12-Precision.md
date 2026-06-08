@@ -309,6 +309,36 @@ The extreme case of reduced precision:
 
 ---
 
+## Standalone Study Guide
+
+### What to master before moving on
+
+- Quantify why reducing bit-width saves arithmetic energy, arithmetic area, and memory traffic.
+- Distinguish integer, fixed-point, floating-point, dynamic fixed-point, MX, log-domain, and codebook formats.
+- Explain why accumulators often need more bits than activations and weights.
+- Compare post-training quantization, quantization-aware training, and mixed precision.
+- Describe spatial and temporal precision-scalable MACs.
+
+### Self-check questions
+
+1. Why does multiplier cost scale more steeply with bit-width than adder cost?
+2. Why is bfloat16 better suited than FP16 for some training workloads?
+3. Why can learned codebook quantization reduce storage without reducing MAC precision?
+
+### Exercises
+
+1. For a layer with RSC = 1024, compute the minimum extra accumulator bits needed to avoid lossless overflow.
+2. Compare INT8, FP16, bfloat16, and MXFP8 for training versus inference. State the range/precision trade-off.
+3. Choose a binary or ternary method from the summary table and explain what hardware it simplifies and what accuracy cost it pays.
+
+### Common traps
+
+- Saying "8-bit" without specifying integer, fixed-point, floating-point, scale granularity, and accumulator precision.
+- Treating quantization as only a hardware issue. Low-bit accuracy usually depends on the training or fine-tuning recipe.
+- Forgetting first and last layers, gradients, and accumulators often need special precision treatment.
+
+---
+
 ## Key Terms
 
 | Term | Gloss |
@@ -370,7 +400,7 @@ The extreme case of reduced precision:
 | Slides | Section |
 |---|---|
 | L12-1 | Title |
-| L12-2 … L12-7 | Ch.1 — Why Reduce Precision? Energy and Area Case |
+| L12-2 … L12-9 | Ch.1 — Why Reduce Precision? Energy and Area Case; determining operand and accumulator bit-width |
 | L12-10 … L12-15 | Ch.2 — Quantization: The Core Idea |
 | L12-16 … L12-36 | Ch.3 — A Taxonomy of Number Formats |
 | L12-23 … L12-30 | Ch.4 — Non-Uniform Quantization |

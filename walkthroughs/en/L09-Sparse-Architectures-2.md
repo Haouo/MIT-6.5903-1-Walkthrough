@@ -103,6 +103,27 @@ Swapping rank order gives **CSC** (Compressed Sparse Column): `Tensor<U,C>(W,H)`
 
 Merging two ranks into a single flat coordinate produces **COO** (Coordinate List): `Tensor<C2>(H,W)`, which stores (H,W) coordinate tuples directly. More merge options and their notation (`U2`, `R2`, `H2`) allow other trade-offs.
 
+### Merging, splitting, and specifying sparsity patterns
+
+Slides 52–71 make an important move: sparsity is no longer just "some coordinates are missing." It becomes a **formal specification over ranks** in the fibertree. That is what lets the same notation describe unstructured pruning, channel pruning, sub-kernel sparsity, Nvidia-style 2:4 sparsity, and hierarchical structured sparsity.
+
+**Merging ranks** combines two or more tensor ranks into one storage rank. For example, `Tensor<C2>(H,W)` stores a flat list of `(h,w)` coordinate tuples, while `Tensor<U2>(H,W)` stores a flattened dense array whose original coordinates can be recovered with division and modulo arithmetic. Merging is useful when the hardware wants to traverse a multi-dimensional object as one linear fiber.
+
+**Splitting fibers** goes the other direction: a single rank is divided into multiple ranks. There are two distinct choices:
+
+- **Coordinate-space splitting:** split by coordinate ranges, e.g., coordinates `0–7`, `8–15`, and so on. This preserves geometric locality and makes the meaning of each tile easy to reason about, but sparse tiles may have very different occupancies.
+- **Position-space splitting:** split by stored positions, i.e., by non-zero count. This balances work across PEs because each split gets about the same number of stored elements, but the coordinate ranges become irregular.
+
+The specification examples show how pruning patterns can be written as transformations on the rank order:
+
+- **Channel-based sparsity:** keep the `C` rank explicit and apply an unstructured rule to channel fibers, yielding a pattern like `C unstructured -> R -> S`.
+- **Sub-kernel sparsity:** flatten the spatial filter ranks `R` and `S` into `RS`, then apply a structured rule such as "2 of 4" within that flattened rank.
+- **Fully unstructured sparsity:** flatten `C`, `R`, and `S` into one `CRS` rank, then apply an unstructured rule over the full filter volume.
+- **2:4 sparsity:** reorder and partition the channel rank into outer and inner ranks (`C1`, `C0`), then apply the 2-of-4 rule at the innermost rank where hardware can decode it cheaply.
+- **Hierarchical Structured Sparsity (HSS):** partition a rank into several nested ranks and apply different `G:H` rules at different levels, such as a coarse 3:4 rule outside a fine 2:4 rule.
+
+> **Why it matters:** These rank transformations are the bridge between model pruning rules and hardware format design. A pruning method is hardware-friendly only if its rank order, flattening, and split points make the remaining non-zero coordinates cheap to encode, traverse, and distribute across PEs.
+
 ### Hardware for concordant traversal
 
 The figure below shows the hardware structure for a 2-D concordant traversal (e.g., scanning a CSR tensor in row-major order). Two stages of position generators (Pgen) and coordinate/payload extractors operate in a pipeline: the H-rank stage produces the fiber boundaries, and the W-rank stage sequences through the coordinates within each fiber.
@@ -285,6 +306,36 @@ The pipeline delivers a measured **7.5× latency speedup** over a dense baseline
 The IS frontend exploits input sparsity (skips zero activations); the OS backend exploits output sparsity (skips zero partial sums); and the intersection in Step 1 further reduces work when both operands are sparse. The rank-swizzle overhead is a one-time reindexing of T, which is small compared to the total compute saved.
 
 > **Why it matters:** ISOSceles shows that a single accelerator can exploit both input and weight sparsity through a carefully designed two-stage pipeline, achieving better PE utilization than either pure IS or pure OS alone. The rank-swizzle is a software/hardware co-design trick that converts a discordant access pattern into a concordant one — a concrete example of the Format and Binding layers of the TeAAL pyramid working together.
+
+---
+
+## Standalone Study Guide
+
+### What to master before moving on
+
+- Use the fibertree abstraction to describe dense and sparse tensors uniformly.
+- Explain `getPayload()` versus `getNext()` and why concordant traversal is cheap.
+- Distinguish coordinate projection from fiber intersection.
+- Trace sparse-weight, sparse-input, and two-sparse convolution loop nests.
+- Compare Cambricon-X, CNVLUTIN, SCNN, and ISOSceles by which sparsity they exploit and what hardware they add.
+
+### Self-check questions
+
+1. Why does CSR make row-major traversal cheap but column-major traversal expensive?
+2. When both operands are sparse, why is projection alone insufficient?
+3. What problem does rank swizzling solve in ISOSceles?
+
+### Exercises
+
+1. Draw a fibertree for a 3x3 matrix with three non-zero values, then label coordinates, positions, fibers, and payloads.
+2. For an output-stationary sparse-weight convolution, compute the projected input coordinate `w` for several `(q,s)` pairs.
+3. Given two sorted sparse fibers, manually perform their intersection and list the emitted matched payloads.
+
+### Common traps
+
+- Confusing coordinate with position. Coordinate is the mathematical index; position is where the item sits in storage.
+- Assuming compressed storage implies cheap random access. Many compressed formats are cheap only for concordant traversal.
+- Treating SCNN and ISOSceles as equivalent because both exploit two-sparse work. Their output-routing strategies are different.
 
 ---
 

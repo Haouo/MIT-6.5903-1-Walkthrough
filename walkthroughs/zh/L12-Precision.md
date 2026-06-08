@@ -307,6 +307,36 @@ Camus（JETCAS 2019）對 19 種精度可擴展乘加器設計的基準測試發
 
 ---
 
+## 獨立學習指南（Standalone Study Guide）
+
+### 進入下一講前必須掌握
+
+- 量化說明降低 bit-width 為何同時節省 arithmetic energy、arithmetic area 與 memory traffic。
+- 區分 integer、fixed-point、floating-point、dynamic fixed-point、MX、log-domain 與 codebook formats。
+- 說明 accumulator 為什麼通常需要比 activations 與 weights 更多 bits。
+- 比較 post-training quantization、quantization-aware training 與 mixed precision。
+- 描述 spatial 與 temporal precision-scalable MACs。
+
+### 自我檢核問題
+
+1. 為什麼 multiplier cost 隨 bit-width 增長比 adder cost 更陡？
+2. 為什麼 bfloat16 在某些 training workloads 中比 FP16 更適合？
+3. 為什麼 learned codebook quantization 能降低 storage，卻不一定降低 MAC precision？
+
+### 練習
+
+1. 對 RSC = 1024 的 layer，計算避免 lossless overflow 所需的最小 accumulator extra bits。
+2. 比較 INT8、FP16、bfloat16、MXFP8 在 training 與 inference 中的 range/precision trade-off。
+3. 從 summary table 選一種 binary 或 ternary method，說明它簡化了什麼硬體，以及付出什麼 accuracy cost。
+
+### 常見誤區
+
+- 只說「8-bit」卻不指定 integer、fixed-point、floating-point、scale granularity 與 accumulator precision。
+- 把 quantization 當成純硬體問題。低 bit accuracy 通常取決於 training 或 fine-tuning recipe。
+- 忘記 first/last layers、gradients、accumulators 往往需要特殊 precision 處理。
+
+---
+
 ## 關鍵詞彙（Key Terms）
 
 | 詞彙 | 說明 |
@@ -368,7 +398,7 @@ Camus（JETCAS 2019）對 19 種精度可擴展乘加器設計的基準測試發
 | 投影片 | 章節 |
 |---|---|
 | L12-1 | 標題 |
-| L12-2 … L12-7 | 第一章 — 為什麼要降低精度？能耗與面積的論證 |
+| L12-2 … L12-9 | 第一章 — 為什麼要降低精度？能耗與面積的論證；決定運算元與累加器位元寬 |
 | L12-10 … L12-15 | 第二章 — 量化：核心概念 |
 | L12-16 … L12-36 | 第三章 — 數字格式的分類法 |
 | L12-23 … L12-30 | 第四章 — 非均勻量化 |

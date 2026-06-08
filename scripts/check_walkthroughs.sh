@@ -5,7 +5,7 @@
 # Runs three structural checks (no PDF tooling needed, so it works in CI):
 #   1. EN/ZH filename parity — every English walkthrough has a Chinese twin.
 #   2. Image links resolve — every embedded ../../assets/... path exists.
-#   3. Template sections — each file contains the required 8 sections
+#   3. Template sections — each file contains the required standalone-study sections
 #      (language-appropriate headings for en/ vs zh/).
 #
 # Exits non-zero on the first category that fails, after listing all problems.
@@ -20,8 +20,8 @@ ZH_DIR="walkthroughs/zh"
 fail=0
 
 # Required section markers per language (substrings, matched anywhere in file).
-EN_SECTIONS=("TL;DR" "Learning Objectives" "Key Terms" "Takeaways" "Connections" "Appendix")
-ZH_SECTIONS=("TL;DR" "學習目標" "關鍵詞彙" "重點回顧" "連結" "附錄")
+EN_SECTIONS=("TL;DR" "Learning Objectives" "Standalone Study Guide" "Key Terms" "Takeaways" "Connections" "Appendix")
+ZH_SECTIONS=("TL;DR" "學習目標" "獨立學習指南" "關鍵詞彙" "重點回顧" "連結" "附錄")
 
 echo "==> 1. EN/ZH filename parity"
 en_list="$(find "$EN_DIR" -maxdepth 1 -name '*.md' -printf '%f\n' | sort)"

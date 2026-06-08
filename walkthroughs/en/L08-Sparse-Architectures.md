@@ -362,6 +362,36 @@ Every design in this lecture — Eyeriss, SCNN, ExTensor, HighLight, Swiftiles �
 
 ---
 
+## Standalone Study Guide
+
+### What to master before moving on
+
+- Distinguish gating, skipping, and compressed-format representation as separate sparse acceleration features.
+- Compare uncompressed, bitmask, coordinate-payload, and run-length formats by compression and access efficiency.
+- Explain why structured sparsity lowers metadata and decoder cost.
+- Explain the sparse tiling problem: occupancy varies, so fixed-shape dense-style tiles waste buffer capacity.
+- Describe Tailors and Swiftiles as an overbooking strategy for sparse tiles.
+
+### Self-check questions
+
+1. Which sparse acceleration feature saves energy but not cycles?
+2. Why can a compressed format be larger than uncompressed storage at high density?
+3. What is the difference between a bumped and unbumped tile in Tailors?
+
+### Exercises
+
+1. For a length-16 vector with four non-zeros, encode it using bitmask and coordinate-payload formats. Count metadata bits separately from payload bits.
+2. Pick a 2:4 sparse group and calculate how many bits are needed to encode the non-zero positions.
+3. Explain why choosing a tile size from maximum occupancy can destroy reuse for the average tile.
+
+### Common traps
+
+- Treating compression ratio as the only format metric. Access efficiency can dominate runtime.
+- Assuming structured sparsity is always better. It may reduce model flexibility or accuracy.
+- Ignoring workload balance: skipping can make different PEs finish at different times.
+
+---
+
 ## Key Terms
 
 | Term | Gloss |
@@ -425,5 +455,5 @@ Every design in this lecture — Eyeriss, SCNN, ExTensor, HighLight, Swiftiles �
 | L08-9 … L08-22 | Ch.2 — Gating vs. Skipping (intersection, single/dual-sided, accounting) |
 | L08-23 … L08-48 | Ch.3 — Representation Formats (U, B, CP, RLE; compression/access efficiency; Eyeriss RLE) |
 | L08-49 … L08-66 | Ch.4 — Structured Sparsity & HSS (G:H, 2:4 STC, HSS, HighLight) |
-| L08-67 … L08-85 | Ch.5 — Tiling Sparse Tensors (uniform occupancy/shape dilemma, overbooking, Tailors, Swiftiles) |
+| L08-67 … L08-93 | Ch.5 — Tiling Sparse Tensors (uniform occupancy/shape dilemma, overbooking, Tailors, Swiftiles, ExTensor evaluation) |
 | L08-94 … L08-96 | Ch.6 — Dataflow interplay, summary, recommended reading |

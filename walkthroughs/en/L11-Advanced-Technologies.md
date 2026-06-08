@@ -292,6 +292,36 @@ CiMLoop's library includes models for photonic components (waveguides, microring
 
 ---
 
+## Standalone Study Guide
+
+### What to master before moving on
+
+- Explain why compute-in-memory attacks data movement by moving MACs toward storage.
+- Describe the analog crossbar multiply-accumulate primitive and why ADC/DAC overhead matters.
+- State the Titanium Law: ADC cost can dominate analog CiM energy as resolution and array size grow.
+- Explain RAELLA as arithmetic reform, not simply a better memory cell.
+- Use CiMLoop as the modeling bridge across devices, circuits, architectures, mappings, and workloads.
+
+### Self-check questions
+
+1. What part of a crossbar performs multiplication, and what part performs accumulation?
+2. Why can analog CiM lose its energy advantage after accounting for ADCs?
+3. Why is an apples-to-apples modeling framework necessary when comparing CiM designs?
+
+### Exercises
+
+1. Trace one vector-matrix multiply through a resistive crossbar, including input delivery and output conversion.
+2. List three device-level nonidealities and explain how each can appear as model accuracy loss.
+3. Compare SRAM CiM, DRAM CiM, ReRAM CiM, and photonic computing along precision, density, and programmability axes.
+
+### Common traps
+
+- Treating analog CiM as "free MACs." Data conversion, input drivers, and peripheral circuits are often dominant.
+- Comparing papers by peak TOPS without normalizing precision, accuracy, technology node, and array size.
+- Forgetting that advanced technologies move constraints rather than eliminating them.
+
+---
+
 ## Key Terms
 
 | Term | Gloss |

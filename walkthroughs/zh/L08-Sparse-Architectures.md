@@ -362,6 +362,36 @@ N 階（N-rank）HSS 模式在 N 個嵌套粒度上分別應用 G:H 規則。例
 
 ---
 
+## 獨立學習指南（Standalone Study Guide）
+
+### 進入下一講前必須掌握
+
+- 區分 gating、skipping 與 compressed-format representation 這三種 sparse acceleration features。
+- 依 compression efficiency 與 access efficiency 比較 uncompressed、bitmask、coordinate-payload、run-length formats。
+- 說明 structured sparsity 為何降低 metadata 與 decoder cost。
+- 說明 sparse tiling 問題：occupancy 會變動，因此固定形狀的 dense-style tile 會浪費 buffer。
+- 描述 Tailors 與 Swiftiles 如何以 overbooking 處理 sparse tiles。
+
+### 自我檢核問題
+
+1. 哪一種 sparse acceleration feature 省能但不省 cycles？
+2. 為什麼高密度時 compressed format 可能比 uncompressed storage 更大？
+3. Tailors 中 bumped tile 與 unbumped tile 的差異是什麼？
+
+### 練習
+
+1. 對一個長度 16、含 4 個非零值的向量，分別用 bitmask 與 coordinate-payload 編碼，並分開計算 metadata bits 與 payload bits。
+2. 選一組 2:4 sparse group，計算需要多少 bits 來編碼非零位置。
+3. 說明為什麼用 maximum occupancy 選 tile size 會破壞 average tile 的重用。
+
+### 常見誤區
+
+- 把 compression ratio 當成唯一格式指標。Access efficiency 可能主導 runtime。
+- 假設 structured sparsity 永遠較好。它可能降低模型彈性或準確度。
+- 忽略 workload balance：skipping 可能讓不同 PE 在不同時間完成。
+
+---
+
 ## 關鍵詞彙（Key Terms）
 
 | 詞彙 | 說明 |
@@ -425,5 +455,5 @@ N 階（N-rank）HSS 模式在 N 個嵌套粒度上分別應用 G:H 規則。例
 | L08-9 … L08-22 | 第二章 — 閘控 vs. 跳過（交集、單邊/雙邊、量化） |
 | L08-23 … L08-48 | 第三章 — 表示格式（U、B、CP、RLE；壓縮/存取效率；Eyeriss RLE） |
 | L08-49 … L08-66 | 第四章 — 結構化稀疏性與 HSS（G:H、2:4 STC、HSS、HighLight） |
-| L08-67 … L08-85 | 第五章 — 稀疏張量分塊（均勻佔用率/形狀困境、超額預訂、Tailors、Swiftiles） |
+| L08-67 … L08-93 | 第五章 — 稀疏張量分塊（均勻佔用率/形狀困境、超額預訂、Tailors、Swiftiles、ExTensor 評估） |
 | L08-94 … L08-96 | 第六章 — 資料流交互作用、總結、推薦閱讀 |

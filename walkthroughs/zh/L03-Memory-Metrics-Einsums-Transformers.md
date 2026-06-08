@@ -422,6 +422,35 @@ Z_{b,p,d}   = C_{b,p,f} × W^Z_{g,d}
 
 ---
 
+## 獨立學習指南（Standalone Study Guide）
+
+### 進入下一講前必須掌握
+
+- 將記憶體階層解釋為容量、頻寬與能耗之間的取捨。
+- 區分延遲、吞吐量、利用率、能效、面積效率與準確度影響。
+- 把 Einsum 作為 FC、CONV 與 attention 的共同表示法。
+- 追蹤 self-attention 從 input embeddings 到 Q/K/V、score、softmax、value mixing 與 output projection 的完整串接。
+
+### 自我檢核問題
+
+1. 為什麼小型 local buffer 即使增加一層記憶體，仍可能降低能耗？
+2. 如果一個設計透過 gating 零值 MAC 省能但不跳過週期，哪些評估指標會變、哪些不會？
+3. 在 attention 中，哪些張量取決於執行時的 token sequence，哪些是學到的權重？
+
+### 練習
+
+1. 選本講一個 Einsum，標出每個秩是自由秩、reduction rank，還是由其他秩推導而來。
+2. 對 attention cascade，寫出每個中間張量和下一個中間張量的 producer-consumer 關係。
+3. 用至少三個指標比較兩個設計，說明單一 scalar metric 會隱藏什麼取捨。
+
+### 常見誤區
+
+- 把低延遲等同於高吞吐量。兩者相關，但不能互換。
+- 把所有記憶體存取視為同等成本。本課程的核心正是 RF、SRAM、global buffer、DRAM 的差異。
+- 把 Einsum 當成單純記法；在這門課中，它是 mapping 與 architecture tools 的共同契約。
+
+---
+
 ## 關鍵詞彙（Key Terms）
 
 | 詞彙 | 說明 |

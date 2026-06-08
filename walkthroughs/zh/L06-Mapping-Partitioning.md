@@ -293,6 +293,35 @@ L05 引入了 DNN 運算的迴圈巢狀表示，並將**資料流（dataflow）*
 
 ---
 
+## 獨立學習指南（Standalone Study Guide）
+
+### 進入下一講前必須掌握
+
+- 把切分視為秩分裂：`i -> (i1, i0)`，原始座標可由這對索引還原。
+- 區分用於重用的時間切分與用於平行化的空間切分。
+- 說明為什麼切分 reduction rank 會在 partition 之間引入 reduction。
+- 依「切分哪個秩」比較 attention 的 tensor、head 與 data parallelism。
+
+### 自我檢核問題
+
+1. 在矩陣乘法中切分 `k` 與 `m` 後，會新增哪些迴圈？
+2. 為什麼切分自由秩通常比切分 reduction rank 容易？
+3. 在 delayed reduction 中，最後 reduction 前先把哪個值顯式放到左側？
+
+### 練習
+
+1. 將 `Z[m] = A[k,m] * B[k]` 同時切分 `k` 與 `m`，再寫出新的迴圈巢。
+2. 選一種 attention partitioning 策略，列出哪些張量被複製、切片或 reduction。
+3. 對四個 PE 的系統提出一種矩陣乘法切分方式，並指出需要溝通的步驟。
+
+### 常見誤區
+
+- 把 tiling 和 parallelization 當成同一件事。兩者可使用相同 split，但 loop annotation 不同。
+- 忘記切分會改變 mapper 看到的 rank structure。
+- 假設所有平行策略都不需要溝通。切分 reduction rank 一定會帶來 communication。
+
+---
+
 ## 關鍵詞彙（Key Terms）
 
 | 詞彙 | 說明 |

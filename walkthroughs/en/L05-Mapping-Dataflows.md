@@ -275,6 +275,35 @@ Storage nodes express the **dataplacement** aspect of mapping. Together, the loo
 
 ---
 
+## Standalone Study Guide
+
+### What to master before moving on
+
+- Define mapping as loop order, loop bounds, partitioning, parallelism, and memory placement.
+- Compare output-stationary, weight-stationary, and input-stationary dataflows by what value is kept close to the MAC.
+- Explain why dataflow changes memory traffic without changing the mathematical operation.
+- Read LoopTree notation as a compact description of loop nesting and data placement.
+
+### Self-check questions
+
+1. For a 1-D convolution, which tensor is reused most directly in OS, WS, and IS?
+2. Why can two dataflows perform exactly the same MACs but consume different energy?
+3. What information does LoopTree add beyond the Einsum itself?
+
+### Exercises
+
+1. Rewrite the 1-D convolution loop nest in OS, WS, and IS order. Mark where each tensor is read and written.
+2. For one dataflow, choose a small buffer size and explain which tensor would spill first.
+3. Use the energy hierarchy to argue which dataflow is preferable for a layer with very large filters but small output maps.
+
+### Common traps
+
+- Calling a dataflow "better" without specifying layer shape and memory sizes.
+- Confusing stationarity with immobility. Stationary data is reused locally for a useful interval, not permanently fixed.
+- Ignoring partial sums: output traffic can dominate if accumulation is poorly placed.
+
+---
+
 ## Key Terms
 
 | Term | Gloss |

@@ -103,6 +103,27 @@
 
 合併兩個秩為一個平坦座標，得到 **COO（Coordinate List）**：`Tensor<C2>(H,W)`，直接儲存 (H,W) 座標元組。更多合併選項與記法（`U2`、`R2`、`H2`）允許其他權衡。
 
+### 秩的合併、分裂，以及稀疏樣式規格
+
+第 52–71 張投影片做了一個重要轉換：稀疏性不再只是「某些座標消失」，而是變成纖維樹中**作用在秩上的形式規格**。因此，同一套記法可以描述非結構化剪枝、通道剪枝、子核心稀疏性、Nvidia 式 2:4 稀疏性，以及階層化結構稀疏性。
+
+**合併秩（merging ranks）**會把兩個以上的張量秩合成一個儲存秩。例如 `Tensor<C2>(H,W)` 以一條平坦列表儲存 `(h,w)` 座標元組；`Tensor<U2>(H,W)` 則是一個平坦稠密陣列，原本的座標可用除法與取模還原。當硬體希望把多維物件當成一條線性纖維遍歷時，合併秩很有用。
+
+**分裂纖維（splitting fibers）**則反過來，把單一秩分成多個秩。這裡有兩個不同選擇：
+
+- **座標空間分裂（coordinate-space splitting）：** 依座標範圍切開，例如 `0–7`、`8–15`。它保留幾何局部性，分塊意義清楚，但不同稀疏分塊的非零數量可能差很多。
+- **位置空間分裂（position-space splitting）：** 依儲存位置切開，也就是依非零數量切。它能讓各 PE 分到近似相同的工作量，但座標範圍會變得不規則。
+
+投影片中的規格範例把剪枝樣式寫成秩順序上的轉換：
+
+- **通道式稀疏性：** 保留 `C` 秩，並對通道纖維套用非結構化規則，形成類似 `C unstructured -> R -> S` 的樣式。
+- **子核心稀疏性：** 將空間濾波器秩 `R` 與 `S` 展平成 `RS`，再在這個展平秩內套用「4 個中保留 2 個」這類結構化規則。
+- **完全非結構化稀疏性：** 將 `C`、`R`、`S` 全部展平成單一 `CRS` 秩，再對整個濾波器體積套用非結構化規則。
+- **2:4 稀疏性：** 重新排序並切分通道秩，形成外層 `C1` 與內層 `C0`，再在最內層套用 2-of-4 規則，讓硬體能以低成本解碼。
+- **階層化結構稀疏性（HSS）：** 將一個秩切成多個巢狀秩，並在不同層級套用不同 `G:H` 規則，例如外層 3:4、內層 2:4。
+
+> **為什麼重要：** 這些秩轉換是模型剪枝規則與硬體格式設計之間的橋樑。剪枝方法是否硬體友善，取決於它的秩順序、展平方式與切分點是否讓剩餘非零座標容易編碼、遍歷並分派到 PE。
+
 ### 協調遍歷的硬體
 
 下圖展示二維協調遍歷（例如以行主序掃描 CSR 張量）的硬體結構。兩個位置產生器（Pgen，Position Generator）與座標／承載值提取器構成流水線（pipeline）：H 秩階段產生纖維邊界，W 秩階段在每條纖維內依序掃描座標。
@@ -285,6 +306,36 @@ ISOSceles 流水線有三個階段：
 IS 前端利用輸入稀疏性（跳過零激活值）；OS 後端利用輸出稀疏性（跳過零部分和）；步驟一中的求交在兩個運算元都稀疏時進一步縮減工作量。秩交換的開銷是對 T 一次性的重新索引，相較於節省的總計算量而言微乎其微。
 
 > **為什麼重要：** ISOSceles 展示了單一加速器可以透過精心設計的兩階段流水線同時利用輸入與權重稀疏性，實現比純 IS 或純 OS 更佳的 PE 利用率。秩交換是一個軟硬體協同設計（co-design）的技巧，把非協調存取模式轉換為協調存取——這是 TeAAL 金字塔中 Format 層與 Binding 層協同運作的具體範例。
+
+---
+
+## 獨立學習指南（Standalone Study Guide）
+
+### 進入下一講前必須掌握
+
+- 用 fibertree abstraction 統一描述 dense 與 sparse tensors。
+- 說明 `getPayload()` 與 `getNext()` 的差異，以及為什麼 concordant traversal 便宜。
+- 區分 coordinate projection 與 fiber intersection。
+- 追蹤 sparse-weight、sparse-input 與 two-sparse convolution loop nests。
+- 依「利用哪種稀疏性」與「新增什麼硬體」比較 Cambricon-X、CNVLUTIN、SCNN、ISOSceles。
+
+### 自我檢核問題
+
+1. 為什麼 CSR 讓 row-major traversal 便宜，卻讓 column-major traversal 昂貴？
+2. 兩個運算元都稀疏時，為什麼只有 projection 不夠？
+3. ISOSceles 中 rank swizzling 解決了什麼問題？
+
+### 練習
+
+1. 為一個 3x3、只有三個非零值的矩陣畫出 fibertree，並標出 coordinates、positions、fibers、payloads。
+2. 對 output-stationary sparse-weight convolution，為數個 `(q,s)` pair 計算 projected input coordinate `w`。
+3. 給定兩條排序過的 sparse fibers，手動執行 intersection，列出輸出的 matched payloads。
+
+### 常見誤區
+
+- 混淆 coordinate 與 position。Coordinate 是數學索引；position 是資料在儲存結構中的位置。
+- 假設 compressed storage 代表 cheap random access。許多壓縮格式只有 concordant traversal 便宜。
+- 因為 SCNN 與 ISOSceles 都利用 two-sparse work，就把兩者當成等價；它們的 output routing strategy 不同。
 
 ---
 

@@ -272,6 +272,36 @@ ws_schedule = isl.Map('{ IterationSpace[q, s] -> Timestamp[t1, t0] : t1 = s and 
 
 ---
 
+## 獨立學習指南（Standalone Study Guide）
+
+### 進入下一講前必須掌握
+
+- 將迴圈巢表示成具有具名 dimensions 與 constraints 的 ISL iteration space。
+- 建立 projection maps，從 compute iterations 對應到它們碰到的 data elements。
+- 用 timestamp map 將 traversal order 轉成 schedule。
+- 把 fill、read、update、shrink events 視為 set/map operations 來計算。
+- 在保持 computation 不變的情況下，透過改變 timestamp map 比較兩種 dataflows。
+
+### 自我檢核問題
+
+1. Iteration-space point 與 data-space point 有什麼差異？
+2. 問「某個時間碰到哪些資料」時，為什麼 inverse timestamp map 有用？
+3. 比較 OS 與 WS schedules 時，改變的是 Einsum、projection maps，還是 timestamp map？
+
+### 練習
+
+1. 為一個小型 1-D convolution 寫出 iteration-space constraints，並列舉所有 valid points。
+2. 建立 input projection map `w = q + s`，並套用到每個 iteration-space point。
+3. 對一個很小的 tiled timestamp range，手動列出哪些 weights 與 inputs 必須 fill 到 L1，哪些可以 retained。
+
+### 常見誤區
+
+- 把 ISL 當成只是語法。核心概念是對 iteration、time、data spaces 做 set algebra。
+- 混淆 data movement counts 與 MAC counts。它們透過 projection maps 相關，但不是同一件事。
+- 比較 mappings 時不小心改變 computation。Computation 應保持固定；改變的是 schedule。
+
+---
+
 ## 關鍵詞彙（Key Terms）
 
 | 詞彙 | 說明 |

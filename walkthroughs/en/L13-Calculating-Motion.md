@@ -272,6 +272,36 @@ This closing comparison makes the payoff of the whole lecture concrete: **the fo
 
 ---
 
+## Standalone Study Guide
+
+### What to master before moving on
+
+- Express a loop nest as an ISL iteration space with named dimensions and constraints.
+- Build projection maps from compute iterations to the data elements they touch.
+- Use a timestamp map to turn a traversal order into a schedule.
+- Compute fill, read, update, and shrink events as set/map operations.
+- Compare two dataflows by changing the timestamp map while keeping the computation fixed.
+
+### Self-check questions
+
+1. What is the difference between an iteration-space point and a data-space point?
+2. Why is the inverse timestamp map useful when asking which data is touched at a time?
+3. What changes when comparing OS and WS schedules: the Einsum, the projection maps, or the timestamp map?
+
+### Exercises
+
+1. Write the iteration-space constraints for a 1-D convolution with small `Q` and `S`, then enumerate all valid points.
+2. Construct the input projection map `w = q + s` and apply it to each iteration-space point.
+3. For a tiny tiled timestamp range, manually list which weights and inputs must be filled into L1 and which can be retained.
+
+### Common traps
+
+- Treating ISL as just syntax. The core idea is set algebra over iteration, time, and data spaces.
+- Confusing data movement counts with MAC counts. They are related through projection maps but not identical.
+- Changing the computation when the goal is only to compare mappings. The computation stays fixed; the schedule changes.
+
+---
+
 ## Key Terms
 
 | Term | Gloss |

@@ -207,6 +207,34 @@ The mechanics, kept short since they are not the intellectual content: the cours
 
 ---
 
+## Standalone Study Guide
+
+### What to master before moving on
+
+- Explain why DNN hardware is limited by data movement, not just arithmetic throughput.
+- Use the TeAAL Pyramid to separate model, representation, mapping, architecture, and technology decisions.
+- Read a Roofline plot as a statement about whether an accelerator is compute-bound or bandwidth-bound.
+- Explain why there is no single "best accelerator": workload shape, data attributes, and mapping choices change the optimum.
+
+### Self-check questions
+
+1. If DRAM energy is much larger than MAC energy, why can increasing MAC count still reduce total energy in some accelerators?
+2. Where do sparsity and precision sit in the pyramid, and why are they treated as co-design decisions rather than purely architectural tricks?
+3. What information would you need before deciding whether a workload should be mapped to a GPU, TPU-like systolic array, or custom sparse accelerator?
+
+### Exercises
+
+1. Pick one real DNN workload and classify its likely bottleneck: compute, memory bandwidth, on-chip storage, or control irregularity. Justify the classification with the vocabulary from this lecture.
+2. Draw a one-page pyramid for FuseMax: mark which part is algorithmic, which part is mapping, and which part is architecture.
+
+### Common traps
+
+- Treating TOPS as a complete performance metric. It ignores memory traffic, utilization, and workload shape.
+- Confusing "specialized" with "inflexible." The lecture's point is that specialization must be scoped to stable workload structure.
+- Reading the pyramid as a waterfall. In practice, decisions feed back across layers.
+
+---
+
 ## Key Terms
 
 | Term | Gloss |
