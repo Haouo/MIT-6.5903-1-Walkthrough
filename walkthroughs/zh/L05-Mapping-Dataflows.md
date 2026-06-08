@@ -1,157 +1,281 @@
-# L05 — 映射：資料流（Mapping: Dataflows）
+# L05 - 映射：資料流（Mapping: Dataflows）
 
-> **課程：** 6.5930/1 — 深度學習硬體架構（Hardware Architectures for Deep Learning）
+> **課程：** 6.5930/1 - 深度學習硬體架構（Hardware Architectures for Deep Learning）
 > **講師：** Joel Emer 與 Vivienne Sze（MIT EECS）
-> **講授日期：** 2026 年 2 月 17 日 · **投影片：** 111 頁 · **來源：** [`Lecture/L05-Mapping.pdf`](../../Lecture/L05-Mapping.pdf)
+> **講授日期：** 2026 年 2 月 17 日。**投影片：** 111 頁。**來源：** [`Lecture/L05-Mapping.pdf`](../../Lecture/L05-Mapping.pdf)
 >
-> *本文是以「概念」為單位重建講課脈絡的導讀（walkthrough），依主題而非逐頁編排。每一節都標註其對應的投影片範圍，方便你對照原始投影片閱讀。*
+> 本章依據公開投影片重建缺少的課堂講解。它不是投影片摘要，而是給無法觀看 lecture video 的讀者使用的自學章節。文中以投影片頁碼作為來源錨點，方便對照原始順序。
 
 ---
 
 ## 一句話總結（TL;DR）
 
-當架構（PE 陣列與記憶體階層）固定之後，**映射（mapping）** 是一組決定「如何把 DNN 運算排程到硬體上」的選擇。在所有映射決策——切分（partitioning）、資料流（dataflow）、資料放置（data placement）、運算放置（compute placement）與切分大小（partition sizing）——之中，本講深入探討的是**資料流**（亦即迴圈順序）。改變迴圈順序，就改變了「哪種資料型態駐留在低成本本地儲存中」，進而決定了能夠避免多少昂貴的 DRAM 存取。本講引入三種 CNN 的典型資料流——**輸出駐留（Output Stationary, OS）**、**權重駐留（Weight Stationary, WS）** 與**輸入駐留（Input Stationary, IS）**——並以 AlexNet 的能耗比較說明，沒有任何一種資料流在所有情境下都是最優的。最後，本講引入 **LoopTree** 作為在單一符號體系中同時表達資料流（迴圈順序）與資料放置（儲存計畫）的形式語言。
+映射（mapping）是一組選擇，用來把抽象的張量運算變成某個加速器上實際可執行的排程。L03 與 L04 告訴我們「要算什麼」：也就是 Einsum。L05 問的是另一件事：迴圈應該用什麼順序跑、資料應該住在哪一層記憶體、哪一種運算元應該停在 MAC 單元附近。
+
+本講的核心概念是**駐留性（stationarity）**。一個稠密卷積會反覆碰到三種資料：權重（weights）、輸入激活值（input activations）、部分和（partial sums）。資料流（dataflow）選擇其中一種資料留在低成本本地儲存中，讓其他資料流過。**輸出駐留（Output Stationary, OS）**讓部分和留在本地。**權重駐留（Weight Stationary, WS）**讓權重留在本地。**輸入駐留（Input Stationary, IS）**讓輸入激活值留在本地。三者計算同一個數學結果，但造成的記憶體流量、互連壓力、緩衝區需求與 PE 利用率都不同。
+
+投影片的量化動機很直接：在本講使用的 Eyeriss 65 nm 能耗表中，一次 DRAM 存取約是一個 MAC 的 200 倍能耗，而暫存器檔（register file, RF）存取約是 1 倍。因此，好的資料流主要不是為了減少算術，而是把昂貴的資料搬移換成本地再利用。
 
 ---
 
-## 本講要解決的問題（What This Lecture Solves）
+## 本講要解決的問題
 
-**問題本身。** L01–L04 建立了 DNN「算什麼」——對高維張量（tensor）做 Einsum——以及「資料搬移有多昂貴」。但 Einsum 只規定了哪些乘加（MAC）必須發生；它完全沒有說這些運算以什麼*順序*執行，也沒有說每個運算元（operand）在硬體輾過它們的過程中*駐留在哪裡*。同一個卷積，可以在同一個 PE 陣列上以極多種方式排程，而這些排程算出來的結果位元完全相同，能耗卻可以相差一個數量級以上。本講要回答的問題是：**給定一個固定的加速器，我們要如何選擇一個排程（即「映射 mapping」），讓昂貴的 DRAM 盡量安靜？**
+Einsum 是數學合約。對一維卷積而言：
 
-**為什麼重要。** 算術幾乎免費，但供應它的運算元並不免費。一次 MAC 花 1 單位能量，但從 DRAM 取一個運算元要花約 200 單位 `[Eyeriss, ISCA 2016, Table IV]`。所以決定一個加速器能耗的，*不是*它做了多少 MAC——那個數字由演算法固定——而是每一筆資料被在記憶體階層裡上下拖動了多少次。資料流（dataflow，亦即迴圈順序）正是控制這項流量最直接的槓桿。掌握它，你就能直接從迴圈巢狀讀出加速器的能耗行為；忽略它，其他所有最佳化都是建在流沙上。
-
----
-
-## 先備知識與心智模型（Prerequisites & Mental Model）
-
-**你應該已經熟悉：**
-
-- **Einsum 符號（L03–L04）：** 把 `O[q] = I[q+s] × F[s]` 讀成「對每個合法的 `q`，在 `s` 上求和」。資料流是疊加在 Einsum *之上*的*遍歷順序選擇*——Einsum 固定算術，映射固定排程。同一個 Einsum 容許多種映射。
-- **CONV 層的各維度（rank，L02）：** M（輸出通道）、C（輸入通道）、P、Q（輸出空間）、R、S（濾波器空間），加上 N（批次）。下面每一個迴圈巢狀都是這些索引維度的某種排列。
-- **記憶體能耗階層（L01）：** RF ≪ 全域緩衝區 ≪ DRAM。本講替這個階層補上數字（1× / 2× / 6× / 200×），並示範如何利用它。
-
-**整講都要握在手裡的心智模型。** 想像一個 MAC 單元位於漏斗底端。它上方有三個水庫——暫存器檔（register file，便宜、極小）、全域緩衝區（global buffer，中等）、DRAM（巨大、貴得殘酷）。每次 MAC 都有三個運算元流過漏斗：一個**權重（weight）**、一個**輸入激活值（input activation）**、一個**部分和（partial sum）**。*資料流就是決定「這三個運算元中哪一個能靜靜坐在便宜水庫裡、讓另外兩個流過」的策略。*你把哪個運算元釘住，資料流就以它命名：釘住輸出部分和 →**輸出駐留（Output Stationary）**；釘住權重 →**權重駐留（Weight Stationary）**；釘住輸入 →**輸入駐留（Input Stationary）**。本講其餘幾乎所有內容，都是這個單一選擇的後果。
-
----
-
-## 學習目標（Learning Objectives）
-
-讀完本講後，你應該能夠：
-
-- 說出**映射的五個面向**（切分、資料流、資料放置、運算放置、切分大小），並說明每一個面向在迴圈巢狀（loop nest）中控制哪件事。
-- 以正規化能耗階層與具體的 AlexNet 範例，說明**為什麼資料搬移主導能耗**。
-- 識別 CNN 中**三種資料再利用類型**（卷積再利用、特徵圖再利用、濾波器再利用），並將每一種連結到減少 DRAM 流量的機會。
-- 說出**輸出駐留、權重駐留、輸入駐留**資料流各自的定義性特質，並閱讀一個迴圈巢狀以判斷它實作了哪種資料流。
-- 說明**迴圈順序如何編碼駐留性**：索引出現在「最外層迴圈」的資料型態變化最慢，因此是最具駐留性的。
-- 比較 OS、WS、IS 各變體在相同工作負載上的能效，並解釋為何沒有單一資料流放之四海皆準。
-- 描述 **LoopTree** 如何以統一的樹狀結構表達資料流與資料放置。
-
----
-
-## 第一章 — 映射的五個面向
-
-> *投影片：L05-1 … L05-8*
-
-本講開頭先把今日主題置入 L01 引入的「關注點分離（Separation of Concerns）」框架之中。**映射**是 TeAAL 金字塔中介於固定硬體架構與演算法之間的那一層。在映射之內，投影片識別出五個各有目標、各自影響迴圈巢狀的面向：
-
-![映射的面向——切分、資料流、資料放置、運算放置、切分大小](../../assets/L05/L05-p03-aspects-of-mapping.png)
-
-1. **切分（Partitioning）** — 把張量（tensor）切成小塊（tile），讓每一塊能放入某個層級的記憶體（時間性再利用），或分散到多個 PE 上（空間性再利用）。在迴圈巢狀中，切分會增加額外的迴圈層次，其迴圈邊界控制各緩衝區中保存多少資料。
-
-2. **資料流（Dataflow）** — 設定 for 迴圈的*順序*。索引維度出現在最外層迴圈的資料型態，變化速度最慢——亦即最具「駐留性（stationarity）」——因此可以在低成本的本地儲存中被反覆再利用。這是今日講次的核心主題。
-
-3. **資料放置（Data placement）** — 控制每個切分後的張量小塊*放在哪個緩衝區*。同樣一塊張量，放在暫存器檔（Register File, RF）中每次存取只花 1×；放在全域緩衝區（Global Buffer）要花 6×；放在 DRAM 要花 200×。資料放置以標注的形式擴充迴圈巢狀，顯示每個迴圈層次各持有哪個張量於哪一層記憶體。
-
-4. **運算放置（Compute placement）** — 區分「時間性迴圈」（單一 ALU 一次做一個 MAC）與「並行迴圈」（多個 MAC 同時橫跨 PE 陣列執行）。並行性在迴圈巢狀中以 `parallel_for` 表示，可縮短時脈週期數，也可能帶動 PE 之間的空間性資料共享。
-
-5. **切分大小（Partition sizing）** — 設定每個迴圈層次的確切數值邊界（tile 大小），在各緩衝區層次的容量限制與所需的再利用程度之間取得平衡。
-
-![今日講次目標——資料搬移的能耗影響與資料流分類法](../../assets/L05/L05-p06-goals-dataflow-taxonomy.png)
-
-今日講次聚焦在**資料流**，因為迴圈順序是控制*駐留性*的首要槓桿——讓特定資料型態在低成本本地儲存中保留盡量長的時間，再去取新資料。背景閱讀：Sze 與 Emer 著 *Efficient Processing of Deep Neural Networks*，第 5 章 5.7.1 節以前的部分與 5.8 節。
-
-> **為什麼重要：** 這五個面向是可以各自獨立拉動的槓桿。理解每一個面向控制什麼、以及它如何在迴圈巢狀中表現，是推理任何加速器設計的前提。本講其餘篇幅就是對其中一根槓桿——資料流——的深入探討。
-
----
-
-## 第二章 — 為什麼資料搬移主導能耗
-
-> *投影片：L05-8 … L05-27*
-
-### 最壞情況基準線
-
-本講以**一維卷積（1-D Convolution）** Einsum `O[q] = I[q+s] × F[s]` 作為貫穿全程的範例。每一個乘加（Multiply-Accumulate, MAC）需要四次記憶體讀寫：讀濾波器權重、讀輸入激活值（input activation）、讀部分和（partial sum）、寫更新後的部分和。若全部四次都在 DRAM 上發生，則 AlexNet 的 7.24 億個 MAC 就需要約 **28.96 億次 DRAM 存取**——考量到 DRAM 存取大約是 ALU 運算的 200 倍能耗，這是極其可觀的成本。
-
-### 兩個機會：再利用與本地累加
-
-在基本 MAC 單元與 DRAM 之間增設本地記憶體層次，能從兩個互補的方向打破最壞情況：
-
-1. **資料再利用（Data reuse）** — 若一個權重或激活值被多個 MAC 重複使用，就只需從 DRAM 取一次。本講識別出 CNN 中三種再利用形式：
-   - **卷積再利用（Convolutional reuse）**（僅限 CONV 層）：滑動視窗使同一個輸入激活值參與多個濾波器位置的計算。
-   - **特徵圖再利用（Fmap reuse）**（CONV 與 FC 層）：同一個激活值與多個濾波器相乘。
-   - **濾波器再利用（Filter reuse）**（CONV 與 FC 層，批次大小 > 1）：同一個權重與來自多張圖片的激活值相乘。
-
-2. **本地累加（Local accumulation）** — 部分和不必在每次 MAC 後都寫回 DRAM。若部分和在本地累加，最終只需在完整輸出激活值產生時才做一次 DRAM 寫入。
-
-![記憶體存取減少——結合資料再利用與本地累加](../../assets/L05/L05-p19-memory-access-reduction.png)
-
-兩者合力的效果十分顯著：對於 AlexNet CONV 層，DRAM 存取可從 **28.96 億次減少至 6,100 萬次**——縮減約 **47 倍**。單就特徵圖或濾波器的 DRAM 讀取而言，相較於最壞情況可減少達 **500 倍**（透過將熱資料保留在本地緩衝區中）。
-
-### 空間架構與能耗階層
-
-真實的 DNN 加速器是**空間架構（spatial architecture）**：DRAM 餵給全域緩衝區（Global Buffer，100–500 kB 的晶片上 SRAM），全域緩衝區再餵給一排處理單元（Processing Element, PE），每個 PE 內含一個 ALU 與一個小型暫存器檔（Register File, RF，0.5–1.0 kB）。PE 之間以晶片上網路（Network-on-Chip, NoC）相連，橫跨 200–1,000 個 PE。
-
-![空間架構——DRAM → 全域緩衝區 → PE 陣列 → ALU/RF](../../assets/L05/L05-p23-spatial-architecture.png)
-
-正規化能耗（在商用 65 nm 製程上量測；來源為 Eyeriss，Chen 等人，ISCA 2016，Table IV）如下：
-
-| 資料來源 | 相對能耗 |
-|---|---|
-| ALU 運算 | **1×（基準）** |
-| 暫存器檔 / PE 內部 | **1×** |
-| 經 NoC 的鄰近 PE | **2×** |
-| 全域緩衝區（100–500 kB） | **6×** |
-| **DRAM** | **200×** |
-
-這個階層讓目標變得清晰：**盡量讓資料留在暫存器檔或全域緩衝區中**。實現此目標的機制正是*資料流*——選擇哪些迴圈放在最外層，讓你在乎的資料型態變化最不頻繁，從而駐留在低成本儲存中。
-
-> **為什麼重要：** DRAM 與 ALU 之間 200 倍的能耗差距意味著：資料搬移——而非算術運算——是能耗的決定性限制。以下分類法中的每一種資料流，本質上都是利用本地累加與資料再利用、盡量減少昂貴 DRAM 流量的策略。
-
----
-
-## 第三章 — 輸出駐留（Output Stationary）資料流
-
-> *投影片：L05-28 … L05-48*
-
-### 資料流分類法
-
-本講引入三種 CNN 的典型資料流，最初由 Chen 等人在 ISCA 2016 中系統性整理：
-
-![資料流分類法——輸出駐留、權重駐留、輸入駐留](../../assets/L05/L05-p28-dataflow-taxonomy.png)
-
-### 如何從迴圈巢狀辨認駐留性
-
-關鍵洞見是：**其索引維度僅出現在內層迴圈（且外層迴圈索引固定）的資料型態，就是駐留型態**。等價地說：輸出張量的空間維度（P、Q）在 OS 中出現在最外層；濾波器張量的維度（R、S）在 WS 中出現在最外層；輸入的維度在 IS 中出現在最外層。
-
-### 輸出駐留：最小化部分和的搬移
-
-在輸出駐留（Output Stationary, OS）中，**一個輸出激活值的部分和在本地累加**——它不會離開 PE 的暫存器檔，直到輸出完整為止。權重與輸入激活值則被循環（串流）送入。
-
-對一維卷積而言，OS 的迴圈巢狀為：
-
+```text
+O[q] = sum_s I[q+s] * F[s]
 ```
-for q in [0, Q):          ← 輸出索引在最外層 → 輸出駐留
+
+這個式子說明哪些乘積必須累加到每個輸出中。它沒有說加速器應該先把某個輸出的所有 filter tap 算完，還是先拿同一個 filter weight 掃過所有輸出位置，或先以輸入位置為外層迴圈。這些選擇不改變最後的數值結果，卻會改變哪些資料從 DRAM 讀出、哪些資料留在 RF、哪些資料必須在 PE 之間通訊。
+
+L05 要解決的是映射中的**資料流**問題，也就是 loop order 的問題：
+
+> 給定一個固定的 spatial accelerator 與固定的 DNN layer，我們要如何安排 loop nest，讓經常被重用的資料停留在 MAC 附近？
+
+這個問題重要，因為 DNN accelerator 往往不是被乘法本身限制，而是被供應乘法器的資料搬移限制。投影片 L05-10 到 L05-19 從 MAC 周圍的讀寫次數建立這個論點。最壞情況下，AlexNet 有 7.24 億次 MAC，若每個 MAC 的四次讀寫都到 DRAM，會需要 28.96 億次 DRAM 存取；投影片也給出最佳情況可降到 6,100 萬次 DRAM 存取。這些數字是針對 AlexNet 的投影片主張，應作為再利用動機，而不是普世保證。
+
+---
+
+## 為什麼本講重要
+
+初學者常有一個太簡化的模型：「PE 越多就越快、越好。」L05 修正這個模型。大型 PE array 只有在能被有效餵資料時才有價值。如果每個 MAC 都從 DRAM 讀權重、輸入、部分和，再把更新後的部分和寫回 DRAM，那麼陣列主要消耗能量在搬資料，而不是算術。
+
+硬體架構師看這個問題時，會問：
+
+- **能耗（energy）：** 存取發生在 DRAM、global buffer、NoC，還是 RF？
+- **頻寬（bandwidth）：** 記憶體系統能不能快到讓 PE 不空等？
+- **延遲（latency）：** 排程是否產生很長的 reduction 或序列化搬移？
+- **面積（area）：** 這個 dataflow 需要多少 RF、global buffer 與 interconnect？
+- **利用率（utilization）：** layer 維度是否配得上 array 暴露出的 parallel ranks？
+- **可程式性（programmability）：** accelerator 能不能跨 layer 改 mapping，還是被鎖在單一 dataflow？
+
+這就是為什麼 mapping 位於 TeAAL pyramid 的 algorithm 與 architecture 之間。Algorithm 說要算什麼；architecture 提供儲存、運算與通訊資源；mapping 則試圖讓 workload 與硬體資源互相配合。
+
+---
+
+## 先備知識與心智模型
+
+閱讀本章前，應帶著三個前面講次的概念。
+
+第一，L02 介紹過 convolution 的 rank。對稠密 2-D convolution：
+
+```text
+O[m][p][q] = sum_c sum_r sum_s I[c][p+r][q+s] * F[m][c][r][s]
+```
+
+其中 `m` 是輸出通道，`c` 是輸入通道，`p,q` 是輸出空間位置，`r,s` 是 filter 空間位置。許多 dataflow 本質上就是把這些 rank 對應的 loop 重新排列。
+
+第二，L03 與 L04 的 Einsum 固定算術，但不固定遍歷順序。同一個方程式可以用許多合法的 loop nest 評估，因為 reduction ranks 上的乘加可以用不同順序排程，只要最終累加結果正確。
+
+第三，L01 建立了記憶體階層的重要性。L05 補上具體正規化成本：ALU 1x、RF 1x、相鄰 PE 經 NoC 2x、global buffer 6x、DRAM 200x。這些值在本章歸因於 Chen、Emer、Sze 的 Eyeriss 論文（ISCA 2016）Table IV，並對應投影片 L05-23 到 L05-24。
+
+本講可以用一個 MAC 單元來想像：
+
+```text
+weight  ----\
+input   ----- MAC ----> updated partial sum
+psum    ----/
+```
+
+每次 dense convolution MAC 都消耗一個 weight、一個 input activation、一個舊 partial sum，並產生更新後的 partial sum。Dataflow 問的是：哪一種值應該留在 MAC 附近，讓接下來多次 MAC 可以重用它？
+
+---
+
+## 學習目標
+
+讀完本章後，你應該能夠：
+
+- 定義 mapping 的五個面向：partitioning、dataflow、data placement、compute placement、partition sizing。
+- 說明 local reuse 與 local accumulation 為什麼能降低 DRAM traffic。
+- 從 loop nest 判斷它是 OS、WS 還是 IS。
+- 解釋 outer loops 如何編碼 stationarity。
+- 用小型 convolution 範例算出：相同 MAC 數可以有不同 memory traffic。
+- 說明 spatial dataflow 為什麼隱含具體 physical interconnect pattern。
+- 解釋為什麼 L05 的 energy comparison 不會導出單一普世贏家。
+- 將 LoopTree 讀成 loop order 加 storage placement 的表示法。
+- 區分投影片直接陳述、論文推導、標準背景解釋與本章教學詮釋。
+
+---
+
+## 1. 映射有五個面向
+
+**來源錨點：** 投影片 L05-2 到 L05-7。
+
+Mapping 不是單一決策。投影片 L05-3 到 L05-5 將它分成五個面向。
+
+| 面向 | 選擇什麼 | 對 loop nest 的影響 | 硬體意義 |
+|---|---|---|---|
+| Partitioning（切分） | 如何把 tensor 分成 tile | 增加 partitioned ranks 與 tile loops | 決定資料能否放入 buffer 或分散到 PEs |
+| Dataflow（資料流） | loop 的順序 | 重新排列 loop ranks | 決定哪個 operand 變化最慢、能停在本地 |
+| Data placement（資料放置） | 每個 tensor tile 放在哪個 memory level | 增加 storage annotations | 控制存取命中 RF、global buffer 或 DRAM |
+| Compute placement（運算放置） | 哪些 loop 是 temporal，哪些是 parallel | 使用一般 loop 或 `parallel_for` | 控制 PE utilization 與 spatial sharing |
+| Partition sizing（切分大小） | 具體 tile size 與 loop bounds | 設定數值範圍 | 在 capacity、bandwidth、parallelism 之間取捨 |
+
+本講聚焦在 **dataflow**。這個焦點刻意縮小：真實 mapping 需要五個面向全部一起決定，但 loop order 是第一個槓桿，因為它決定自然的 reuse pattern。L06 會再深入 partitioning。
+
+### 直覺
+
+想像一個 tensor tile 被放入很小的 RF。若接下來許多 MAC 都用同一個 tile，載入它很值得。若下一個 MAC 馬上需要不同 tile，RF 幫助就很有限。Dataflow 的任務就是讓接下來許多 MAC 盡量重用相同資料。
+
+### 精確意義
+
+在本講中，**dataflow** 指 computation 的 loop order，也包括哪些 ranks 被 parallelize。它不只是圖上箭頭的幾何方向，而是透過 loop nest 表達的 compute、storage、communication policy。
+
+### 常見誤解
+
+**誤解：** Mapping 跟 hardware architecture 是同一件事。
+
+**修正：** Architecture 提供資源：PE、buffer、NoC link、memory port。Mapping 決定某個 computation 如何使用這些資源。同一個硬體有時能跑多種 mapping；同一種 mapping 也可能在不同硬體上有不同成本。
+
+---
+
+## 2. 為什麼記憶體存取是瓶頸
+
+**來源錨點：** 投影片 L05-8 到 L05-27。
+
+對一維卷積：
+
+```text
+O[q] = sum_s I[q+s] * F[s]
+```
+
+總共有 `Q * S` 次 MAC。最壞情況下，每次 MAC 需要：
+
+- 讀一個 filter weight；
+- 讀一個 input activation；
+- 讀一個舊 partial sum；
+- 寫一個更新後的 partial sum。
+
+也就是每個 MAC 四次 memory operation。投影片 L05-11 將這個最壞情況套到 AlexNet：7.24 億次 MAC 若全部在 DRAM 讀寫，會變成 28.96 億次 DRAM access。
+
+重點不是真實 accelerator 一定會這樣做，而是 memory hierarchy 要避免的 baseline 正是這種情況。
+
+### 兩個機會
+
+投影片 L05-13 到 L05-19 指出兩個機會。
+
+**Data reuse（資料再利用）：** 一個值取一次，供多個 MAC 使用。CNN 有幾種結構性 reuse：
+
+| Reuse 類型 | 出現位置 | 被重用的資料 | 為什麼會發生 |
+|---|---|---|---|
+| Convolutional reuse（卷積再利用） | CONV | input activations 與 filter weights | sliding windows 彼此重疊 |
+| Fmap reuse（feature-map reuse） | CONV 與 FC | input activations | 一個 activation 會乘上多個 filters |
+| Filter reuse（濾波器再利用） | CONV 與 FC，batch > 1 | filter weights | 同一個 weight 用於多個 input examples |
+
+**Local accumulation（本地累加）：** partial sum 留在本地儲存直到成為 final output。若沒有 local accumulation，每次中間更新都可能變成 DRAM read/write。若在 RF 或 local buffer 累加，只有最後完整 output 需要寫出。
+
+### Computational intensity
+
+投影片 L05-12 問：額外 local memory level 什麼時候有幫助？答案是：
+
+```text
+computational intensity > 1
+```
+
+在本講可以讀成：
+
+```text
+某個被取入的值服務的 MAC 數 / 被取入的相異值數 > 1
+```
+
+如果一個 fetched word 只服務一次 MAC，把它放本地幫助不大。如果一個 fetched word 服務 10、100、甚至 500 次 MAC，本地儲存就能大幅降低 DRAM traffic。投影片 L05-17 指出，在有利 reuse 下，AlexNet CONV layers 的 filter/fmap DRAM reads 最多可降 500x。
+
+### 硬體意義
+
+Memory hierarchy 不是事後加上的 cache 而已。它的容量、頻寬、位置決定哪些 reuse pattern 能被利用。L05 的 spatial architecture 模型中，DRAM 餵給 100-500 kB global buffer，再餵給 200-1000 個 PE 的 array，每個 PE 有 0.5-1.0 kB RF。這些容量是投影片範例，不是所有 accelerator 的必要規格。
+
+---
+
+## 3. 駐留性：讀懂 dataflow 的規則
+
+**來源錨點：** 投影片 L05-28 到 L05-35，以及 L05-49 到 L05-55。
+
+本講最有用的閱讀規則是：
+
+> 哪個 tensor 的識別 ranks 被放在 outer loops，哪個 tensor 就變化最慢，也最具 stationarity。
+
+比較兩個合法的一維卷積 loop nest。
+
+```text
+# Output Stationary
+for q in [0, Q):
   for s in [0, S):
     o[q] += i[q+s] * f[s]
 ```
 
-最外層迴圈遍歷 `q`——輸出位置。對任意固定的 `q`，部分和 `o[q]` 在所有 `s` 上累加，始終不離開本地儲存。權重 `f[s]` 與激活值 `i[q+s]` 串流進來；部分和則原地不動。
+對固定外層 `q`，同一個 output partial sum `o[q]` 會針對所有 `s` 被更新。Output 留在本地。
 
-![輸出駐留 1-D 迴圈巢狀——最外層迴圈遍歷輸出位置](../../assets/L05/L05-p34-os-loop-nest-1d.png)
-
-對完整的 CONV 層（六個張量維度：C、M、P、Q、R、S），OS 迴圈巢狀將 P 與 Q 放在最外層，並對 C 與 M 並行化：
-
+```text
+# Weight Stationary
+for s in [0, S):
+  for q in [0, Q):
+    o[q] += i[q+s] * f[s]
 ```
+
+對固定外層 `s`，同一個 weight `f[s]` 會用於所有 `q`。Weight 留在本地。
+
+Loop nest 做的是同一組 MAC；它沒有做同一種 memory traffic。
+
+### 重要細節
+
+Stationary 不代表「永遠不動」。它代表某個值在有用時間窗內保持 resident。WS accelerator 最終還是要載入新 weights；OS accelerator 最終還是要寫出 final outputs。差別在於移動之前發生了多少 reuse。
+
+---
+
+## 4. 範例演練：相同 MAC，不同 traffic
+
+**教學詮釋：** 本例為本章原創，用 Eyeriss Table IV 的能耗比值作為背景，但 tiny tensor 是為教學而建構。
+
+使用 valid 1-D convolution：
+
+```text
+W = 5 inputs
+S = 3 filter taps
+Q = W - S + 1 = 3 outputs
+```
+
+總共有 `Q * S = 9` 次 MAC。輸出為：
+
+```text
+O[0] = I[0]F[0] + I[1]F[1] + I[2]F[2]
+O[1] = I[1]F[0] + I[2]F[1] + I[3]F[2]
+O[2] = I[2]F[0] + I[3]F[1] + I[4]F[2]
+```
+
+先只看 partial-sum operand。
+
+| 策略 | Psum reads | Psum writes | 約略 psum energy |
+|---|---:|---:|---:|
+| No local reuse | 9 次 DRAM | 9 次 DRAM | `(9 + 9) * 200 = 3600` |
+| Output stationary | 9 次 RF | 6 次 RF 中間寫 + 3 次 DRAM 最終寫 | `(9 + 6) * 1 + 3 * 200 = 615` |
+
+算術完全相同，partial-sum traffic 完全不同。OS 避免把 intermediate partial sums 反覆送到 DRAM。這就是投影片說 memory access is the bottleneck 的具體機制。
+
+### 這個例子沒有主張什麼
+
+它沒有計算 weight 或 activation traffic。完整模型必須計算三種 operand 在所有 memory levels 的 access。L13 會用 ISL 形式化這件事。本例刻意很小，是為了讓 stationarity 機制清楚可見。
+
+---
+
+## 5. 輸出駐留（Output Stationary, OS）
+
+**來源錨點：** 投影片 L05-28 到 L05-48。
+
+**定義：** 在 Output Stationary（OS）中，output partial sums 留在本地，weights 與 input activations 則流過。
+
+對一維卷積：
+
+```text
+for q in [0, Q):
+  for s in [0, S):
+    o[q] += i[q+s] * f[s]
+```
+
+對每個 `q`，accelerator 先完成該 output 的所有 `S` 個 contribution，再移到下一個 output。如果 partial sum 放得進 PE 的 RF，中間 psum read/write 就會是 local access。
+
+對 dense 2-D convolution，投影片給的 loop nest 是：
+
+```text
 for p in [0, P):
   for q in [0, Q):
     for r in [0, R):
@@ -161,42 +285,56 @@ for p in [0, P):
             o[m][p][q] += i[c][p+r][q+s] * f[m][c][r][s]
 ```
 
-![CONV 層 OS 迴圈巢狀——P、Q 在最外層；C、M 並行化](../../assets/L05/L05-p37-conv-os-loop-nest.png)
+Output spatial ranks `p,q` 是外層 temporal loops。Channel ranks `c,m` 在投影片範例中被 parallelize。硬體意義是，多個 PE 針對 output channels 與 input channels 貢獻運算，同時相關 output partial sums 在本地累加。
 
-**OS 硬體實例：** ShiDianNao（ISCA 2015）與 KU Leuven（VLSI 2016 / ISSCC 2017）被引用為 OS 的代表。在 ShiDianNao 中，輸入激活值串流穿過陣列，權重被廣播（broadcast），部分和在每個 PE 內部累加後才串流輸出。
+### 直覺
 
-> **為什麼重要：** OS 最小化部分和讀寫的能耗——這是稠密 CONV 中最頻繁的操作。透過讓部分和保持駐留，可以避免在每次中間累加步驟後付出 200 倍的 DRAM 代價。
+OS 是「先把這個 output 做完，再把它趕出本地」的策略。它有吸引力，因為 partial sums 天生 write-heavy：每次 MAC 都會更新一個 partial sum。如果這些更新都 spill 到 DRAM，能耗會很差。
+
+### 硬體意義
+
+投影片 L05-29 到 L05-31 引用 ShiDianNao 與 KU Leuven 等 OS 例子。共同模式是 activations 與 weights 送進 array，而 partial sums 在 PE 內或 PE 附近累加。這偏好能 broadcast/multicast operands，且能提供低成本 local accumulation 的硬體。
+
+### 常見誤解
+
+**誤解：** OS 代表 outputs 完全不移動。
+
+**修正：** Final outputs 還是要離開 PE 或 local buffer。OS 減少的是 intermediate partial sums 的搬移，不是取消 final output storage。
 
 ---
 
-## 第四章 — 權重駐留（Weight Stationary）資料流
+## 6. 權重駐留（Weight Stationary, WS）
 
-> *投影片：L05-48 … L05-84*
+**來源錨點：** 投影片 L05-48 到 L05-84。
 
-### 迴圈巢狀
+**定義：** 在 Weight Stationary（WS）中，weights 留在本地，input activations 與 partial sums 移動。
 
-在權重駐留（Weight Stationary, WS）中，**濾波器權重駐留在暫存器檔中**——一旦載入就不再移動。輸入激活值與部分和則串流通過。
+對一維卷積：
 
-對一維卷積而言，WS 的迴圈巢狀為：
-
-```
-for s in [0, S):          ← 濾波器索引在最外層 → 權重駐留
+```text
+for s in [0, S):
   for q in [0, Q):
     o[q] += i[q+s] * f[s]
 ```
 
-最外層迴圈遍歷 `s`——濾波器位置。對任意固定的 `s`，權重 `f[s]` 保持不變，同時計算所有輸出位置 `q` 對應的結果。
+對固定 `s`，同一個 weight `f[s]` 用於所有 output positions `q`。如果 weight 存在 PE RF，一次 weight fetch 就能服務多次 MAC。
 
-![權重駐留 1-D 迴圈巢狀——最外層迴圈遍歷濾波器索引](../../assets/L05/L05-p50-ws-loop-nest-1d.png)
+投影片 L05-54 與 L05-55 也展示 parallel WS：
 
-對並行 WS 設計（以 `parallel_for s` 將濾波器位置並行化），所有權重同時在各 PE 上處於活躍狀態——每個 PE 持有一個權重值。輸入激活值被**多播（multicast）**到所有 PE，每個 PE 各自累加其輸出的部分和。
-
-### NVDLA 作為 WS 範例
-
-NVIDIA Deep Learning Accelerator（NVDLA，2017 年 9 月 29 日發布）是具體的 WS 實作。其 PE 陣列有 M × C 個 MAC，其中 M 為輸出通道數、C 為輸入通道數。NVDLA 的完整 CONV 迴圈巢狀為：
-
+```text
+parallel_for s in [0, S):
+  for q in [0, Q):
+    o[q] += i[q+s] * f[s]
 ```
-for r in [0, R):          ← 濾波器空間維度在最外層 → 權重駐留
+
+此時不同 PE 持有不同 weights。Activations 被 multicast 到那些 PEs，而 resulting partial sums 必須被累加。
+
+### NVDLA 作為 WS 例子
+
+投影片 L05-57 到 L05-80 使用簡化的 NVDLA 例子。投影片描述的 PE array 組織為 `M * C` 個 MAC，其中 `M` 是 output channels，`C` 是 input channels。簡化 loop nest 為：
+
+```text
+for r in [0, R):
   for s in [0, S):
     for p in [0, P):
       for q in [0, Q):
@@ -205,315 +343,424 @@ for r in [0, R):          ← 濾波器空間維度在最外層 → 權重駐留
             o[m][p][q] += i[c][p+r][q+s] * f[m][c][r][s]
 ```
 
-最外層迴圈是 `r` 與 `s`——濾波器的空間維度。對固定的 `(r, s)`，已載入的濾波器權重 `f[m][c][r][s]`（針對所有 m、c）保持固定，運算遍歷所有 `(p, q)` 輸出位置及其對應的輸入視窗。
+最上層 loops 是 `r,s`，也就是 filter spatial ranks，因此它是 weight stationary。對固定 filter position，硬體處理許多 input/output positions，同時讓相關 weights 保持 resident。
 
-![NVDLA WS CONV 迴圈巢狀——R、S 在最外層；M、C 並行化](../../assets/L05/L05-p79-ws-nvdla-loop-nest.png)
+### 硬體意義
 
-NVDLA 的卷積緩衝區同時儲存權重與激活值；在各層中，權重與激活值在緩衝區中的比例各有不同。其他被引用的 WS 範例：Chakradhar（ISCA 2010）、nn-X/NeuFlow（CVPRW 2014）、TPU（ISCA 2017）、ISAAC（ISCA 2016）。
+當每個 weight 被大量重用時，WS 能降低 weight read energy。它也要求與 OS 不同的實體路徑。Activations 常需要 broadcast 或 multicast 到持有 weights 的 PEs，partial sums 可能需要 spatial accumulation 或透過 output path 移動。
 
-> **為什麼重要：** WS 最大化了權重的卷積再利用與濾波器再利用——每個從 DRAM 取出的權重，都在所有輸出位置（P × Q）以及整個批次中被重複使用。這在輸入特徵圖小但濾波器數多的層（即激活值相對小、權重相對大）時特別有效。
+投影片 L05-57 也暴露 utilization 問題：如果 layer 的 `M` 與 `C` 維度不符合 array shape，一些 MAC 可能 idle。這是 mapping 與 architecture 的交互作用，不是 convolution 數學本身的性質。
+
+### 常見誤解
+
+**誤解：** WS 一定最好，因為 weights 是 model parameters，理應重用。
+
+**修正：** WS 在 weights 重用夠多、且放得進 local storage 時很強。但若 activation 或 partial-sum traffic 主導、layer shape 讓 array utilization 不佳，或 reduction traffic 很昂貴，WS 就未必最好。
 
 ---
 
-## 第五章 — 輸入駐留（Input Stationary）資料流
+## 7. 輸入駐留（Input Stationary, IS）
 
-> *投影片：L05-85 … L05-90*
+**來源錨點：** 投影片 L05-85 到 L05-90。
 
-在輸入駐留（Input Stationary, IS）中，**輸入激活值保持駐留**，而權重與部分和則流動。IS 對*稀疏（sparse）* CNN 特別有利（例如 SCNN，Parashar 等人，ISCA 2017），因為許多權重為零。當輸入比權重更大時，保持輸入駐留可減少對較大（較貴）記憶體的讀取次數。
+**定義：** 在 Input Stationary（IS）中，input activations 留在本地，weights 與 partial sums 移動。
 
-由於一維卷積的 Einsum `O[q] = I[q+s] × F[s]` 使用複合索引 `q+s` 存取輸入，要實現 IS 需要換元。令 `w = q + s`（因此 `q = w − s`），改為對原始輸入索引 `w` 迭代：
+一維卷積方程式使用 compound input index `q+s`，所以 OS 形式中沒有顯式 input loop：
 
+```text
+for q in [0, Q):
+  for s in [0, S):
+    w = q + s
+    o[q] += i[w] * f[s]
 ```
-for w in [0, W):          ← 輸入索引在最外層 → 輸入駐留
+
+若要明確表達 input stationarity，要換變數：
+
+```text
+w = q + s
+q = w - s
+```
+
+然後改以 raw input position `w` 迭代：
+
+```text
+for w in [0, W):
   for s in [0, S):
     q = w - s
-    o[q] += i[w] * f[s]  ← 注意：q 必須在 [0, Q) 範圍內
+    if 0 <= q < Q:
+      o[q] += i[w] * f[s]
 ```
 
-![輸入駐留 1-D 迴圈巢狀——最外層迴圈遍歷輸入索引 w](../../assets/L05/L05-p88-is-loop-nest-1d.png)
+這個 guard 很重要。沒有它，在 convolution 邊界附近會產生非法 output index。
 
-在 Einsum 符號中，以 `W` 作為顯式索引（其中 `W = Q + S − 1`），並透過協維度（co-rank）表達 `q = w − s`，可得 IS Einsum `O[w-s] = I[w] × F[s]`。遍歷順序（由快到慢）為先 S 後 W。
+### 為什麼 IS 會和 sparse CNN 一起出現
 
-> **為什麼重要：** IS 用於輸入激活值張量遠大於權重張量的稀疏 CNN。保持輸入駐留，避免了從 DRAM 反覆取入大型輸入的高代價。對稠密 CNN 而言，IS 通常不作分析，因為其他資料流在此情境下提供更好的權衡。
+投影片 L05-86 說 IS 用於 sparse CNN，並引用 SCNN（Parashar et al., ISCA 2017），同時說本講不分析 dense CNN 的 IS。原因是結構性的：如果 inputs 很大且許多 weights 為零，保留 nonzero inputs 並和相關 weights 結合，可能減少對較大 memory 的讀取。後續 sparse architecture 講次會更完整回到這個想法。
+
+### 硬體意義
+
+IS 可能產生分散的 output updates，因為固定 input `i[w]` 會貢獻到多個 `o[w-s]` 位置。這讓 accumulator path 比簡單的「一個 output 留在這裡」OS 圖像更複雜。在 sparse settings 中，zero skipping 改變了 traffic balance，因此這個複雜度可能值得付出。
+
+### 常見誤解
+
+**誤解：** IS 只是把 OS 的 loop 名稱換掉。
+
+**修正：** IS 需要圍繞 raw input coordinate 改變 traversal，並處理 `q = w - s` projection。這個 projection 會改變 output update pattern，也改變硬體累加路徑。
 
 ---
 
-## 第六章 — 能耗比較與設計權衡
+## 8. 能耗比較與設計權衡
 
-> *投影片：L05-91 … L05-95*
+**來源錨點：** 投影片 L05-91 到 L05-94。
 
-### OS 的變體
+介紹 OS、WS、IS 之後，投影片用三種 tiling variants 回到 OS：
 
-本講檢視了三種輸出 tile 形狀不同的 OS 變體：
-
-| 變體 | 輸出通道數 | 輸出激活值數 | 目標 |
+| 變體 | Output channels | Output activations | 投影片註記 |
 |---|---|---|---|
-| **OSA** | 單一 M | 多個 P×Q | CONV 層 |
-| **OSB** | 多個 M | 多個 P×Q | FC 層 |
-| **OSC** | 多個 M | 單一 P×Q | — |
+| OSA | single `M` | multiple `P * Q` | targeting CONV layers |
+| OSB | multiple `M` | multiple `P * Q` | - |
+| OSC | multiple `M` | single `P * Q` | targeting FC layers |
 
-每個變體使用不同的 Einsum 與不同的並行維度集合（例如 OSA 對 P0 與 Q0 並行；OSC 對 M0 並行）。
+投影片 L05-93 在 equal total area、256 PEs、AlexNet CONV layers、batch size 16 的設定下比較 WS、OSA、OSB、OSC 與 NLR。主要教學結論不是某個單一數字，而是 WS 與 OS variants 都遠優於 no-local-reuse baseline，但沒有任何一者在所有情況都支配其他者。
 
-### 在 AlexNet 上的能耗比較
+### 如何解讀這個比較
 
-本講展示了 WS、OSA、OSB、OSC 與「無本地再利用（No Local Reuse, NLR）」基準線之間，每個 MAC 正規化能耗的比較。所有設計使用相同的總面積（256 個 PE），以批次大小 16 跑 AlexNet CONV 層作為基準測試。
+Layer shape 會改變最佳 dataflow。Large spatial maps、many channels、small filters、large filters、batch size 都會改變哪個 operand 的 reuse 最有價值。因此固定 dataflow 的晶片，至少在某些 layers 上很可能不是最優。
 
-![跨資料流的每 MAC 能耗比較——WS vs. OS 各變體 vs. NLR](../../assets/L05/L05-p93-energy-comparison.png)
+### 硬體意義
 
-關鍵發現：**沒有任何單一資料流在所有面向均勝出**。WS、OSA、OSB 與 OSC 的結果彼此接近，均遠優於 NLR，但它們的相對排序取決於各層的維度（通道數、濾波器大小、激活值特徵圖大小）。這一發現促使人們去思考：能夠根據各層維度動態調整資料流的*彈性（flexible）*加速器，可能優於*固定資料流*的設計。
-
-> **為什麼重要：** 這個比較告訴你，針對特定層的維度選擇合適的資料流，可以明顯降低每個 MAC 的能耗。它也說明沒有單一資料流放之四海皆準——這一結果，正是研究更精密映射以及追求可重配置架構（後續講次涵蓋）的動機所在。
+這個比較導向 flexible 或 reconfigurable mappings。Flexibility 不是免費的：它需要更複雜的 control、更彈性的 storage，通常也需要更通用的 NoC。但另一個選項是把 silicon 固定在單一 reuse pattern 上，然後期待 workload 剛好符合它。
 
 ---
 
-## 第七章 — LoopTree：表達資料流與資料放置
+## 9. LoopTree：dataflow 加 data placement
 
-> *投影片：L05-95 … L05-111*
+**來源錨點：** 投影片 L05-95 到 L05-111。
 
-本講最後一節引入 **LoopTree**——一種以統一樹狀結構規格化映射決策（尤其是資料流與資料放置）的形式語言。以偽程式碼撰寫的迴圈巢狀雖然捕捉了運算的順序，卻無法直接表達*資料放在記憶體階層的哪一層*。LoopTree 填補了這個空缺。
+Pseudocode loop nests 很適合表達順序，但不擅長表達資料存在哪裡。LoopTree 被引入來同時表示兩者。
 
-![LoopTree——用於資料流與資料放置的樹狀符號](../../assets/L05/L05-p96-looptree-intro.png)
+### Workload example：matrix multiplication
 
-### LoopTree 中的資料流
+投影片改用 matrix multiplication：
 
-在 LoopTree 中，**迴圈節點（loop nodes）** 代表各個 for 迴圈。它們在樹中的順序編碼了迴圈順序——最外層的迴圈位於樹的高處，最內層的位於低處。以矩陣乘法 `Z[m][n] = A[m][ni] × B[ni][n]` 為例，選擇類似 OS 的遍歷，意味著把 M 與 N 的迴圈節點放在 NI 迴圈節點的上方。
+```text
+Z[m][n] = sum_ni A[m][ni] * B[ni][n]
+```
 
-### 切分一個維度
+這個式子命名 tensor ranks、binary operation，以及 reduction rank `ni`。它仍然不假設 operation order。
 
-在 LoopTree 中切分（partitioning）一個維度（例如 NI）會將其拆分為外層 tile 維度（NI₁）與內層維度（NI₀）。這在 Einsum 中以*維度調換（swizzling ranks）*來表達——明確引入切分後的子維度。產生的 LoopTree 對 NI₁ 與 NI₀ 各有一個迴圈節點，中間插有不同的儲存節點。
+### LoopTree 中的 dataflow
 
-### 規格化儲存計畫（資料放置）
+在 LoopTree 中，loop nodes 編碼順序。類似 OS 的 matrix multiplication 可能把 `m` 與 `n` 放在 `ni` 上方，表示一個 output `Z[m][n]` 沿著 `ni` 被累加。
 
-LoopTree 中的**儲存節點（storage nodes）** 標記了資料在各記憶體層次中被取入的位置。以矩陣乘法為例：
+### Partitioning 與 rank swizzling
 
-- DRAM（根節點）：作為後備儲存，持有所有張量（A、B、Z）。
-- 全域緩衝區（Global Buffer）：所有權重 WA 一次性全部取入（在 M 迴圈層次）；激活值 A 每次「for m」迭代取入一個切塊；激活值 B 每次「for ni1」迭代取入一個切塊。
+投影片 L05-102 到 L05-105 顯示，切分 `NI` 這樣的 rank 會產生 `NI1` 與 `NI0` 等 sub-ranks。Einsum 會用這些 sub-ranks 重寫；投影片稱這個過程為 swizzling ranks。Dataflow 要在 partitioning 後指定，因為 loop tree 排列的是 partitioned ranks，而不只是原始 rank。
 
-儲存節點表達了映射的**資料放置**面向。迴圈節點（資料流）加上儲存節點（資料放置），共同構成 LoopTree 對一個映射如何排程到記憶體階層上的完整規格。
+### Storage plan
 
-> **為什麼重要：** LoopTree 是本課程 TeAAL 模擬工具鏈所使用的形式語言。能夠撰寫 LoopTree 是完成實驗作業與期末專題的前提——兩者都需要你以程式化的方式表達映射，並評估其能耗與效能的權衡。
+投影片 L05-106 到 L05-111 加入 storage nodes：
+
+- DRAM 是所有 tensors 的 backing storage。
+- Global buffer 可以取入所有 weights。
+- 每次 `for m` iteration 可以取入一塊 `A`。
+- 每次 `for ni1` iteration 可以取入另一個 operand 的一塊。
+
+重點是，完整 mapping 需要 loop nodes 與 storage nodes。Loop order 說值何時被使用；storage placement 說值從哪一層 memory 供應。
+
+### 常見誤解
+
+**誤解：** LoopTree 只是比較漂亮的 loop nest。
+
+**修正：** LoopTree 是 mapping specification。它能在同一結構中表示 loop order、partitioned ranks 與 storage placement。這就是它對 TeAAL-style analysis 和後續 data-motion counting 有用的原因。
 
 ---
 
-## 範例演練 — 相同的 MAC，不同的能耗
+## 10. 關鍵方程式與如何閱讀
 
-本講的核心主張——兩種資料流可以執行*完全相同的算術*、卻消耗*非常不同的能耗*——只要在一個小例子上數一數存取次數就很容易相信。取一個一維卷積：**W = 5** 個輸入、**S = 3** 個濾波器抽頭，得到 **Q = W − S + 1 = 3** 個輸出。算術是固定的：每一種資料流都剛好做 **Q × S = 9 次 MAC**。改變的是*部分和的流量*。
+### 一維卷積
 
-採用 Eyeriss Table IV 的能耗比值（RF = 1×、DRAM = 200×，皆為每次存取），單就部分和這個運算元比較兩個極端：
+```text
+O[q] = sum_s I[q+s] * F[s]
+```
 
-| | 無本地再利用（NLR） | 輸出駐留（OS） |
-|---|---|---|
-| 累加期間 `o[q]` 住在哪 | DRAM | RF（釘住） |
-| 部分和讀取 | 9 次（全在 DRAM） | 9 次（全在 RF） |
-| 部分和寫入 | 9 次（全在 DRAM） | 6 次中間（RF）+ 3 次最終（DRAM） |
-| 部分和能耗 | (9 + 9) × 200 = **3600** | (9 + 6) × 1 + 3 × 200 = **615** |
+`q` 選 output position。`s` 選 filter tap。`q+s` 選該 tap 使用的 input position。硬體意義：compound input coordinate 是 input stationarity 需要 projection 的原因。
 
-同樣 9 次 MAC、同樣的數值輸出——但把部分和釘在暫存器檔裡，部分和能耗就降低約 **5.9 倍**。把這從 9 次 MAC 放大到 AlexNet 的 7.24 億次 MAC，正是本講以「記憶體存取是瓶頸」開場的原因。也請注意這裡還藏著*第二根*槓桿：只有 S = 3 個相異權重，每個都被全部 Q = 3 個輸出所需要。如果我們再把這 3 個權重也留在 RF 裡（這就是權重駐留的想法），權重的 DRAM 讀取就從 9 次降到 3 次——換了一個運算元，同樣的技巧。
+### 稠密二維卷積
 
-> **如何閱讀：** 這些演算數字是示意性的（刻意只隔離一個運算元，好讓帳目誠實），但其*比值*與*機制*都是真的。駐留性把昂貴的 DRAM 存取換成便宜的 RF 存取，完全不動到算術。
+```text
+O[m][p][q] = sum_c sum_r sum_s I[c][p+r][q+s] * F[m][c][r][s]
+```
+
+`c,r,s` 是 reduction ranks。`m,p,q` 命名 output。硬體意義：固定 `m,p,q` 並遍歷 reduction 有利於 local output accumulation；固定 `r,s` 則有利於 weight reuse。
+
+### Dataflow reading rule
+
+```text
+outer loops change slowest -> associated tensor is most stationary
+```
+
+這是教學用 shorthand。完整 mapping 還要考慮 partitioning 與 data placement。單靠 outer loop 不能保證 stationarity；如果 tile 放不下或 storage plan 讓它被 evict，它仍然無法真正留在本地。
+
+### Energy model reminder
+
+```text
+energy roughly tracks access count * energy per access level
+```
+
+因此相同 MAC 數可能有不同 energy。也因此，量化主張必須有來源：access count 與 per-level cost 取決於 workload、technology 與 architecture。
 
 ---
 
-## 關鍵方程式與如何閱讀（Key Equations & How to Read Them）
+## 11. 硬體意涵
 
-**1. 一維卷積 Einsum（貫穿全程的範例）。**
+**Energy：** Dataflow 改變哪些 access 是 RF、NoC、global buffer 或 DRAM access。由於引用的階層從 1x 到 200x，這可能主導算術能耗。
 
-```
-O[q] = Σ_s  I[q+s] × F[s]
-```
+**Bandwidth：** Dataflow 可以降低總流量，卻對某一層 memory 造成高瞬時頻寬需求。例如 WS 可能需要 activation multicast；OS 可能需要把 weights 與 activations 送到持有 psum 的 PEs。
 
-讀作：對每個輸出位置 `q`，把長度為 `S` 的濾波器 `F` 與輸入視窗 `I[q .. q+S−1]` 的乘積相加。複合索引 `q+s` 正是把輸入耦合到輸出的東西，也正是為什麼輸入駐留需要換元（`w = q+s`）。*硬體意義：* 索引表達式固定了哪個輸入餵給哪個 MAC——圍繞它的迴圈順序則固定了哪個運算元在本地被再利用。
+**Latency：** Parallel loops 可以減少 cycles，但 reductions 與 psum movement 如果不匹配 dataflow，會形成延遲。
 
-**2. CONV 層 Einsum（七個維度）。**
+**Area：** Stationarity 需要 storage。OS 需要 local psum capacity。WS 需要 local weight capacity。IS 需要 local input capacity，且常需要更彈性的 output update path。
 
-```
-O[m][p][q] = Σ_c Σ_r Σ_s  I[c][p+r][q+s] × F[m][c][r][s]
-```
+**Utilization：** Mapping choices 會和 layer dimensions 互動。NVDLA 簡化的 `M * C` array 例子說明，如果 channel dimensions 不符合 exposed parallelism，MAC 可能 idle。
 
-被求和的維度（`c`、`r`、`s`）是*歸約（reduction）*維度——它們累加進同一個輸出、從不單獨出現在等號左邊。*硬體意義：* 歸約維度放在內層迴圈時會在本地累加（有利於 OS）；非歸約的輸出維度（`m`、`p`、`q`）放在最外層時則把某個輸出釘住。
+**Programmability：** Fixed dataflow 對匹配的 layer 可以更簡單有效。Flexible dataflow 能跨 layers 適應，但需要更多 mapping machinery。
 
-**3. 駐留性規則（如何從迴圈巢狀讀出資料流）。**
-
-> 索引維度占據**最外層**迴圈的資料型態變化最慢、駐留最久 → 它就是**駐留**型態。
-
-這是本講最有用的閱讀技巧：瞄一眼迴圈巢狀頂端，就能說出駐留張量。輸出維度在頂 → OS；濾波器維度在頂 → WS；輸入維度在頂 → IS。
-
-**4. 再利用與計算強度（本地緩衝區何時有幫助？）。**
-
-```
-計算強度（computational intensity）≈（被服務的 MAC 數）/（被取入的相異字數）
-```
-
-只有當這個比值大於 1——亦即每個被取入的字餵給超過一個 MAC 時——本地記憶體層次才划算（投影片 L05-12）。*硬體意義：* 三種再利用（卷積、特徵圖、濾波器）正是讓 RF 與全域緩衝區值得占用面積的結構性「強度 > 1」來源。
+**Correctness：** Loop reordering 只有在保留 accumulation dependencies 時才合法。Partial sums 可以流經不同 storage levels，但 final reduction 必須包含同一組 products。
 
 ---
 
-## 硬體意涵（Hardware Implications）
+## 12. 常見誤解
 
-資料流不是抽象的排程選擇——每一種都*要求不同的實體資料路徑*：
+### 誤解：Dataflow 就是圖上資料移動的方向。
 
-- **互連 / 晶片上網路（NoC）。** OS **廣播（broadcast）**權重、在空間上再利用激活值，之後只需要本地的部分和累加。WS 把激活值**多播（multicast）**到各 PE，並且必須加上一條**空間歸約（spatial reduction）**路徑來合併部分和。IS 釘住輸入、串流權重。為廣播而建的 NoC，並不是你想用來做歸約的 NoC——所以選定一種資料流，就等於把矽片定下來。
-- **緩衝區尺寸。** 駐留張量必須*放得進*便宜的那一層。OS 需要 RF 容納一個輸出的部分和；WS 需要 RF 寬到能容納每個 PE 釘住的權重；IS 需要足夠的本地容量裝下（較大的）輸入 tile。尺寸算錯，駐留資料就會溢出，整體塌回 NLR 基準線。
-- **陣列利用率。** 像 NVDLA 這種固定 WS 陣列暴露出 `M × C` 個 MAC；若某層的通道數與陣列維度不匹配，MAC 就會**閒置**（投影片 L05-57）。因此資料流選擇會與層的形狀交互作用，決定的是*利用率*，不只是能耗。
-- **「沒有普世贏家」的後果。** 因為 WS、OSA、OSB、OSC 彼此接近、卻會隨層維度而重新排序（第六章），一顆*單一資料流*的晶片在某些層上必然不是最優。這正是支持**可重配置**資料流的硬體論據——也正是下方論文橋接中的 Row-Stationary 資料流所要填補的缺口。
+在本課程中，dataflow 主要是 loop-order policy，決定 stationarity、reuse 與 accumulation。箭頭圖是 dataflow 的結果，不是定義本身。
+
+### 誤解：最好的 dataflow 是 MAC 數最少的 dataflow。
+
+Dense OS、WS、IS 對同一 layer 執行相同 MAC。差別在 memory traffic、bandwidth 與 utilization。
+
+### 誤解：讓一種 operand stationary 就解決所有資料搬移。
+
+它只解決搬移的一部分。OS 仍可能搬很多 weights 與 inputs。WS 仍可能搬很多 activations 與 partial sums。IS 仍可能造成分散 output updates。
+
+### 誤解：local memory 越多一定越好。
+
+Local memory 只有在捕捉 reuse 時才有幫助。如果 dataflow 在 evict tile 前沒有重用它，額外 storage 可能只增加 area，收益很小。
+
+### 誤解：某篇 dataflow comparison 的數字可以直接套到任何現代模型。
+
+投影片比較使用 AlexNet CONV layers、batch size 16、256 PEs，以及特定 technology context 的 energy model。比精確 bar 更能安全轉移的結論是：「reuse 很重要，而且沒有固定 dataflow 永遠勝出。」
 
 ---
 
-## 論文橋接（Paper Bridge）— Eyeriss（Chen、Emer 與 Sze，ISCA 2016）
+## 13. 重點回顧
+
+- Mapping 是圍繞 Einsum 的硬體排程：loop order、tiling、storage placement、parallelism 與 tile sizes 都屬於 mapping。
+- Dataflow 是 mapping 中的 loop-order 部分；它決定哪個 operand 最具 stationarity。
+- OS 讓 partial sums 留在本地，WS 讓 weights 留在本地，IS 讓 inputs 留在本地。
+- 相同 MAC count 仍可能有很不同的 energy，因為 memory accesses 可能發生在不同 hierarchy levels。
+- 沒有單一 dataflow 永遠勝出；layer shape、buffer capacity、interconnect 與 PE utilization 都會影響結果。
+- LoopTree 用 partitioned ranks 與 storage nodes 擴充 loop nests，讓工具能分析 mappings。
+
+---
+
+## 14. 與前後講次的連結
+
+**銜接 L01：** L01 引入 memory-energy argument 與 separation-of-concerns pyramid。L05 透過 loop order 與 stationarity 讓 mapping layer 變具體。
+
+**銜接 L02：** L02 介紹 convolution ranks。L05 把這些 ranks 變成 loop nests，並問哪些 ranks 應該在 outer、inner 或 parallel loops。
+
+**銜接 L03-L04：** Einsum 表達 what to compute，但不承諾 order。L05 說明這個分離為什麼重要：許多合法 order 有不同 hardware cost。
+
+**導向 L06：** L06 研究 partitioning。L05 問「哪個 operand 應該留在本地」；L06 問「tile 應該多大、partitioned ranks 如何揭露 temporal 與 spatial reuse」。
+
+**導向 L07-L10：** Sparse architectures 改變 access counts，可能讓 input-stationary 或 hybrid schedules 更有吸引力。本講的 IS projection 會在 sparse fibers traversal 與 projection 時再次出現。
+
+**導向 L13：** L05 用直覺 access counting。L13 用 sets、maps、timestamps、shrink/delta calculations 將 data-motion counting 形式化。
+
+---
+
+## 15. 論文橋接：Eyeriss（Chen、Emer、Sze，ISCA 2016）
 
 ### 文獻身分
-- **標題：** *Eyeriss: A Spatial Architecture for Energy-Efficient Dataflow for Convolutional Neural Networks*
-- **作者：** Yu-Hsin Chen、Joel Emer、Vivienne Sze（MIT / NVIDIA Research）
-- **發表：** ISCA 2016
-- **用於：** L05（本講的分類法與能耗比較皆直接取自此文）；在 L08–L10（稀疏架構、Eyeriss v2）再度出現。
 
-### 所解決的問題
-高度並行的資料路徑解決了*吞吐量*問題，卻沒解決*能耗*問題，因為資料搬移可能比運算更昂貴。本文問：什麼樣的資料流既能支援大規模並行、又能最小化搬移權重、激活值與部分和的能耗？
+- **標題：** *Eyeriss: A Spatial Architecture for Energy-Efficient Dataflow for Convolutional Neural Networks*
+- **作者：** Yu-Hsin Chen、Joel Emer、Vivienne Sze
+- **年份／會議：** 2016，ISCA
+- **用於本講：** L05 dataflow taxonomy、energy hierarchy、energy comparison；後續講次會回到 Eyeriss 與 sparse successors。
+
+### 解決的問題
+
+此論文處理 CNN accelerators 中 data movement 的能耗問題。高度並行的 MAC array 可以提供 throughput，但如果 weights、activations、partial sums 太常穿越昂貴 memory levels，energy efficiency 仍然很差。
 
 ### 核心想法
-兩項貢獻。(1) 一套**分類法（taxonomy）**，依各加速器釘住哪個運算元，將先前的 CNN 加速器分類為權重駐留（§V-A）、輸出駐留（§V-B）與無本地再利用（§V-C）。(2) 一種新資料流，**列駐留（Row Stationary, RS）**（§VI），它不固定在單一運算元上，而是在每個 PE 內釘住一條*一維卷積的列（row）*，使濾波器權重、輸入特徵圖的列、與部分和全部都被再利用——順應層的形狀，而非偏袒某一個張量。
+
+論文先系統化既有 dataflows，依它們降低哪種 data movement 來分類，包括 weight-stationary、output-stationary 與 no-local-reuse styles。接著提出 **Row Stationary（RS）**，試圖同時利用 filters、input feature maps 與 partial sums 的 reuse，而不是只最佳化單一 operand。
 
 ### 與本講的關聯
-這就是投影片背後的那篇論文。投影片 L05-28 的資料流分類法標註為 `[Chen, ISCA 2016]`；投影片 L05-93 的每 MAC 能耗比較（WS / OSA / OSB / OSC / NLR）就是它的評估 `[Chen et al., ISCA 2016]`；而第二章使用的 **1×/2×/6×/200×** 能耗階層就是它的 **Table IV**。關鍵在於，本講在第六章末尾留下開放問題*「是否可能做得更好？」*——而這篇論文就是答案。
 
-### 本章所用的關鍵主張
-- **正規化能耗（Table IV）：** 相對於一次 MAC，DRAM **200×**、全域緩衝區（>100 kB）**6×**、跨 PE 陣列（1–2 mm）**2×**、RF（0.5 kB）**1×**——本講每一項權衡的量化骨幹。
-- **分類法：** 既有加速器各自只減少*一種*資料搬移（WS §V-A、OS §V-B、NLR §V-C）。
-- **列駐留（§VI）：** 透過最大化 PE 本地儲存、直接的跨 PE 通訊與空間並行，減少*所有*類型的資料搬移；並順應 CNN 形狀。
-- **結果（Abstract / §VI-C）：** 在相同硬體面積與相同並行度的比較下，RS 在 CONV 層比既有資料流節能 **1.4×–2.5×**，在 FC 層（批次 > 16）至少 **1.3×**；此分析已在一顆實際流片的晶片上驗證。
+投影片 L05-28 將 dataflow taxonomy 歸因於 Chen, ISCA 2016。投影片 L05-93 將 energy comparison 歸因於 Chen et al., ISCA 2016。投影片 L05-23 到 L05-24 使用的 normalized memory hierarchy 與 Eyeriss energy table，尤其是 Table IV，相互對應。
 
-### 學生應該記住的
-1. 本講學到的 OS/WS/IS 標籤，只是此處首次形式化之分類法的*一個軸*。
-2. 「沒有單一資料流勝出」不是死路——RS 證明你可以設計出同時再利用*三個*運算元的資料流。
-3. 公平的資料流比較必須讓**面積與並行度保持固定**——這是 §VI-C 的方法論要點。
-4. 你一直引用的能耗數字（200×、6× …）有明確來源：Eyeriss Table IV，一次 65 nm 的量測。
+### 本章使用的關鍵主張
+
+- **Energy hierarchy：** DRAM 200x、global buffer 6x、inter-PE movement 2x、RF 1x，相對於 MAC reference。來源錨點：Eyeriss Table IV 與投影片 L05-23 到 L05-24。
+- **Taxonomy：** 既有 CNN accelerator dataflows 可用「哪個 operand stationary」或「降低哪種 movement」來描述。來源錨點：Eyeriss Section V 與投影片 L05-28。
+- **公平比較方法：** 比較 dataflows 時應固定硬體資源假設，例如 equal area 與 equal parallelism。來源錨點：Eyeriss evaluation methodology 與投影片 L05-93。
+- **Row Stationary 結果：** 論文在 AlexNet/equal-area 方法下報告 RS 比所比較的既有 dataflows 更節能。這是 paper-derived claim，不是 L05 投影片完整展開的內容。
+
+### 學生應記住什麼
+
+- OS 與 WS 不只是名稱，而是有硬體後果的 reuse policies。
+- 本講使用的 energy numbers 來自特定論文與 technology context。
+- 公平 dataflow comparison 必須先固定 hardware assumptions，再比較 mappings。
+- 「沒有普世贏家」會推動更 flexible 的 dataflows 與 mapping tools。
 
 ### 限制與假設
-評估只針對 AlexNet、且為 65 nm；等面積約束是一個建模選擇；RS 以更複雜的控制與映射換取它的彈性。把這些加速倍數推廣到其他網路或製程節點時，這些注意事項都很重要。
 
-### 建議插入位置
-在第六章之後立刻讀這段橋接（它回答了「是否可能做得更好？」），並回頭把 Table IV 與第二章的能耗階層對照著看。
+Eyeriss 結果與論文中的 networks、technology assumptions、area constraints、architecture model 綁在一起。精確改善倍數不應在未重新評估 workload 與 hardware 時直接推廣。本章只用此論文橋接 L05 概念，不把它當作完整 paper summary。
+
+### 建議閱讀位置
+
+讀完第 8 與第 9 節後再讀本橋接。它說明 taxonomy 與 energy comparison 來自何處，也說明為什麼本講自然導向更 flexible 的 dataflow design。
 
 ---
 
-## 獨立學習指南（Standalone Study Guide）
+## 16. 獨立學習指南
 
-### 進入下一講前必須掌握
+### 必須掌握
 
-- 將 mapping 定義為迴圈順序、迴圈邊界、切分、平行化與記憶體放置的組合。
-- 以「哪個值被保留在 MAC 附近」比較 output-stationary、weight-stationary 與 input-stationary。
-- 說明資料流如何在不改變數學運算的前提下改變記憶體流量。
-- 把 LoopTree notation 讀成迴圈巢與資料放置的緊湊描述。
+- 將 mapping 解釋為 loop、storage、parallelism decisions 的組合。
+- 給定 loop nest，辨認 stationary operand。
+- 解釋為什麼 DRAM traffic 可能在 MAC count 不變時主導 energy。
+- 用 tiny convolution 計算 OS 與 no local reuse 的 partial-sum traffic。
+- 解釋 OS、WS、IS 隱含的硬體路徑。
+- 說明 LoopTree 比 Einsum 多表達了什麼。
 
 ### 自我檢核問題
 
-1. 對 1-D convolution 而言，OS、WS、IS 各自最直接重用哪個張量？
-2. 為什麼兩種資料流執行完全相同的 MAC，能耗卻可能不同？
-3. LoopTree 比 Einsum 本身多描述了哪些資訊？
+1. 在 `O[q] = sum_s I[q+s]F[s]` 中，為什麼 `for q` 在 `for s` 外面會讓 output stationary？
+2. 為什麼 `for s` 在 `for q` 外面會讓 weight stationary？
+3. Input-stationary loop nest 需要哪個 guard？為什麼？
+4. 為什麼兩個 MAC count 相同的 mappings 可能有不同 energy？
+5. Dataflow 控制 mapping 的哪個面向？它不控制哪些面向？
+6. 為什麼 NVDLA 簡化的 `M * C` PE organization 可能造成 utilization loss？
+7. LoopTree storage node 表達了 Einsum 沒有表達的哪些資訊？
+8. 為什麼若不說 layer shape 與 hardware assumptions，「dataflow X 最好」是不完整主張？
 
 ### 練習
 
-1. 將 1-D convolution 迴圈巢分別改寫成 OS、WS、IS 順序，並標記每個張量在哪裡讀寫。
-2. 對其中一種資料流，假設一個很小的 buffer size，說明哪個張量會最先溢出。
-3. 用能耗階層推理：對 filter 很大但 output map 很小的層，哪種資料流可能較有利？
-
-### 常見誤區
-
-- 不指定 layer shape 與 memory size 就說某種 dataflow「比較好」。
-- 把 stationarity 誤解為資料永遠不動。stationary data 是在有用時間窗內局部重用。
-- 忽略 partial sums：如果累加位置不好，output traffic 可能主導能耗。
+1. **概念題：** 對 OS、WS、IS，分別指出 stationary operand，以及最可能造成 movement pressure 的 operand。
+2. **小計算：** 對 `W = 6`、`S = 3`、`Q = 4` 重做 worked example。只計算 no local reuse 與 OS 的 partial-sum traffic。
+3. **Loop reading：** 給定 loop order `r, s, p, q, parallel m, parallel c`，判斷 dataflow 並解釋原因。
+4. **設計權衡：** 假設 accelerator 的 RF 很小，但 global buffer 較大。OS 或 WS 的哪些假設會變脆弱？
+5. **Paper bridge：** 閱讀 Eyeriss abstract 與 Table IV。本章哪些 claims 依賴 paper，而不只是投影片？
+6. **開放架構推理：** 為 OS 設計一個 NoC primitive，再為 WS 設計一個。解釋為什麼兩者不一樣。
 
 ---
 
-## 關鍵詞彙（Key Terms）
+## 17. 關鍵詞彙（Key Terms）
 
-| 詞彙 | 說明 |
-|---|---|
-| **映射（Mapping）** | 把 DNN 運算排程到硬體上的一組決策：切分、資料流、資料放置、運算放置、切分大小。 |
-| **資料流（Dataflow）** | 迴圈巢狀中的迴圈順序；決定哪種資料型態最具駐留性（變化最慢），從而受益於本地儲存再利用。 |
-| **駐留性（Stationarity）** | 某種資料型態駐留在低成本本地儲存（RF 或全域緩衝區）中的特性，而其他資料則串流通過。 |
-| **輸出駐留（Output Stationary, OS）** | 輸出部分和在本地累加的資料流；輸出索引（P、Q）在迴圈巢狀中位於最外層。 |
-| **權重駐留（Weight Stationary, WS）** | 濾波器權重保持駐留的資料流；濾波器空間索引（R、S）在迴圈巢狀中位於最外層。 |
-| **輸入駐留（Input Stationary, IS）** | 輸入激活值保持駐留的資料流；原始輸入索引（W）在迴圈巢狀中位於最外層。 |
-| **迴圈巢狀（Loop nest）** | 表達張量運算遍歷順序的巢狀 for 迴圈；迴圈順序直接編碼了資料流。 |
-| **並行迴圈（parallel\_for）** | 其迭代在多個 PE 上同時執行的迴圈；表達運算放置。 |
-| **卷積再利用（Convolutional reuse）** | 因滑動視窗而使同一輸入激活值在多個濾波器位置被重複使用；僅限 CONV 層。 |
-| **特徵圖再利用（Fmap reuse）** | 同一個激活值被乘以多個濾波器（同一激活值 × 多個權重）。 |
-| **濾波器再利用（Filter reuse）** | 同一個濾波器權重被乘以來自多張圖片的激活值（批次 > 1）。 |
-| **切分（Partitioning）** | 把張量切成 tile 以放入某個記憶體層次；引入額外的迴圈維度。 |
-| **資料放置（Data placement）** | 在每個迴圈層次上，選擇各張量切塊放在哪個緩衝區層次；控制空間性與時間性局部性。 |
-| **LoopTree** | 結合迴圈節點（資料流）與儲存節點（資料放置）以形式化規格化一個映射的樹狀符號。 |
-| **NLR（無本地再利用，No Local Reuse）** | 無任何快取的基準資料流；所有存取均前往 DRAM——最差情況的能耗參考基準。 |
-| **AlexNet** | 能耗比較中使用的基準 CNN（7.24 億個 MAC；DRAM 存取可從 28.96 億次減至 6,100 萬次）。 |
+### Mapping（映射）
 
----
+把 tensor computation 映射到硬體上的 scheduling 與 placement decisions，包括 partitioning、dataflow、data placement、compute placement、partition sizing。硬體意義：mapping 決定 computation 的每一部分使用哪些 memory levels 與 PEs。
 
-## 重點回顧（Takeaways）
+### Dataflow（資料流）
 
-- **映射有五個面向**：切分、資料流、資料放置、運算放置、切分大小。每個面向控制迴圈巢狀中不同的維度，以及不同類型的資料搬移。
-- **資料搬移主導能耗**：DRAM 存取大約是 ALU 運算的 200 倍；本地累加與資料再利用能把 AlexNet 的 DRAM 流量從 28.96 億次削減到 6,100 萬次。
-- **資料流 = 迴圈順序 = 駐留性**：索引出現在*最外層迴圈*的資料型態就是駐留型態。讀最外層迴圈，立刻就能判斷資料流。
-- **三種典型 CNN 資料流**：輸出駐留（OS）讓部分和保持本地；權重駐留（WS）讓權重保持本地；輸入駐留（IS）讓輸入激活值保持本地。
-- **沒有任何資料流放之四海皆準**：WS 與 OS 各變體的優劣隨層的維度（濾波器大小、通道深度、激活值特徵圖大小）而異。彈性架構可以利用這一點。
-- **LoopTree** 以單一形式表達整合了資料流（迴圈節點順序）與資料放置（儲存節點位置）——這正是本課程模擬工具所使用的語言。
+決定哪些 tensor values 變化慢、可在本地被重用的 loop-order policy。它不只是圖上的箭頭方向。硬體意義：dataflow 形塑 memory traffic、NoC traffic、buffer requirements 與 PE utilization。
 
----
+### Stationarity（駐留性）
 
-## 與先前及後續講次的連結（Connections）
+某個值在多次有用 MAC 期間停留在低成本 storage 的性質。硬體意義：stationarity 把反覆 DRAM 或 global-buffer access 轉成 RF 或 NoC-local access。常見混淆：stationary 不等於永久不動。
 
-### 建立在先前講次之上
+### Output Stationary, OS（輸出駐留）
 
-- **L01 的能耗階層** — L01 初步勾勒的 1× / 2× / 6× / 200× 能耗對照表，在這裡拿到具體數字（Eyeriss Table IV），成為本講每一個權衡分析的量化骨幹。
-- **L02 的 CONV 層維度** — 定義一個卷積的七個維度（M、C、P、Q、R、S、N）是每一個迴圈巢狀所排列的原料；沒有 L02 對 CONV 層的解剖，這裡的迴圈巢狀就是天書。
-- **L03–L04 的 Einsum 形式主義** — Einsum 說的是*算什麼*；本講說明迴圈巢狀的遍歷順序是疊加在 Einsum *之上*的映射，而非其內含。同一個 Einsum 可以用 OS、WS 或 IS 順序遍歷。
+Output partial sums 保持本地、沿 reduction terms 累加的 dataflow。硬體意義：降低 intermediate psum movement，偏好 local accumulation structures。
 
-### 在後續講次中再現
+### Weight Stationary, WS（權重駐留）
 
-- **切分深入探討** — L06 詳細檢視切分：如何對維度做 tile、tile 大小如何決定各緩衝區的占用量，以及如何選擇在頻寬與容量之間取得平衡的 tile 大小。第七章 LoopTree 的儲存節點正是通往它的橋樑。
-- **稀疏資料流** — L07–L10（稀疏性）將輸入駐留與其他資料流延伸至有零值激活值或權重的情境，大幅改變能耗平衡；L08–L10 的 Eyeriss v2 正是直接承襲此處橋接的 Eyeriss 論文。
-- **可重配置架構** — 後續關於脈動陣列（systolic array）與彈性加速器的講次，直接受到本講發現（以及 Eyeriss 的列駐留答案）「沒有單一固定資料流在所有層均勝出」的激勵，探索如何在同一塊硬體上支援多種資料流。
-- **精確的資料搬移計數** — L13 以整數集合函式庫（Integer Set Library, ISL）取代本講手算的再利用論證，為任何以 LoopTree 表達的映射計算精確的資料搬移次數。
+Weights 保持本地、activations 與 partial sums 移動的 dataflow。硬體意義：當每個 weight 被大量重用時可降低 weight read energy，但可能需要 activation multicast 與 psum reduction。
 
----
+### Input Stationary, IS（輸入駐留）
 
-## 附錄 — 投影片對照表（Slide-to-Section Map）
+Input activations 保持本地的 dataflow。硬體意義：在某些 sparse settings 中有用，但透過 `q = w - s` projection 可能造成 scattered output updates。
 
-| 投影片 | 章節 |
-|---|---|
-| L05-1 | 標題 |
-| L05-2 | 關注點分離——映射的脈絡 |
-| L05-3 … L05-5 | 第一章 — 映射的五個面向 |
-| L05-6 … L05-7 | 第一章 — 今日講次目標；背景閱讀 |
-| L05-8 … L05-27 | 第二章 — 資料搬移與能耗階層 |
-| L05-28 … L05-35 | 第三章 — 資料流分類法；OS 定義；1-D OS 迴圈巢狀 |
-| L05-36 … L05-48 | 第三章 — CONV 層 OS 迴圈巢狀；OS 硬體範例（ShiDianNao、KU Leuven） |
-| L05-49 … L05-57 | 第四章 — WS 定義；1-D WS 迴圈巢狀；並行 WS 動畫 |
-| L05-58 … L05-84 | 第四章 — NVDLA WS 迴圈巢狀與動畫；WS 硬體範例 |
-| L05-85 … L05-90 | 第五章 — IS 定義；1-D IS 迴圈巢狀；IS Einsum |
-| L05-91 … L05-93 | 第六章 — OS 各變體（OSA、OSB、OSC）；能耗比較 |
-| L05-94 … L05-95 | 第六章 — 映射面向摘要 |
-| L05-96 … L05-111 | 第七章 — LoopTree：資料流與資料放置符號 |
+### Partial Sum, Psum（部分和）
+
+尚未成為 final output 的中間累加值。硬體意義：psums 每次 MAC 都更新，因此不好的 psum placement 可能主導 traffic。
+
+### Local Accumulation（本地累加）
+
+在 output 完成前，把 psum updates 留在 RF 或 local buffer。硬體意義：避免 intermediate psums 反覆進出 DRAM。
+
+### Data Reuse（資料再利用）
+
+一個 fetched value 服務多個 MAC。硬體意義：reuse 是小型 local memories 值得佔用 area 與 energy 的原因。
+
+### Convolutional Reuse（卷積再利用）
+
+卷積 sliding windows 重疊造成的 reuse。硬體意義：一個 input activation 可貢獻到多個 output windows。
+
+### Fmap Reuse（特徵圖再利用）
+
+Input activations 被多個 filters 或 output channels 重用。硬體意義：multicast 或 buffering 可讓一個 activation 餵給多個 MAC。
+
+### Filter Reuse（濾波器再利用）
+
+Weights 在 batch 的多個 images 或多個 spatial positions 中重用。硬體意義：weight storage 與 scheduling 能攤銷昂貴的 weight fetch。
+
+### Data Placement（資料放置）
+
+在 loop nest 的每個位置，選擇每個 tensor tile 位於哪個 memory level。硬體意義：placement 決定 logical access 是 RF、NoC、global-buffer 還是 DRAM energy。
+
+### LoopTree
+
+一種 mapping tree notation。Loop nodes 表達 dataflow；storage nodes 表達 data placement；partitioned ranks 表達 tiling。硬體意義：LoopTree 可被工具分析以估算 data movement。
+
+### NLR, No Local Reuse（無本地再利用）
+
+沒有有效 local reuse 的 baseline。硬體意義：它是警示案例，不是好的 accelerator design。
 
 ---
 
-## 來源註記（Source Notes）
+## 18. 附錄 - 投影片對照表（Slide-to-Section Map）
 
-區分哪些來自投影片、哪些來自所引論文、哪些是為自學而加上的教學鷹架：
+| 投影片範圍 | 章節 | 註記 |
+|---|---|---|
+| L05-1 | 標題與 metadata | 課程脈絡 |
+| L05-2 | 本講要解決的問題 | Separation of concerns 中的 mapping |
+| L05-3 到 L05-5 | 第 1 節 | Mapping 的五個面向 |
+| L05-6 到 L05-7 | 學習目標與來源註記 | Goals 與 background reading |
+| L05-8 到 L05-13 | 第 2 節 | 1-D convolution、MAC memory traffic、computational intensity |
+| L05-14 到 L05-19 | 第 2 節 | Reuse types 與 AlexNet DRAM reduction |
+| L05-20 到 L05-27 | 第 2 與第 11 節 | Spatial architecture 與 low-cost local access |
+| L05-28 到 L05-35 | 第 3 與第 5 節 | Taxonomy 與 1-D OS |
+| L05-36 到 L05-48 | 第 5 節 | CONV-layer OS 與 OS examples |
+| L05-49 到 L05-55 | 第 3 與第 6 節 | 1-D WS 與 parallel WS |
+| L05-56 到 L05-84 | 第 6 節 | nn-X、NVDLA 與 WS examples |
+| L05-85 到 L05-90 | 第 7 節 | IS、coordinate projection、sparse CNN note |
+| L05-91 到 L05-94 | 第 8 節 | OS variants 與 energy comparison |
+| L05-95 到 L05-111 | 第 9 節 | LoopTree、partitioning、swizzling、storage plan |
+| 背景補充 | 第 4、10 到 17 節 | 教學範例、誤解、關鍵詞彙、練習 |
 
-- **能耗比值（1× / 2× / 6× / 200×）。** 投影片 L05-23/24；底層量測為 Eyeriss，Chen 等人，ISCA 2016，**Table IV**（商用 65 nm 製程）。
-- **AlexNet 的 MAC 與 DRAM 存取數（7.24 億 MAC；最壞 28.96 億次 → 最佳 6,100 萬次；約 47×）。** 投影片 L05-11、L05-19。AlexNet 本身：Krizhevsky 等人，NeurIPS 2012。
-- **濾波器/特徵圖 DRAM 讀取最多減少 500×。** 投影片 L05-17（針對 AlexNet CONV 層所述）。
-- **資料流分類法（OS / WS / IS）與 OS/WS/NLR 定義。** 投影片 L05-28 起；分類法在投影片上標註為 `[Chen, ISCA 2016]`（Eyeriss §V）。
-- **每 MAC 能耗比較（WS / OSA / OSB / OSC / NLR，256 PE，AlexNet CONV，批次 16）。** 投影片 L05-93；這是 `[Chen et al., ISCA 2016]` 中的評估（該論文另含列駐留那一條）。
-- **硬體實例** — ShiDianNao `[Du, ISCA 2015]`、KU Leuven `[Moons, VLSI 2016 / ISSCC 2017]`、NVDLA（nvdla.org，2017）、nn-X/NeuFlow `[Farabet, ICCV 2009 / CVPRW 2014]`、TPU `[Jouppi, ISCA 2017]`、ISAAC `[Shafiee, ISCA 2016]`：見投影片 L05-30/31、56/57、84。
-- **稀疏 CNN 的輸入駐留** — 投影片 L05-86，標註為 SCNN `[Parashar, ISCA 2017]`。
-- **LoopTree 符號與矩陣乘法的儲存計畫演練。** 投影片 L05-95…111；LoopTree 是本課程 TeAAL 工具鏈所使用的符號。
-- **論文橋接中的「列駐留」答案。** Eyeriss，ISCA 2016，§VI 與 Abstract——*不在* L05 投影片上（投影片停在開放問題）；此處引入以補完整個故事。
-- **範例演練（「相同的 MAC，不同的能耗」）。** 原創，為本導讀而作（教學詮釋）；僅使用 Table IV 的能耗比值。絕對能耗數字為示意，非量測值。
+---
 
-## 不確定性註記（Uncertainty Notes）
+## 19. 來源註記（Source Notes）
 
-- **47×** 與 **500×** 是投影片所述的 AlexNet CONV 層*最佳情況*縮減；實際可達數字取決於具體的層維度與緩衝區尺寸，實務上會更小。
-- **1.4×–2.5× / ≥1.3×** 的列駐留改善是引自 Eyeriss *Abstract*、在其等面積、等並行度方法論下的數字；它們是 AlexNet 與 65 nm 專屬，不應讀作普世通則。
-- 本導讀引入列駐留來回答投影片的開放問題。實際授課很可能把 RS 留到它自己的章節處理，因此此處的*強調與順序*可能與課程呈現方式不同。
-- 範例演練刻意只隔離部分和這個運算元以求清晰；完整的計算還要追蹤權重與激活值的流量，這會改變絕對數字（但不改變結論）。
+- **投影片：** Lecture ordering、mapping-aspects list、reuse taxonomy、OS/WS/IS loop nests、NVDLA simplified example、OS variants、energy comparison setup、LoopTree introduction，皆依據 `Lecture/L05-Mapping.pdf`。
+- **Energy ratios：** 1x/2x/6x/200x hierarchy 顯示於投影片 L05-23 到 L05-24；本章歸因於 Chen、Emer、Sze，ISCA 2016，Table IV。
+- **AlexNet access counts：** 7.24 億 MAC 與 28.96 億 worst-case DRAM accesses 來自投影片 L05-11。6,100 萬 best-case DRAM accesses 來自投影片 L05-19。
+- **最多 500x reuse claim：** 投影片 L05-17 指出 AlexNet CONV layers 的 filter/fmap DRAM reads 最多可降低 500x。
+- **Dataflow taxonomy：** 投影片 L05-28 引用 Chen, ISCA 2016。
+- **Hardware examples：** ShiDianNao、KU Leuven、nn-X/NeuFlow、NVDLA、TPU、ISAAC、PRIME 等例子出現在投影片 L05-30 到 L05-84。本章只把它們作為簡短例子，不做完整 paper summary。
+- **Input Stationary and sparse CNNs：** 投影片 L05-86 引用 SCNN，Parashar，ISCA 2017。
+- **Paper bridge：** Eyeriss 討論只用來支撐本講概念：energy hierarchy、taxonomy、fair comparison、row-stationary motivation。
+- **教學詮釋：** Worked examples、misconceptions、hardware implication synthesis，以及部分 cross-lecture connections，是為自學章節新增的原創解釋。
+
+## 20. 不確定性註記（Uncertainty Notes）
+
+- Live lecture 可能更依賴動畫講解；本章以 loop-nest reasoning 取代動畫，使讀者不看影片也能理解。
+- AlexNet DRAM reduction numbers 是投影片陳述的 best-case figures。實際 reduction 取決於 layer dimensions、tile sizes、memory capacity 與 implementation。
+- Eyeriss energy table 具有 technology specificity。質性的 memory hierarchy 很有用，但精確 ratios 不應被視為 universal constants。
+- Row Stationary 放在 paper bridge 中，是為了回應投影片「Is it possible to do better?」的動機。L05 投影片本身沒有完整教 RS。
+- 既有 `assets/L05/*.png` 檔案看起來是 extracted slide images。本次重寫沒有在章節中嵌入它們，但檔案仍留在 repository 中；公開發布前應另外做 copyright review。
