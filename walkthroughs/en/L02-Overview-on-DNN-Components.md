@@ -278,7 +278,7 @@ The architectural lesson is direct:
 - If the workload is compute-bound, improving memory bandwidth may not be the main bottleneck.
 - If the measured implementation is far below the roof, the gap may come from stalls, instruction overhead, poor mapping, insufficient buffering, or utilization problems.
 
-**Source note:** Lecture 02 slides 42-43 introduce the Roofline Model and cite Williams, Waterman, and Patterson, CACM 2009. The slides note that rooflines can be drawn for each memory-hierarchy level, though they are often shown for DRAM.
+**Source note:** Lecture 02 slides 42-43 introduce the Roofline Model and cite Williams, Waterman, and Patterson, CACM 2009. The local PDF `papers/Roofline Model.pdf` defines operational intensity as operations per byte of DRAM traffic and presents the attainable-performance bound used here. The slides generalize this intuition to memory-hierarchy levels beyond DRAM.
 
 ---
 
@@ -714,7 +714,7 @@ They usually do not dominate MAC count like CONV, but they can still affect fusi
 
 ### Local PDF Note
 
-The repository currently includes local PDFs for Batch Normalization and TeAAL, but not for the original Roofline CACM 2009 paper. BatchNorm and TeAAL are treated as paper-verified bridges; Roofline remains slide-anchored.
+The repository currently includes local PDFs for Batch Normalization, TeAAL, and the original Roofline CACM 2009 paper. These bridges are therefore paper-verified as well as slide-anchored.
 
 ### Paper Bridge: Batch Normalization
 
@@ -758,22 +758,28 @@ The repository currently includes local PDFs for Batch Normalization and TeAAL, 
 
 **What students should remember:** TeAAL is not introduced as a software detail. It is introduced to discipline architectural thinking: specify the computation first, then explore mappings and hardware.
 
-### Source Bridge: Roofline Model
+### Paper Bridge: Roofline Model
 
-**Bibliographic identity:** Lecture 02 slides cite Williams, Waterman, and Patterson, *Roofline: An Insightful Visual Performance Model for Multicore Architectures*, Communications of the ACM, 2009. No local PDF is present in this repository.
+**Bibliographic identity:** Samuel Williams, Andrew Waterman, and David Patterson, *Roofline: An Insightful Visual Performance Model for Multicore Architectures*, Communications of the ACM, 2009. Local PDF: `papers/Roofline Model.pdf`.
 
-**Problem addressed:** Designers need a simple way to decide whether performance is limited by memory bandwidth or compute throughput.
+**Problem addressed:** Multicore systems were becoming diverse, and programmers, compiler writers, and architects needed a simple model that did not merely predict performance but explained which bottleneck mattered. The paper frames Roofline as a bound-and-bottleneck model: it is intentionally not perfect, but it should expose whether a kernel is constrained by memory bandwidth or compute throughput.
 
-**Core idea:** Plot achievable throughput as a function of compute intensity. The maximum is limited by either the bandwidth slope or the compute roof.
+**Core idea:** Plot attainable throughput as a function of operational intensity. In the paper, operational intensity means operations per byte of DRAM traffic after cache filtering. The upper bound is $P_\text{attainable}=\min(P_\text{peak}, B_\text{mem}\times I_\text{op})$, where $P_\text{peak}$ is peak compute throughput, $B_\text{mem}$ is sustainable memory bandwidth, and $I_\text{op}$ is operational intensity. The intersection of the sloped bandwidth line and the flat compute roof is the **ridge point**: the minimum operational intensity needed to reach peak compute.
 
-**Relevance to this lecture:** The model explains why CI matters: low-CI implementations cannot use more compute lanes unless memory traffic is reduced or bandwidth increases.
+**Relevance to this lecture:** L02 uses compute intensity to make memory traffic concrete. The paper's operational-intensity language explains the same hardware tradeoff: a low-intensity implementation cannot use more MAC lanes unless it reduces data movement, increases bandwidth, or changes the mapping so more operations are supported by each byte moved.
 
 **Key claims used here:**
 
-- Roofline visualizes throughput using memory bandwidth, compute parallelism, and compute intensity (Lecture 02 slides 42-43).
-- When memory-bound, increasing the number of lanes does not necessarily increase throughput (Lecture 02 slide 43).
+- The model ties floating-point performance, operational intensity, and memory performance into a 2D graph. Source anchor: paper p. 66.
+- Operational intensity is measured as operations per byte of DRAM traffic, with traffic counted after cache hierarchy filtering. Source anchor: paper p. 66.
+- Attainable performance is bounded by the smaller of peak compute throughput and memory bandwidth times operational intensity. Source anchor: paper p. 67.
+- The ridge point gives the minimum operational intensity required to achieve peak performance; a ridge far to the right means only high-intensity kernels can reach the compute roof. Source anchor: paper p. 67.
+- The paper adds **ceilings** below the roofline to represent missing optimizations such as ILP/SIMD, floating-point balance, unit-stride access, memory affinity, and software prefetching. Source anchor: paper pp. 68-69.
+- Cache optimizations can move a kernel rightward by increasing operational intensity, because caches reduce traffic to main memory. Source anchor: paper p. 69.
 
-**What students should remember:** Roofline is not merely a graph. It is a design diagnostic: it tells you which resource to optimize first.
+**What students should remember:** Roofline is not merely a graph. It is a design diagnostic: it tells you whether to spend effort on reuse and bandwidth, on compute parallelism, or on lower-level implementation ceilings before expecting more throughput.
+
+**Limitations and assumptions:** The original paper is written for multicore floating-point kernels and DRAM traffic. L02 adapts the same idea to DNN accelerators and sometimes to other memory-hierarchy levels. That adaptation is a teaching interpretation: the diagnostic remains useful, but the exact bandwidth roof, traffic definition, and ceilings must be remeasured for each accelerator and memory level.
 
 ---
 
@@ -919,7 +925,7 @@ The FC-as-matrix-multiply view becomes important for advanced technologies and p
 - The TeAAL methodology and separation-of-concerns discussion is based on Lecture 02 slides 3-8, 21, 27-28, and 44 plus the local `papers/TeAAL.pdf`, especially Sections 2.2, 2.3, and 3-4.
 - The tensor, rank, Einsum, and ODE explanations are based on Lecture 02 slides 9-20.
 - The compute-intensity formulas and $K=250, M=100$ numerical values are based on Lecture 02 slides 23-26 and 38-41.
-- The Roofline discussion is based on Lecture 02 slides 42-43, which cite Williams, Waterman, and Patterson, CACM 2009.
+- The Roofline discussion is based on Lecture 02 slides 42-43 and the local `papers/Roofline Model.pdf`, especially pp. 66-69.
 - The CNN component taxonomy and CONV dominance claim are based on Lecture 02 slides 45-52.
 - The CONV shape, stride, padding, decoder-ring, and Einsum material is based on Lecture 02 slides 53-83.
 - The FC-to-matrix-vector and FC-to-matrix-matrix derivations are based on Lecture 02 slides 85-102.

@@ -278,7 +278,7 @@ $$\text{achievable throughput} \le \min(\text{peak compute throughput},\ \mathrm
 - 如果 workload 是 compute-bound，改善 memory bandwidth 可能不是主要瓶頸。
 - 如果實測 implementation 離 roof 很遠，原因可能是 stalls、instruction overhead、不佳 mapping、buffering 不足或 utilization 問題。
 
-**來源說明：** Lecture 02 slides 42-43 介紹 Roofline Model，並引用 Williams, Waterman, and Patterson, CACM 2009。投影片也指出 roofline 可以針對 memory hierarchy 的每一層畫出來，雖然常見圖通常以 DRAM 為主。
+**來源說明：** Lecture 02 slides 42-43 介紹 Roofline Model，並引用 Williams, Waterman, and Patterson, CACM 2009。本地 PDF `papers/Roofline Model.pdf` 將 operational intensity 定義為每 byte DRAM traffic 的 operations，並提出本節使用的 attainable-performance bound。投影片則把這個直覺推廣到 DRAM 以外的 memory-hierarchy levels。
 
 ---
 
@@ -714,7 +714,7 @@ FC 是 $R=H$、$S=W$ 的 CONV special case。差異不是新的 arithmetic，而
 
 ### Local PDF Note
 
-目前 repository 有 Batch Normalization 與 TeAAL 的 local PDFs，但沒有 Roofline CACM 2009 原始 paper。因此 BatchNorm 與 TeAAL 是 paper-verified bridges；Roofline 仍是 slide-anchored。
+目前 repository 有 Batch Normalization、TeAAL 與 Roofline CACM 2009 原始 paper 的 local PDFs。因此這些 bridges 同時是 paper-verified 與 slide-anchored。
 
 ### Paper Bridge: Batch Normalization
 
@@ -758,22 +758,28 @@ FC 是 $R=H$、$S=W$ 的 CONV special case。差異不是新的 arithmetic，而
 
 **What students should remember：** TeAAL 不是單純軟體細節，而是用來訓練架構思考的 discipline：先指定 computation，再探索 mappings 與 hardware。
 
-### Source Bridge: Roofline Model
+### Paper Bridge: Roofline Model
 
-**Bibliographic identity：** Lecture 02 slides 引用 Williams, Waterman, and Patterson, *Roofline: An Insightful Visual Performance Model for Multicore Architectures*, Communications of the ACM, 2009。目前 repository 沒有 local PDF。
+**Bibliographic identity：** Samuel Williams、Andrew Waterman、David Patterson，*Roofline: An Insightful Visual Performance Model for Multicore Architectures*，Communications of the ACM，2009。Local PDF：`papers/Roofline Model.pdf`。
 
-**Problem addressed：** Designers 需要簡單方法判斷 performance 是受限於 memory bandwidth 還是 compute throughput。
+**Problem addressed：** Multicore systems 變得愈來愈多樣，programmers、compiler writers 與 architects 需要一個簡單模型，不只是預測 performance，而是指出哪個 bottleneck 真正重要。Roofline 在論文中是 bound-and-bottleneck model：它不追求完美模擬，而是讓 memory bandwidth 與 compute throughput 的限制變清楚。
 
-**Core idea：** 將 achievable throughput 畫成 compute intensity 的函數。上限由 bandwidth slope 或 compute roof 決定。
+**Core idea：** 將 attainable throughput 畫成 operational intensity 的函數。論文中的 operational intensity 指的是 cache hierarchy filtering 之後，每 byte DRAM traffic 對應多少 operations。上限可寫成 $P_\text{attainable}=\min(P_\text{peak}, B_\text{mem}\times I_\text{op})$，其中 $P_\text{peak}$ 是 peak compute throughput，$B_\text{mem}$ 是 sustainable memory bandwidth，$I_\text{op}$ 是 operational intensity。斜的 bandwidth line 與水平 compute roof 的交點稱為 **ridge point**：也就是要碰到 compute roof 所需的最低 operational intensity。
 
-**Relevance to this lecture：** 這個 model 說明為什麼 CI 重要：低 CI implementation 不能只靠更多 compute lanes 提速，除非降低 memory traffic 或增加 bandwidth。
+**Relevance to this lecture：** L02 用 compute intensity 讓 memory traffic 變成可計算的東西。論文的 operational-intensity language 說明同一個硬體 tradeoff：低 intensity implementation 不能只靠更多 MAC lanes 提速，除非它減少 data movement、增加 bandwidth，或改變 mapping，讓每個搬動的 byte 支撐更多 operations。
 
 **Key claims used here：**
 
-- Roofline 用 memory bandwidth、compute parallelism 與 compute intensity visualizes throughput（Lecture 02 slides 42-43）。
-- 當 memory-bound 時，增加 lanes 不一定增加 throughput（Lecture 02 slide 43）。
+- Roofline 將 floating-point performance、operational intensity 與 memory performance 放在同一張 2D graph。來源：paper p. 66。
+- Operational intensity 以每 byte DRAM traffic 的 operations 衡量，而且 traffic 是 cache hierarchy filtering 之後到 main memory 的 bytes。來源：paper p. 66。
+- Attainable performance 受 peak compute throughput 與 memory bandwidth 乘上 operational intensity 兩者中較小者限制。來源：paper p. 67。
+- Ridge point 給出達到 peak performance 所需的最低 operational intensity；ridge point 越靠右，代表只有非常高 intensity 的 kernels 才容易碰到 compute roof。來源：paper p. 67。
+- 論文加入 **ceilings** 表示 roofline 下方還有其他未完成優化，例如 ILP/SIMD、floating-point balance、unit-stride access、memory affinity、software prefetching。來源：paper pp. 68-69。
+- Cache optimizations 可以讓 kernel 往右移，因為更好的 cache behavior 會減少 main-memory traffic，因而增加 operational intensity。來源：paper p. 69。
 
-**What students should remember：** Roofline 不只是一張圖，而是 design diagnostic：它告訴你應該先優化哪個 resource。
+**What students should remember：** Roofline 不只是一張圖，而是 design diagnostic：它告訴你該先投資 reuse/bandwidth、compute parallelism，還是先處理更底層的 implementation ceilings，才有機會看到 throughput 提升。
+
+**Limitations and assumptions：** 原論文針對 multicore floating-point kernels 與 DRAM traffic。本章把相同直覺改用於 DNN accelerators，也有時推廣到其他 memory-hierarchy levels。這是 teaching interpretation：診斷方式仍有用，但實際 bandwidth roof、traffic 定義與 ceilings 必須針對每個 accelerator 與 memory level 重新量測。
 
 ---
 
@@ -919,7 +925,7 @@ FC-as-matrix-multiply 的觀點會在 advanced technologies 與 precision 中變
 - TeAAL methodology 與 separation-of-concerns 討論依據 Lecture 02 slides 3-8, 21, 27-28, and 44，以及本地 `papers/TeAAL.pdf`，尤其是 Sections 2.2、2.3、3-4。
 - Tensor、rank、Einsum 與 ODE 說明依據 Lecture 02 slides 9-20。
 - Compute-intensity formulas 與 $K=250, M=100$ 數值依據 Lecture 02 slides 23-26 and 38-41。
-- Roofline discussion 依據 Lecture 02 slides 42-43，這些 slides 引用 Williams, Waterman, and Patterson, CACM 2009。
+- Roofline discussion 依據 Lecture 02 slides 42-43 與本地 `papers/Roofline Model.pdf`，尤其是 pp. 66-69。
 - CNN component taxonomy 與 CONV dominance claim 依據 Lecture 02 slides 45-52。
 - CONV shape、stride、padding、decoder-ring 與 Einsum material 依據 Lecture 02 slides 53-83。
 - FC-to-matrix-vector 與 FC-to-matrix-matrix derivations 依據 Lecture 02 slides 85-102。
