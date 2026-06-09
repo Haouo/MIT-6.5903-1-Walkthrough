@@ -1,330 +1,627 @@
-# L07 — Co-Design of DNN Models and Hardware: Sparsity
+# L07 - Co-Design of DNN Models and Hardware: Sparsity
 
-> **Course:** 6.5930/1 — Hardware Architectures for Deep Learning
+> **Course:** 6.5930/1 - Hardware Architectures for Deep Learning
 > **Instructors:** Joel Emer & Vivienne Sze (MIT EECS)
 > **Lecture date:** February 25, 2026 · **Slides:** 53 · **Source:** [`Lecture/L07 - Sparsity.pdf`](../../Lecture/L07%20-%20Sparsity.pdf)
 >
-> *This is a conceptual walkthrough that reconstructs the lecture's narrative from the slides. It is organized by idea, not slide-by-slide. Each section cites the slide range it draws from so you can follow along with the original deck.*
+> This walkthrough reconstructs the missing lecture narration from the slides and local papers. It is a self-study chapter, not a slide transcript.
 
 ---
 
 ## TL;DR
 
-Deep neural networks are full of **zeros** — and zeros are free if the hardware knows how to skip them. This lecture, which sits at the boundary of the **Format** layer of the TeAAL Pyramid (how data is represented) and the **Compute** layer (what gets computed), explains where those zeros come from and how to make more of them. **Activation sparsity** arises naturally from ReLU and from structured input data such as graphs; **weight sparsity** can be deliberately introduced through **pruning** — a four-step loop of scoring, grouping, ranking, and fine-tuning. The two big payoffs are **(1) reduced data movement and storage** (because zeros need not be stored or fetched) and **(2) reduced computation** (because anything multiplied by zero equals zero). The catch: fully exploiting sparsity in hardware is non-trivial and demands specialized support — which is exactly what L08–L10 address.
+Sparsity means many tensor values are repeated, usually repeated zeros. In DNN hardware, zeros create two opportunities: do not store/move the zero, and do not execute a multiply-add whose result cannot change the output. L07 explains where zeros come from and why they are not automatically useful. Activation sparsity can arise naturally from ReLU, correlations in input data, or sparse graph structure. Weight sparsity is usually created by pruning, a model-hardware co-design process that chooses which weights or groups to remove, how to recover accuracy, and what hardware metric to optimize.
+
+The central warning is that sparsity is an opportunity, not a guarantee. Skipping zeros requires metadata, compression formats, zero detection, scheduling, and load balancing. A dense accelerator may still perform the ineffectual work. A sparse accelerator may skip work but pay overhead. The best design depends on sparsity level, granularity, dataflow, memory hierarchy, and the actual deployment platform.
+
+---
+
+## What Problem This Lecture Solves
+
+Earlier lectures showed that DNN accelerator efficiency is often dominated by memory movement and PE utilization, not just MAC count. L07 asks: if many DNN values are zero, can the system avoid moving and computing with them?
+
+The naive answer is "yes, because anything times zero is zero." The hardware answer is more careful. To save energy or time, the system must know which values are zero early enough to avoid fetching, routing, or multiplying them. It must also keep PEs busy after removing work. If the nonzeros are irregular, one PE may receive many nonzeros while another receives few. The sparse representation may require indices, run lengths, masks, or other metadata. That metadata costs storage, bandwidth, and control logic.
+
+This lecture therefore frames sparsity as co-design. The model decides where zeros come from; the hardware decides whether those zeros become real savings.
+
+Source note: L07 slides 2-6 directly state the goals, sparsity definition, and effectual/ineffectual operation framework.
+
+---
+
+## Why This Lecture Matters
+
+Sparsity is one of the main levers for reducing DNN inference cost, but it sits across several layers of the accelerator stack.
+
+- **Algorithm/model:** pruning changes the trained network and may change accuracy.
+- **Format:** compressed representations decide how nonzeros and metadata are stored.
+- **Mapping:** the dataflow decides where sparse values are reused and where zero-skipping happens.
+- **Architecture:** PEs need gating, skipping, intersection, buffering, or load-balancing support.
+- **Evaluation:** the right metric might be energy, latency, storage, throughput, accuracy, or a full tradeoff curve.
+
+The lecture prepares the ground for L08-L10. L07 says where sparsity comes from and what design choices it introduces. Later lectures show sparse accelerator mechanisms.
+
+---
+
+## Prerequisites and Mental Model
+
+You should know:
+
+- ReLU: $\operatorname{ReLU}(x)=\max(0,x)$.
+- Dense MAC: a multiply-accumulate such as $z \leftarrow z + a\cdot w$.
+- Memory hierarchy: moving data from farther memory usually costs more energy.
+- Dataflow and partitioning: mapping determines where values live and when they are reused.
+
+Mental model: imagine a dense accelerator as a factory line that processes every box, even empty boxes. Sparsity asks whether empty boxes can be detected before they consume conveyor bandwidth, storage, and worker time. The answer depends on the label system, routing system, and how evenly the remaining boxes are distributed.
 
 ---
 
 ## Learning Objectives
 
-After this lecture you should be able to:
+After this lecture, you should be able to:
 
-- Distinguish **activation sparsity** (natural) from **weight sparsity** (engineered via pruning).
-- Explain the two **hardware-level benefits** of sparsity: reducing data movement/storage and reducing computation.
-- Define **effectual** vs. **ineffectual** operations and understand why the latter introduce a hardware cost tradeoff.
-- Trace the **pruning pipeline** (scoring → grouping → ranking → fine-tuning → scheduling).
-- Contrast **magnitude-based** and **energy-aware** pruning criteria, and explain why indirect metrics like MAC count can be misleading.
-- Distinguish **fine-grained (unstructured)** from **coarse-grained (structured)** weight sparsity and articulate the hardware implications of each.
-- Explain why sparsity on the order of **30–70%** already matters for DNN hardware even though software libraries target >99%.
-
----
-
-## Chapter 1 — What Sparsity Buys (and What It Costs)
-
-> *Slides: L07-2 … L07-8*
-
-### The two goals
-
-The lecture opens with a precise statement of scope: today's focus is **reducing the number of operations for storage and compute** by exploiting sparsity — broadly defined as repeated values, and in most DNN contexts, **repeated zeros**.
-
-![Goals of today's lecture — exploit sparsity to reduce data movement and computation](../../assets/L07/L07-p02-goals.png)
-
-Two distinct hardware benefits flow from a zero in a tensor:
-
-1. **Reduce data movement and storage cost** — because `anything × 0 = 0` and `anything + 0 = anything`, a zero value need never be fetched from memory or sent across a network-on-chip. Skipping the load and the communication directly translates to energy savings, since (as L01 established) DRAM access costs ~200× an arithmetic operation.
-2. **Reduce number of operations** — the multiply-accumulate can be entirely bypassed when one operand is zero, saving both compute time and the energy of the ALU itself.
-
-### Effectual vs. ineffectual operations
-
-The lecture introduces a precise accounting framework:
-
-> **Total algorithmic operations** = effectual operations + ineffectual operations
-
-An **effectual** operation is one that changes the result; an **ineffectual** one (involving a zero) does not. Hardware that fully exploits sparsity would execute only the effectual fraction. In reality:
-
-> **Actual operations performed** = effectual + *unexploited* ineffectual operations
-
-Avoiding *all* ineffectual operations is hard — it requires knowing at hardware time which inputs are zero, routing around them, and keeping the effective throughput high. This creates a central tension: more elaborate sparsity-exploitation machinery **reduces operations skipped but increases the cost per operation** (area, power, control overhead). Slides L07-7 and L07-8 make this tradeoff graphical: throughput and energy efficiency both depend on the interplay between hardware complexity and the actual sparsity level in the workload. The right design point depends on the deployment scenario.
-
-> **Why it matters:** Sparsity is not free — it creates an opportunity that hardware must be built to capture. Understanding the effectual/ineffectual distinction is the first step toward designing or evaluating a sparse accelerator.
+- Define sparsity, density, effectual operation, and ineffectual operation.
+- Distinguish activation sparsity from weight sparsity.
+- Explain why ReLU creates natural activation zeros.
+- Explain why graph adjacency matrices introduce structural sparsity.
+- Describe the pruning loop: scoring, grouping, ranking, fine-tuning, and scheduling.
+- Compare magnitude-based, feature-based, energy-aware, and platform-aware pruning objectives.
+- Explain why unstructured sparsity and structured sparsity create different hardware tradeoffs.
+- Explain why MAC count and weight count can be poor proxies for latency or energy.
+- Identify what L08-L10 must add to turn sparse workloads into hardware speedups.
 
 ---
 
-## Chapter 2 — Activation Sparsity: Where Natural Zeros Come From
+## Main Textbook-Style Narrative
 
-> *Slides: L07-9 … L07-23*
+### 1. Sparsity Creates Effectual and Ineffectual Work
 
-### Sources of sparsity
+In this lecture, sparsity usually means zeros. A tensor with 75% zeros has density 25%, meaning one quarter of its entries are nonzero.
 
-The lecture identifies two broad origins of zeros in DNN tensors:
+The hardware opportunity comes from two identities:
 
-![Sources of sparsity — activation sparsity (ReLU, correlations, graph structure) and weight sparsity (reordering, pruning)](../../assets/L07/L07-p03-sources-of-sparsity.png)
+$$
+a \times 0 = 0, \qquad a + 0 = a.
+$$
 
-**Activation sparsity** (zeros in the feature maps / intermediate tensors):
-- **ReLU nonlinearity** — the dominant source: any negative pre-activation is clamped to zero.
-- **Spatial and temporal correlation of inputs** — neighboring pixels in a feature map are correlated; frames in a video are similar.
-- **Structural sparsity of the input representation** — graphs, for instance, have sparse adjacency matrices.
+If a MAC uses a zero activation or zero weight, the multiply either produces zero or the add does not change the accumulator. The slides call the useful operations **effectual operations** and the useless zero-related operations **ineffectual operations**:
 
-**Weight sparsity** (zeros in the learned parameters):
-- **Redundant weights** — many weights are near-identical and can be consolidated before execution (without changing the model).
-- **Network pruning** — deliberately removing weights whose removal has small impact on accuracy.
+$$
+\text{total operations}=\text{effectual operations}+\text{ineffectual operations}.
+$$
 
-### ReLU and AlexNet activation sparsity
+But hardware usually performs:
 
-The landmark result: on **AlexNet**, the output feature maps of all five convolutional layers contain **~75% zeros** after ReLU. The bar chart on slide 10 shows that the fraction of non-zero activations never rises above ~25% across the five CONV layers. This means that in a naive dense implementation, three out of every four activations are zero — all of their associated multiplications are ineffectual.
+$$
+\text{actual operations}=\text{effectual operations}+\text{unexploited ineffectual operations}.
+$$
 
-![ReLU produces ~75% zeros in AlexNet feature maps](../../assets/L07/L07-p10-relu-activation-sparsity.png)
+The gap between ineffectual operations and unexploited ineffectual operations is the sparse accelerator design space. A perfect sparse machine would skip all ineffectual work. A realistic sparse machine skips some work and pays overhead for doing so.
 
-### Hardware responses to activation sparsity
+Hardware implication: zero-skipping is valuable only if the saved arithmetic and movement exceed the costs of detecting zeros, carrying metadata, steering data, and balancing work.
 
-The lecture surveys several architectural techniques for exploiting activation zeros:
+Source note: the effectual/ineffectual operation framework is directly from L07 slides 5-8.
 
-- **Compression** — store only non-zero values with metadata (indices or run-length codes). This shrinks both storage footprint and memory bandwidth — meaning more useful data can be held at each level of the hierarchy.
-- **Zero-skipping (Cnvlutin, ISCA 2016)** — built on top of DaDianNao, avoids fetching and multiplying zero activations, achieving 1.37× speedup (1.52× with additional activation pruning) at 4.49% area overhead.
-- **Activation pruning (Minerva, ISCA 2016)** — goes further by removing small-but-nonzero activations; achieves 11% speedup on ImageNet, 2× power reduction on MNIST.
-- **SnaPEA (ISCA 2018)** — predicts, *before* completing the convolution, whether the ReLU will output zero. If the partial sum already crosses a threshold indicating a negative result, the remaining computation is skipped. Additional hardware is required to decide when to safely terminate.
-- **PredictiveNet / Song (ISCA 2018)** — simplifies the prediction: only compute on the high bits of each weight; if the high-bit result is already negative, skip the low-bit computation entirely.
+### 2. Compression Saves Movement, Not Just Storage
 
-### Spatial and temporal correlations
+Compression stores only useful values plus enough metadata to reconstruct their positions. For sparse tensors, that could mean coordinate lists, compressed sparse rows, run-length encoding, masks, or structured patterns.
 
-Beyond ReLU, sparsity can be extracted from the structure of the input itself:
+A compression format must be uniquely decodable. For DNN inference, it is usually lossless, because changing the tensor values can affect accuracy unless the approximation is explicitly part of model design.
 
-- **Spatial correlation (Diffy, MICRO 2018)** — neighboring activations in a feature map differ only slightly. Processing *deltas* between neighbors rather than the full values introduces sparsity in the difference representation.
-- **Temporal correlation** — consecutive video frames overlap significantly. Architectures such as EVA2, Euphrates, and FAST (all 2018) exploit inter-frame redundancy to skip redundant computation, at the cost of extra storage and motion-vector computation. This approach is application-specific (video only) and assumes the same operation is applied every frame.
+The hardware reason compression matters is not merely capacity. If a compressed activation tile fits in a local buffer but the dense tile does not, the accelerator may avoid DRAM reads. The storage win becomes a data-movement win.
 
-### Graph Neural Networks: structural sparsity
+Common misconception: compression alone guarantees speedup. Compression can reduce bytes moved, but if the compute engine must decompress into a dense stream and still execute dense MACs, the operation count may not fall. Speedup requires the compute path to exploit the sparse representation.
 
-GNNs operate on graphs (molecules, social networks, biological networks, financial graphs). The graph topology is encoded as an **adjacency matrix**, which is typically very sparse — most nodes are not connected to most other nodes. The GNN computation per layer is:
+Source note: compression requirements and benefits are slide-stated in L07 slide 11.
 
-> X_(l+1) = σ(Â · X_(l) · W_(l))
+### 3. Activation Sparsity: Natural Zeros From Data and Nonlinearities
 
-where Â is the normalized adjacency matrix (sparse), X is the node feature matrix (dense), and W is the weight matrix (dense). The order in which the two matrix multiplications are performed materially affects how sparsity is exploited: computing `Â × (X × W)` versus `(Â × X) × W` can lead to very different effective densities of the intermediate result.
+Activation sparsity refers to zeros in intermediate feature maps. L07 identifies three origins: ReLU, input correlations, and sparse input structure.
 
-> **Why it matters:** Activation sparsity in CNNs is structural — ReLU guarantees it. Approximately 75% of activations in a standard network like AlexNet are zero. Any accelerator targeting CNN inference can plan around this fact. GNNs and video models add additional structured sparsity, but with different hardware challenges.
+**ReLU:** if a pre-activation is negative, ReLU outputs zero. For the tiny matrix
 
----
+$$
+\begin{bmatrix}
+9 & -1 & -3\\
+1 & -5 & 5\\
+-2 & 6 & -1
+\end{bmatrix},
+$$
 
-## Chapter 3 — Weight Sparsity: Pruning DNN Models
+ReLU produces
 
-> *Slides: L07-24 … L07-51*
+$$
+\begin{bmatrix}
+9 & 0 & 0\\
+1 & 0 & 5\\
+0 & 6 & 0
+\end{bmatrix}.
+$$
 
-### Redundant weights and Gauss's trick
+Five of nine values are zero. In a convolution layer, each zero activation can eliminate many weight multiplications if the hardware can skip them.
 
-Before pruning, the lecture notes that weight redundancy can sometimes be exploited without accuracy loss. If two weights in a filter are equal (e.g., filter [A B A]), their corresponding inputs can be summed first, and only then multiplied by the weight — reducing 3 multiplies to 2. This is the idea behind **UCNN (ISCA 2018)**, which pre-processes weights to find and exploit such redundancies. The insight generalizes Gauss's multiplication algorithm (which trades multiplications for additions) to DNN convolutions.
+The slides report that AlexNet convolutional output feature maps after ReLU have about 75% zeros across the shown convolution layers. This is a slide-stated quantitative claim from L07 slide 10.
 
-### The pruning pipeline
+**Spatial correlation:** neighboring activations in an image feature map are often similar. Instead of processing full values, a system may process differences or deltas. If neighboring values are close, those deltas can be sparse. This is application- and representation-dependent.
 
-Modern network pruning is a four-stage iterative loop:
+**Temporal correlation:** consecutive video frames are similar. A system may reuse prior-frame computation or process motion/delta information, but it needs extra storage and a way to find redundancy. This is useful mainly when the same operation is applied repeatedly across time.
 
-![The pruning pipeline: scoring → grouping → ranking → fine-tuning → scheduling](../../assets/L07/L07-p29-pruning-pipeline.png)
+**Graph structure:** graph neural networks use adjacency matrices. Most real graphs are not complete, so adjacency matrices are usually sparse. A layer can be written as:
 
-**1. Scoring** — assign each weight (or group of weights) a score reflecting its importance to accuracy or efficiency:
-- **Magnitude-based pruning** (most common): the score is simply |w|. Large-magnitude weights are deemed important; small-magnitude ones are candidates for removal. Typical results: 50% sparsity without retraining, 80% with retraining [Han, NeurIPS 2015].
-- **Feature-based pruning**: score based on impact on the output feature map rather than weight magnitude [Yang, CVPR 2017].
+$$
+X^{(\ell+1)}=\sigma(\hat{A}X^{(\ell)}W^{(\ell)}),
+$$
 
-**2. Grouping** — decide the *granularity* of removal: individual weights, rows, channels, or entire filters. This is the structured/unstructured dimension.
+where $\hat{A}$ is a normalized sparse adjacency matrix, $X^{(\ell)}$ is the dense node-feature matrix, and $W^{(\ell)}$ is the dense weight matrix. The order of multiplication matters: $(\hat{A}X)W$ and $\hat{A}(XW)$ have the same mathematical result under associativity, but the intermediate density and memory traffic can differ.
 
-**3. Ranking** — sort weights (or groups) by their scores and select those below a threshold for removal.
+Hardware implication: activation sparsity is dynamic. The zero pattern can change with each input. Hardware needs runtime detection or a format that carries the positions of nonzeros.
 
-**4. Fine-tuning and scheduling** — after each pruning step, retrain the surviving weights to recover accuracy. The schedule determines how aggressively to prune each iteration. A key refinement: **splicing (Guo, NeurIPS 2016)** allows previously pruned weights to be *restored* if the gradient later indicates they are important, roughly halving the number of non-zero weights needed to maintain accuracy compared to irreversible pruning.
+Source note: ReLU, Cnvlutin, SnaPEA, PredictiveNet/Song, Diffy, temporal-correlation examples, and GNN setup are based on L07 slides 10-23. Only the slide deck was used for the cited architecture result numbers in this worker pass.
 
-The classic algorithm is **Optimal Brain Damage [LeCun, NeurIPS 1989]**: train → compute second derivatives for each weight → compute saliency → delete low-saliency weights → fine-tune → repeat.
+### 4. Weight Sparsity: Zeros Created by Model Design
 
-### Energy-aware scoring
+Weight sparsity refers to zeros in learned parameters. Unlike activation sparsity, weight sparsity can be fixed after training. That makes it easier to store compressed weights offline and plan mappings around them.
 
-A critical insight: **weight count alone is not a good proxy for energy**. The energy cost of a weight depends on *where it lives in the memory hierarchy* and *which dataflow is in use*. On a 65 nm process, the hierarchy is (as established in L01):
+The lecture first notes that weights may contain redundancy even before pruning. If a filter is $[A,B,A]$ and the input is $[1,2,3]$, dense processing computes:
 
-| Data source | Relative energy |
-|---|---|
-| Register File (RF) | 1× |
-| Neighbor PE (NoC) | 2× |
-| Global Buffer | 6× |
-| DRAM | 200× |
+$$
+A\cdot1+B\cdot2+A\cdot3.
+$$
 
-A weight in DRAM costs 200× more to access than one already in the register file. **Energy-aware pruning (EAP) [Yang, CVPR 2017]** directly incorporates this into the scoring metric: layers consuming most energy are pruned first.
+Because $A$ appears twice, we can rewrite:
 
-![Scoring with energy awareness — the energy cost depends on the memory hierarchy](../../assets/L07/L07-p32-energy-aware-scoring.png)
+$$
+A(1+3)+B\cdot2.
+$$
 
-The payoff is dramatic: EAP reduces AlexNet energy by **3.7×** vs. 2.1× for magnitude-based pruning, a **1.7× additional improvement**. The energy breakdown of GoogLeNet on slide L07-34 reveals why MAC count alone is misleading: output feature maps (43%), input feature maps (25%), and weights (22%) together vastly outweigh computation (10%) in total energy.
+This reduces three multiplications and three weight reads to two multiplications and two weight reads, at the cost of an extra addition and possibly a wider value entering the multiply. This example is directly based on L07 slide 26.
 
-### Platform-aware adaptation: NetAdapt
+This is not pruning yet. It exploits repeated weights. Pruning goes further by setting selected weights or groups to zero.
 
-Even energy is not always the right metric. **NetAdapt [Yang, ECCV 2018]** makes a deeper point: the relevant metric is **on-device latency or energy on the actual target platform**, measured empirically rather than estimated analytically. The reason is that the compiler, runtime, and hardware architecture all interact in ways that make the number of MACs a poor predictor of real latency.
+### 5. The Pruning Pipeline
 
-NetAdapt's algorithm:
-1. Start from a pretrained network.
-2. At each iteration, propose multiple simplified networks (by reducing channels or filters per layer).
-3. For each proposal, measure actual latency/energy on the target platform.
-4. Among proposals that meet the resource budget, select the one with highest accuracy.
-5. Fine-tune the selected network and repeat until the target budget is reached.
+The pruning pipeline has five conceptual pieces.
 
-The result: NetAdapt increases the real inference speed of MobileNet by up to **1.7×** with similar accuracy on ImageNet, tested on a Google Pixel 1 CPU. Critically, a version of NetAdapt guided by MAC count (rather than latency) achieves a better MAC vs. accuracy tradeoff — but this does *not* translate to lower latency. The takeaway: **use direct metrics**.
+**Scoring:** assign a score to a weight or group. Magnitude-based pruning uses $|w|$. Feature-based pruning estimates impact on output features. More advanced methods may use gradients, saliency, energy, or measured latency.
 
-### Structured vs. unstructured weight sparsity
+**Grouping:** decide the granularity. You may remove individual weights, rows, channels, filters, blocks, or patterns.
 
-The choice of pruning granularity — the **grouping** dimension of the pipeline — has profound hardware implications:
+**Ranking:** compare scores and choose what to remove.
 
-![Pruning granularity spectrum: from individual weights (fine-grained/unstructured) to entire filters (coarse-grained/structured)](../../assets/L07/L07-p42-structured-vs-unstructured.png)
+**Fine-tuning:** update the surviving weights to recover accuracy.
 
-Along a spectrum from fine to coarse:
+**Scheduling:** decide how aggressively to prune at each iteration.
 
-| Granularity | What is removed | Hardware benefit | Accuracy cost |
+A compact version of the loop is:
+
+```text
+train dense model
+repeat:
+    score weights or groups
+    remove the lowest-ranked weights or groups
+    fine-tune the remaining weights
+until target accuracy/energy/latency/storage budget is reached
+```
+
+The classic early method, Optimal Brain Damage, uses second-derivative saliency to estimate impact on training error before deletion. The slides cite LeCun, NeurIPS 1989 for this history.
+
+Source note: the pipeline follows L07 slides 27-30 and 46-48. Blalock et al., "What is the State of Neural Network Pruning?" Sections 2.1-2.4 provides the local-paper support for pruning masks, high-level prune/fine-tune algorithm, structure/scoring/scheduling/fine-tuning categories, and evaluation metrics.
+
+### 6. Energy-Aware and Platform-Aware Pruning
+
+Magnitude-based pruning asks, "Which weights look least important to accuracy?" Energy-aware pruning asks a different question: "Which removals reduce energy most for this hardware and dataflow?"
+
+This distinction matters because one weight is not equal to another in hardware cost. A weight fetched from DRAM is much more expensive than a weight already in a register file. A weight in a high-reuse layer may have a different energy impact than a weight in a layer with little reuse.
+
+L07 slide 32 gives a memory hierarchy energy table from Yang, CVPR 2017: ALU/RF as $1\times$, NoC as $2\times$, global buffer as $6\times$, DRAM as $200\times$. Treat these ratios as slide-stated values for the course example, not universal constants.
+
+The slides report that Energy-Aware Pruning reduces AlexNet energy by $3.7\times$ and improves over magnitude-based pruning by $1.7\times$ in the cited work. Source: L07 slide 35, citing Yang, CVPR 2017.
+
+Platform-aware pruning pushes the idea further. NetAdapt measures latency or energy on the actual target platform instead of relying only on MAC count. The lecture source uses this example to show that optimizing MACs can fail to optimize real latency. Source: L07 slides 37-41, citing Yang, ECCV 2018.
+
+Hardware implication: the pruning objective must match the deployment objective. If the goal is phone latency, measure phone latency. If the goal is accelerator energy, model or measure accelerator energy with the actual mapping and memory hierarchy.
+
+### 7. Structured vs. Unstructured Sparsity
+
+Grouping is the bridge between model accuracy and hardware regularity.
+
+**Unstructured sparsity:** remove individual weights. This offers maximum flexibility and often preserves accuracy well at a given sparsity level, but the zero pattern is irregular. Hardware needs indices, intersection, or sparse scheduling.
+
+**Structured sparsity:** remove rows, channels, filters, blocks, or fixed patterns. This is easier for dense SIMD, systolic, or vector hardware because the remaining computation has regular shapes. The cost is that removing an entire structure is a coarser model change and may hurt accuracy earlier.
+
+A useful way to read the granularity spectrum:
+
+| Granularity | What disappears | Hardware effect | Model risk |
 |---|---|---|---|
-| **Weight (unstructured)** | Individual scalar weights | Maximum compression | Minimum |
-| **Row pruning** | Entire rows of a weight matrix | Some vectorization | Moderate |
-| **Channel pruning** | Entire input channels | Eliminates whole MACs | Higher |
-| **Filter pruning** | Entire output filters | Dense submatrix remains | Highest |
+| Weight | individual scalar | highest irregularity, best flexibility | lower |
+| Row/block/pattern | small regular group | some vector regularity | moderate |
+| Channel | full input channel | removes repeated dense work | higher |
+| Filter | full output channel/filter | shrinks dense layer shape | higher |
 
-**Unstructured sparsity** offers the highest compression ratio and the least accuracy loss, but the resulting irregular zero pattern is hard to exploit in dense hardware. **Structured (coarse-grained) sparsity** produces regular zeros that map naturally onto SIMD units, systolic arrays, or other parallel data-path hardware — at the cost of accuracy for a given sparsity level.
+The slides cite Scalpel as pruning to match SIMD organization, pattern-based pruning as a middle ground, and mixture-of-experts as dynamic coarse-grained sparsity. These are slide-stated examples from L07 slides 43-45.
 
-**Scalpel [Yu, ISCA 2017]** bridges the gap by pruning to match the underlying hardware's data-parallel organization. For a 2-way SIMD unit, it ensures zeros appear in pairs, achieving 1.92× speedup over fully unstructured pruning.
+Common misconception: a model with 90% unstructured sparsity is automatically faster than a model with 50% structured sparsity. The first may have better compression but worse hardware utilization; the second may map to dense kernels and run faster.
 
-**Pattern-based pruning [PCONV, AAAI 2020; PatDNN, ASPLOS 2020]** takes a middle path: prune based on a small set of structured zero patterns within each filter, achieving better hardware regularity than unstructured pruning with less accuracy loss than channel/filter pruning.
+### 8. Pruning Interacts With Layer Type and Starting Architecture
 
-**Mixture-of-Experts (MoE)** models can also be understood as a form of coarse-grained sparsity: at inference time, only a small number of "expert" sub-networks are activated for any given input, leaving the rest idle.
+Pruning does not affect all layers equally. In AlexNet, the slides report larger weight reduction in fully connected layers than convolutional layers, and a smaller MAC reduction than weight reduction. Source: L07 slide 49, citing Han, NeurIPS 2015.
 
-### Pruning and accuracy: the interaction with model efficiency
+Modern efficient models are also harder to prune. If a model such as MobileNet or EfficientNet was already designed to remove redundancy, pruning may reduce accuracy faster than pruning an older overparameterized model. The slides explicitly state that accuracy drops more quickly for modern efficient DNN models and that an unpruned efficient model can outperform a pruned inefficient model. Source: L07 slides 50-51, citing Hoefler JMLR 2021 and Blalock MLSys 2020.
 
-Two important nuances close this chapter:
+Hardware implication: pruning is not a substitute for architecture design. It is one tool in a broader model-hardware co-design loop.
 
-![Accuracy drops more quickly when pruning efficient models](../../assets/L07/L07-p50-pruning-accuracy-tradeoff.png)
+### 9. Why Specialized Hardware Is Needed
 
-1. **Efficient models are harder to prune.** Modern compact models (MobileNets, EfficientNets) already have most redundancy removed by design. Pruning them causes accuracy to drop faster than pruning older, overparameterized models like AlexNet. The "free compression" gains are smaller the more optimized the starting model.
+L07 closes by noting that practical DNN sparsity is often on the order of 30-70%, while conventional sparse software libraries are designed for much higher sparsity levels. Source: L07 slide 52.
 
-2. **Starting from a better model matters more than pruning a worse one.** An unpruned efficient DNN model can outperform a pruned inefficient model at the same computational budget [Blalock, MLSys 2020]. The implication: **architecture search and pruning are complementary, not interchangeable strategies**.
+This explains why later lectures are needed. At 30-70% sparsity, zeros are common enough to matter but not so dominant that generic sparse libraries automatically win. Hardware must exploit moderate sparsity with low overhead.
 
-![An unpruned efficient model can outperform a pruned inefficient model](../../assets/L07/L07-p51-pruning-dnn-model.png)
+Specialized sparse hardware may need:
 
-> **Why it matters:** Pruning is the primary lever for creating weight sparsity, but its design space is vast — scoring, grouping, scheduling, fine-tuning, and the choice of starting model all interact. Energy-aware and platform-aware approaches (EAP, NetAdapt) systematically outperform naive magnitude-based methods because they target the right objective from the start.
+- compressed storage formats,
+- zero detection before fetch or before MAC,
+- gating to avoid useless switching,
+- metadata decode and address generation,
+- sparse intersection logic,
+- buffering for variable-rate nonzero streams,
+- load balancing across PEs,
+- mapping strategies that account for density.
 
 ---
 
-## Chapter 4 — The Hardware Gap and the Road Ahead
+## Worked Examples
 
-> *Slides: L07-52 … L07-53*
+### Example 1: Effectual Fraction
 
-### What the lecture concludes
+Suppose a dot product has $8$ weights and $8$ activations. The activation vector has zeros at positions 1, 4, and 7. The weight vector has zeros at positions 2 and 7.
 
-The summary slide crystallizes the key messages of L07:
+A MAC is ineffectual if either operand is zero. The zero-affected positions are $\{1,2,4,7\}$, so $4$ of $8$ MACs are ineffectual. The effectual fraction is $4/8=50\%$.
 
-![Summary — sparsity's benefits, typical sparsity levels, and the need for specialized hardware](../../assets/L07/L07-p52-summary.png)
+Hardware meaning: a dense PE performs all $8$ MACs. A sparse PE might perform only $4$, but only if it can identify and schedule the nonzero pairs efficiently.
 
-- Sparsity can reduce **number of operations, data movement, and storage cost** simultaneously.
-- **Fine-tuning** is essential: it allows the model to recover accuracy after weights are removed and to reach higher sparsity without accuracy collapse.
-- Practical DNN sparsity is **30–70%** — meaningful, but far below the >99% threshold at which existing dense software libraries (cuSPARSE, MKL-sparse) begin to show gains. Off-the-shelf software does not help here.
-- **Coarse-grained pruning** can also improve speed and storage cost without requiring custom sparse hardware.
-- Directly targeting hardware metrics (energy, latency) produces better accuracy vs. complexity tradeoffs than indirect proxies (operation count, weight count).
+### Example 2: Metadata Can Overwhelm Tiny Values
 
-### The missing piece: specialized hardware
+Suppose a sparse vector of length $16$ has four nonzeros. If each value is 8 bits and each index is 4 bits, the compressed representation stores $4(8+4)=48$ bits. The dense representation stores $16\cdot8=128$ bits. Compression helps.
 
-The final message of L07 is a forward pointer: **exploiting 30–70% sparsity requires specialized hardware**. Dense accelerators waste cycles and energy on zero multiplications even when the software knows the zeros are there. Efficiently skipping those zeros requires:
+If the vector has twelve nonzeros, compressed storage is $12(8+4)=144$ bits, worse than dense storage. This is why sparse format choice depends on density and metadata cost.
 
-- Detection of zero operands at the PE level (or before data is fetched).
-- Compression formats that allow non-zero values to be stored and retrieved without the overhead of their zero neighbors.
-- Load-balancing mechanisms that prevent idle PEs when one input stream is denser than another.
+### Example 3: Pruning Objective Changes the Answer
 
-These are exactly the topics of L08–L10.
+Suppose two candidate weights can be pruned with equal accuracy loss. Weight $w_1$ is fetched once from a local buffer. Weight $w_2$ is fetched many times from DRAM because the mapping provides little reuse. Magnitude pruning may treat them similarly if $|w_1| \approx |w_2|$. Energy-aware pruning should prefer removing $w_2$ because it saves more movement.
 
-> **Why it matters:** Without hardware support, sparsity is theoretical. With the right hardware (the subject of the next three lectures), 30–70% weight or activation sparsity translates directly into near-proportional reductions in energy and execution time.
+---
+
+## Key Equations and How to Read Them
+
+### Sparsity and Density
+
+$$
+\text{sparsity}=\frac{\#\text{zeros}}{\#\text{total values}}, \qquad
+\text{density}=1-\text{sparsity}.
+$$
+
+Sparsity tells you the opportunity size. Density tells you how much useful work remains. Hardware cost depends on both plus metadata and load balance.
+
+### Effectual Operation Accounting
+
+$$
+\text{actual operations}
+=\text{effectual operations}+\text{unexploited ineffectual operations}.
+$$
+
+The goal of sparse hardware is to reduce the second term without making each remaining operation too expensive.
+
+### GNN Layer
+
+$$
+X^{(\ell+1)}=\sigma(\hat{A}X^{(\ell)}W^{(\ell)}).
+$$
+
+$\hat{A}$ is sparse graph structure. $X^{(\ell)}$ and $W^{(\ell)}$ are often dense. Mapping must decide whether to multiply by $\hat{A}$ early or late, because intermediate density affects memory traffic.
+
+### Pruned Model Mask
+
+$$
+f(x;M\odot W)
+$$
+
+$M$ is a binary mask and $W$ is the weight tensor. If $M_i=0$, weight $W_i$ is pruned. This notation is based on Blalock et al., Section 2.1.
+
+---
+
+## Hardware Implications
+
+**Energy:** skipping a zero can save compute energy and data movement energy, but metadata and control consume energy.
+
+**Bandwidth:** compressed tensors can reduce bandwidth, but irregular nonzero streams may create bursty or hard-to-coalesce accesses.
+
+**Latency:** skipping work can reduce latency only if the scheduler avoids bubbles and load imbalance.
+
+**Area:** sparse support needs extra hardware: decoders, comparators, masks, queues, arbiters, or intersection units.
+
+**Utilization:** random sparsity can leave PEs idle unless work is dynamically balanced.
+
+**Correctness:** pruning can change model outputs; activation skipping must preserve exact dense semantics unless approximate inference is intended.
+
+**Programmability:** sparse mappings are harder to specify because format, mapping, and architecture interact.
+
+---
+
+## Common Misconceptions
+
+### Misconception: Data movement is saved automatically when values are zero.
+
+The system saves movement only if zeros are not fetched or if compressed storage avoids moving them. If zeros are fetched in dense format and discarded at the PE, DRAM bandwidth was already spent.
+
+### Misconception: Higher sparsity always means faster execution.
+
+Higher sparsity can mean less work, but it may also mean more irregularity, metadata overhead, and load imbalance. Granularity matters.
+
+### Misconception: Weight count is a good energy metric.
+
+Different weights can cause different memory traffic depending on layer shape, reuse, and dataflow. Energy-aware pruning exists because weight count alone is not enough.
+
+### Misconception: Pruning an inefficient model is equivalent to designing an efficient model.
+
+Pruning can help, but starting from a better architecture can dominate. L07 explicitly points to cases where an unpruned efficient model outperforms a pruned inefficient one.
+
+---
+
+## Connections to Previous and Later Lectures
+
+**L01-L03:** energy and memory hierarchy motivate why skipping movement can matter more than skipping MACs.
+
+**L05-L06:** pruning energy depends on mapping; the same zero may save different memory levels under different dataflows and partitions.
+
+**L08-L10:** these lectures provide the accelerator mechanisms for exploiting sparse weights and activations.
+
+**L12:** precision and sparsity are complementary compression axes: one reduces bits per value, the other reduces number of represented values.
+
+**L13:** calculating data motion for sparse workloads requires counting nonzeros, metadata, and movement across each memory level.
+
+---
+
+## Paper Bridge: Computing's Energy Problem
+
+### Bibliographic identity
+
+- **Title:** "Computing's Energy Problem (and what we can do about it)"
+- **Author:** Mark Horowitz
+- **Year / venue:** ISSCC 2014
+- **Used in lecture(s):** Supports L01/L03 memory-energy themes and L07's motivation for avoiding data movement.
+
+### Problem addressed
+
+The paper explains why energy, not just transistor count or peak operations, became a central computing constraint. It emphasizes that memory movement can dominate energy.
+
+### Core idea
+
+Energy-efficient systems require locality and specialization. DRAM accesses are much more expensive than internal cache accesses or functional operations, so algorithms and hardware should maximize reuse and avoid unnecessary movement.
+
+### Relevance to this lecture
+
+Sparsity is attractive partly because zeros need not move. Horowitz provides the energy context for why avoiding a DRAM fetch of a zero can matter more than avoiding a single arithmetic operation.
+
+### Key claims used in this chapter
+
+- DRAM access energy is listed as roughly 1-2 nJ, while an internal cache access or functional operation is around 10 pJ. Source: Horowitz ISSCC 2014, Section 5 "Don't Forget the Memory Energy."
+- Energy-efficient computation requires strong locality and many operations per memory fetch. Source: Horowitz ISSCC 2014, Sections 5-6.
+
+### What students should remember
+
+- Sparse acceleration is as much about memory movement as arithmetic.
+- A zero fetched from DRAM has already cost energy.
+- Locality and format choices determine whether sparsity becomes a real hardware benefit.
+
+### Limitations and assumptions
+
+The numerical energy values are technology- and system-dependent. Use them as scale intuition, not universal constants.
+
+### Suggested insertion points
+
+Reference this paper when explaining compression, energy-aware pruning, and why skipping a zero late in the PE is less valuable than never moving it.
+
+---
+
+## Paper Bridge: What is the State of Neural Network Pruning?
+
+### Bibliographic identity
+
+- **Title:** "What is the State of Neural Network Pruning?"
+- **Authors:** Davis Blalock, Jose Javier Gonzalez Ortiz, Jonathan Frankle, John Guttag
+- **Year / venue:** MLSys 2020
+- **Used in lecture(s):** L07 pruning methodology and evaluation discipline.
+
+### Problem addressed
+
+The paper asks whether the pruning literature has reliable, comparable evidence about which methods work best. It finds that inconsistent datasets, architectures, metrics, and baselines make comparison difficult.
+
+### Core idea
+
+The paper frames pruning as applying a binary mask to a model, then compares pruning methods by structure, scoring, scheduling, fine-tuning, and evaluation metrics. It argues for standardized benchmarking and introduces ShrinkBench.
+
+### Relevance to this lecture
+
+L07 teaches the pruning design space. Blalock et al. explain why that design space must be evaluated carefully: parameter count, FLOPs, theoretical speedup, latency, and accuracy are not interchangeable.
+
+### Key claims used in this chapter
+
+- A pruned model can be represented as $f(x;M\odot W')$, where $M$ is a binary mask. Source: Blalock et al., Section 2.1.
+- Many pruning strategies follow train, score/prune, fine-tune, iterate. Source: Algorithm 1 and Section 2.2.
+- Methods differ mainly in structure, scoring, scheduling, and fine-tuning. Source: Section 2.3.
+- Evaluation goals differ; parameter count and FLOPs are loose proxies for latency, throughput, memory usage, and power. Source: Section 2.4.
+- The paper identifies inconsistent metrics and benchmarking as a major problem in pruning research. Source: abstract and Section 5.2.
+
+### What students should remember
+
+- Pruning is not one method; it is a family of choices.
+- Always ask what metric a pruning result optimizes.
+- A sparse model should be evaluated across an accuracy-efficiency curve, not by one cherry-picked point.
+- Hardware-facing pruning should report direct metrics when possible.
+
+### Limitations and assumptions
+
+The paper is a pruning survey and benchmarking study, not a sparse accelerator architecture paper. It supports pruning methodology and evaluation discipline, not a particular hardware mechanism.
+
+### Suggested insertion points
+
+Use this bridge in the pruning pipeline section, the direct-metrics discussion, and the warning about efficient architectures versus pruned inefficient ones.
 
 ---
 
 ## Standalone Study Guide
 
-### What to master before moving on
+### How to study this lecture
 
-- Separate activation sparsity, weight sparsity, and structural sparsity.
-- Explain why ReLU creates natural activation zeros while pruning creates model-weight zeros.
-- Describe the pruning pipeline: train, score, prune, fine-tune, and evaluate.
-- Explain the accuracy-hardware trade-off between unstructured and structured pruning.
+1. Start with effectual vs. ineffectual operations.
+2. Separate activation sparsity from weight sparsity.
+3. For each sparsity source, ask whether the zero pattern is known before runtime.
+4. For each pruning strategy, ask what metric it optimizes.
+5. For each sparse representation, estimate metadata and load-balance cost.
 
 ### Self-check questions
 
-1. Why does activation sparsity vary with input data while weight sparsity can be fixed after training?
-2. What is the difference between pruning a value, a channel, and a block?
-3. Why might the most accurate sparse model be hard for hardware to accelerate?
+1. What is the difference between sparsity and density?
+2. Why does ReLU create activation sparsity?
+3. Why does skipping a zero at the PE save less than never fetching that zero?
+4. Why can splitting pruning by weight magnitude miss energy opportunities?
+5. What is the difference between unstructured and structured sparsity?
+6. Why are MAC count and latency not interchangeable metrics?
+7. Why do L08-L10 need specialized hardware mechanisms?
 
 ### Exercises
 
-1. Sketch a pruning experiment for one CNN layer: choose a scoring rule, sparsity target, and fine-tuning step.
-2. Compare magnitude pruning and energy-aware pruning in terms of what objective each optimizes.
-3. Given a target sparsity, propose whether unstructured, block, channel, or N:M pruning is most hardware-friendly.
-
-### Common traps
-
-- Assuming sparsity automatically saves time. It saves time only when the hardware can skip work.
-- Comparing sparsity percentages without specifying granularity.
-- Forgetting that pruning can change accuracy and therefore belongs to model-hardware co-design.
+1. **Conceptual:** Explain effectual and ineffectual operations using a two-element dot product.
+2. **Small calculation:** A vector has 64 entries, 20 nonzeros, 8-bit values, and 6-bit indices. Compare dense and coordinate-list storage.
+3. **Design tradeoff:** Pick one layer and decide whether weight pruning or activation skipping is easier to exploit. State your assumptions.
+4. **Pruning pipeline:** Design a pruning loop for a small MLP. Specify scoring, grouping, ranking, fine-tuning, and stopping criterion.
+5. **Paper-reading bridge:** From Blalock et al., explain why reporting only parameter reduction can be misleading.
+6. **Architecture reasoning:** Design a PE-level zero-skipping mechanism and list one benefit and one overhead.
 
 ---
 
 ## Key Terms
 
-| Term | Gloss |
-|---|---|
-| **Sparsity** | The fraction of values in a tensor that are zero (or below some threshold). High sparsity = many zeros. |
-| **Density** | The complement of sparsity: fraction of *non-zero* values. A 75%-sparse tensor has 25% density. |
-| **Activation sparsity** | Zeros in intermediate feature maps, arising primarily from ReLU. |
-| **Weight sparsity** | Zeros in learned model parameters, primarily created by pruning. |
-| **Effectual operation** | A multiply-accumulate that changes the output (neither operand is zero). |
-| **Ineffectual operation** | A multiply-accumulate where at least one operand is zero; the result is always 0 or unchanged. |
-| **Pruning** | The process of setting model weights to zero (or removing them) to reduce computation and storage. |
-| **Magnitude-based pruning** | Remove weights with the smallest absolute values; the most common scoring method. |
-| **Energy-aware pruning (EAP)** | Incorporate the energy cost of weight access (determined by its location in the memory hierarchy) into the pruning score. |
-| **Saliency** | A measure of how much a weight's removal impacts training error (from Optimal Brain Damage). |
-| **Fine-tuning** | Retraining the surviving weights after pruning to recover lost accuracy. |
-| **Splicing** | Allowing previously pruned weights to be restored during fine-tuning if they become important again. |
-| **Scheduling** | Deciding how many weights to prune in each iteration of the pruning loop. |
-| **Unstructured sparsity** | Zeros scattered at arbitrary locations (individual weights). Highest flexibility, hardest for hardware. |
-| **Structured sparsity** | Zeros in regular patterns (whole rows, channels, or filters). Easier for hardware, higher accuracy cost. |
-| **Pattern-based pruning** | A middle-ground approach: prune based on a small set of structured zero patterns within filters. |
-| **NetAdapt** | A platform-aware DNN adaptation algorithm that uses empirical latency/energy measurements to guide pruning. |
-| **Cnvlutin** | A hardware architecture (ISCA 2016) that skips zero-activation multiplications in convolutions. |
-| **SnaPEA** | A predictor (ISCA 2018) that terminates partial-sum computation early when the ReLU output is predictably zero. |
-| **Mixture of Experts (MoE)** | A model architecture that activates only a subset of "expert" sub-networks per input; a form of dynamic coarse-grained sparsity. |
-| **GNN** | Graph Neural Network — operates on sparse adjacency matrices, a structural form of sparsity. |
+### Sparsity
+
+The fraction of tensor values that are zero or otherwise repeated enough to exploit. In this lecture it usually means zeros.
+
+### Density
+
+The fraction of values that are nonzero. A 70% sparse tensor has 30% density.
+
+### Effectual operation
+
+A computation that changes the output. In a MAC, it usually means both operands matter.
+
+### Ineffectual operation
+
+A computation involving a zero that does not change the result. Sparse hardware tries to skip these.
+
+### Activation sparsity
+
+Zeros in intermediate activations. Often dynamic and input-dependent, especially with ReLU.
+
+### Weight sparsity
+
+Zeros in model parameters. Usually created by pruning and often known before inference.
+
+### Compression format
+
+A representation that stores nonzeros plus metadata. It matters because metadata can erase savings at moderate density.
+
+### Pruning
+
+Removing weights or groups of weights, often by applying a binary mask and fine-tuning the remaining model.
+
+### Scoring
+
+Assigning importance values to weights or groups before pruning.
+
+### Grouping
+
+Choosing the granularity of pruning: individual weights, blocks, rows, channels, filters, or patterns.
+
+### Ranking
+
+Ordering scored weights or groups to decide what to remove.
+
+### Fine-tuning
+
+Retraining the remaining weights after pruning to recover accuracy.
+
+### Scheduling
+
+Choosing how many weights or groups to prune at each iteration.
+
+### Unstructured sparsity
+
+Arbitrary individual zeros. Flexible for the model, hard for hardware.
+
+### Structured sparsity
+
+Zeros arranged in regular groups. Easier for hardware, often more restrictive for accuracy.
+
+### Energy-aware pruning
+
+Pruning that scores removals partly by their energy impact, not only by weight magnitude or accuracy.
+
+### Platform-aware pruning
+
+Pruning or adapting a network using direct measurements such as latency or energy on the target platform.
+
+### Metadata
+
+Extra information needed to locate nonzeros, such as indices, masks, or run lengths.
 
 ---
 
 ## Takeaways
 
-- DNN tensors contain large fractions of zeros: ~**75% of AlexNet's convolutional activations** are zero after ReLU; weight pruning can create **50–80% weight sparsity** without significant accuracy loss.
-- Sparsity yields two hardware benefits: **reduced data movement/storage** (skip fetching zeros) and **reduced computation** (skip multiply-accumulates with a zero operand).
-- The **effectual/ineffectual operation** framework precisely defines the opportunity: actual hardware captures only the fraction of that opportunity that its complexity budget allows.
-- **Pruning** is a four-stage iterative loop: **scoring → grouping → ranking → fine-tuning**. Scheduling controls how aggressively to prune per iteration.
-- **Energy-aware scoring** (EAP) outperforms magnitude-based scoring by **1.7×** on AlexNet energy because it targets the actual objective, not a proxy.
-- **MAC count is a poor proxy** for real latency (NetAdapt): always measure on the actual platform.
-- **Unstructured sparsity** gives the most compression but is the hardest for hardware; **structured sparsity** trades some accuracy for hardware regularity.
-- Practical DNN sparsity is **30–70%** — standard software libraries do not help; **specialized hardware is required**.
-- Starting from a well-designed efficient model matters as much as pruning: an unpruned efficient model can beat a pruned inefficient one at the same compute budget.
+- Sparsity creates the possibility of saving storage, data movement, and computation.
+- Effectual/ineffectual accounting separates mathematical opportunity from what hardware actually skips.
+- Activation sparsity is often dynamic; weight sparsity can often be fixed after training.
+- Pruning is a pipeline of scoring, grouping, ranking, fine-tuning, and scheduling.
+- The right pruning metric depends on the deployment objective.
+- Unstructured sparsity favors model flexibility; structured sparsity favors hardware regularity.
+- Moderate DNN sparsity requires specialized hardware support to become reliable speedup or energy savings.
 
 ---
 
-## Connections to Later Lectures
+## Connections
 
-- **L08–L10 (Sparse Architectures):** The direct sequel. L07 establishes the *source and magnitude* of sparsity; L08–L10 show how hardware (Eyeriss v2, SCNN, ExTensor, and others) is designed to detect, compress, and exploit it efficiently.
-- **L01 Pyramid of Concerns — Format layer:** Weight and activation sparsity are manifestations of the **Format** layer. Choosing whether to use a dense or compressed representation, and at what granularity, is a Format-layer decision that interacts with the Mapping and Architecture layers above and below it.
-- **L01 Energy hierarchy:** The entire motivation for energy-aware pruning (EAP) and platform-aware adaptation (NetAdapt) traces back to the L01 insight that DRAM access costs ~200× an ALU operation. Skipping a zero-weight fetch from DRAM saves 200× the energy of the skipped multiply.
-- **L05–L06 (Mapping / Partitioning):** The energy cost of a weight access in EAP depends on the dataflow (mapping): different loop orderings cause the same weight to be read from DRAM, the global buffer, or the register file. Pruning scores that ignore this are suboptimal.
-- **L12 (Precision):** Reduced precision (quantization) and sparsity are complementary compression techniques: both reduce the bit-width and count of values that need to be stored and moved. Many production accelerators combine them.
+L07 connects to L01-L03 through memory energy, to L05-L06 through mapping-dependent reuse, to L08-L10 through sparse accelerator mechanisms, to L12 through precision/compression tradeoffs, and to L13 through explicit data-movement accounting. The unifying question is: when a value is zero, which layer of the stack knows it soon enough to avoid cost?
 
 ---
 
-## Appendix — Slide-to-Section Map
+## Appendix - Slide-to-Section Map
 
-| Slides | Section |
-|---|---|
-| L07-1 | Title |
-| L07-2 … L07-8 | Ch.1 — What Sparsity Buys (and What It Costs) |
-| L07-9 … L07-23 | Ch.2 — Activation Sparsity: Where Natural Zeros Come From |
-| L07-24 … L07-51 | Ch.3 — Weight Sparsity: Pruning DNN Models |
-| L07-52 … L07-53 | Ch.4 — The Hardware Gap and the Road Ahead |
+| Slide range | Chapter section | Notes |
+|---|---|---|
+| L07-1 | Title and metadata | Lecture identity |
+| L07-2-L07-8 | Sparsity creates effectual and ineffectual work | Expanded with hardware-overhead explanation |
+| L07-9-L07-17 | Activation sparsity | ReLU, compression, activation skipping, correlation |
+| L07-18-L07-23 | Graph sparsity | GNN notation and operation-order discussion |
+| L07-24-L07-26 | Weight redundancy | Gauss/UCNN-style repeated-weight intuition |
+| L07-27-L07-31 | Pruning pipeline | Scoring and classic pruning |
+| L07-32-L07-41 | Energy/platform-aware pruning | Expanded with direct-metric reasoning |
+| L07-42-L07-45 | Structured vs. unstructured sparsity | Expanded with granularity tradeoff |
+| L07-46-L07-48 | Ranking, fine-tuning, scheduling | Integrated into pruning pipeline |
+| L07-49-L07-51 | Interplay with layer type and model architecture | Expanded with Blalock connection |
+| L07-52-L07-53 | Summary and readings | Used for takeaways and paper bridge |
+
+---
+
+## Source Notes
+
+- The lecture ordering follows `Lecture/L07 - Sparsity.pdf`.
+- The effectual/ineffectual operation definitions, sparsity sources, ReLU/AlexNet activation sparsity, activation-sparsity architecture examples, GNN setup, pruning pipeline, energy-aware pruning examples, NetAdapt examples, structured-pruning examples, and summary sparsity range are based on L07 slides 2-53.
+- Quantitative claims such as ~75% zeros in AlexNet feature maps, Cnvlutin speedup/area overhead, Minerva speed/power results, Energy-Aware Pruning energy improvements, NetAdapt latency improvements, Han pruning reductions, and 30-70% practical sparsity are slide-stated claims from L07 and should be checked against their original papers before reuse outside this companion.
+- The memory-energy motivation uses `papers/L07_ComputingsEnergyProblem_Horowitz_ISSCC2014.pdf`, especially Section 5.
+- The pruning methodology and evaluation discipline use `papers/L16_StateOfPruning_Blalock_MLSys2020.pdf`, especially Sections 2.1-2.4 and 5.2.
+- Worked examples are original teaching examples.
+
+## Uncertainty Notes
+
+- Several architecture examples cited by the slides, including Cnvlutin, Minerva, SnaPEA, Diffy, UCNN, EAP, NetAdapt, Scalpel, PCONV, and PatDNN, were not independently checked against local PDFs in this worker pass.
+- The chapter does not remove existing slide-derived assets under `assets/L07`; it avoids adding new copied figures.
+- Exact sparse-hardware mechanisms are intentionally deferred to L08-L10.

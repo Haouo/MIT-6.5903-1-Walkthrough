@@ -1,459 +1,606 @@
 # L08 — Sparse Architectures
 
 > **Course:** 6.5930/1 — Hardware Architectures for Deep Learning
-> **Instructors:** Joel Emer & Vivienne Sze (MIT EECS)
-> **Lecture date:** March 2, 2026 · **Slides:** 96 · **Source:** [`Lecture/L08 - Sparse Architectures.pdf`](../../Lecture/L08%20-%20Sparse%20Architectures.pdf)
->
-> *This is a conceptual walkthrough that reconstructs the lecture's narrative from the slides. It is organized by idea, not slide-by-slide. Each section cites the slide range it draws from so you can follow along with the original deck.*
+> **Instructors:** Joel Emer and Vivienne Sze
+> **Lecture date:** March 2, 2026
+> **Primary source:** [`Lecture/L08 - Sparse Architectures.pdf`](../../Lecture/L08%20-%20Sparse%20Architectures.pdf)
+
+This chapter reconstructs the lecture narration from the public slides and local papers. It avoids copied slide or paper figures; diagrams are described textually or redrawn as small original examples.
 
 ---
 
 ## TL;DR
 
-Modern DNNs are **sparse**: many of their weights and activations are zero, so roughly half (or more) of all multiply-accumulate operations are *ineffectual* — they contribute nothing to the result. The question is not whether to exploit sparsity, but *how* and at *what cost*. This lecture introduces three hardware strategies — **gating**, **skipping**, and **compressed-format representation** — collectively called **Sparse Acceleration Features (SAFs)**. It works out *exactly* how many reads and cycles each strategy saves on a concrete 1-D dot-product example, derives the tradeoffs between different **representation formats** (Uncompressed, Bitmask, Coordinate Payload, Run-Length Encoding), then moves on to **structured sparsity**, **Hierarchical Structured Sparsity (HSS)**, and finally the thorny problem of **tiling sparse tensors** — where overbooking strategies such as **Tailors + Swiftiles** are needed to maximize buffer utilization. Throughout, concrete accelerator designs (Eyeriss, SCNN, ExTensor, HighLight) illustrate how academic theory has been put into silicon.
+Sparsity is attractive because zero operands create **ineffectual work**: compute, reads, writes, and interconnect traffic that cannot change the output. The hard part is that zeros are not just "missing values." They create irregular control flow, variable tile occupancy, metadata, intersection logic, and load imbalance.
 
----
+Lecture 08 introduces three sparse acceleration features:
+
+- **Gating:** detect a zero and idle the relevant hardware for that cycle. This saves energy, but the dense schedule still consumes the cycle.
+- **Skipping:** move directly to the next useful coordinate. This saves energy and time, but requires metadata and traversal hardware.
+- **Format:** encode sparse tensors so zeros are not stored or moved. This saves capacity and bandwidth, but metadata can become the bottleneck.
+
+The lecture then expands from unstructured formats to structured sparsity, hierarchical structured sparsity (HSS), and sparse tiling. The architectural lesson is blunt: sparsity only helps when the saved work exceeds the cost of finding, representing, routing, and balancing the nonzeros.
+
+## What Problem This Lecture Solves
+
+Dense DNN accelerators assume regular arrays: every loop iteration fetches operands, performs a MAC, updates a partial sum, and advances to the next coordinate. Sparse tensors break that assumption. If an activation or weight is zero, the corresponding multiplication is unnecessary, but the accelerator must know that before spending energy or time.
+
+This lecture solves the first half of the sparse architecture problem:
+
+1. How do we define which operations are useful?
+2. How can hardware avoid reading or computing zero operands?
+3. How should sparse data be represented?
+4. Why does structured sparsity simplify hardware?
+5. Why does tiling become difficult when nonzero counts vary across tiles?
+
+Lecture 09 will use these ideas to build concrete sparse convolution dataflows.
+
+## Why This Lecture Matters
+
+Sparse acceleration is not a small optimization sitting after the dataflow design. It changes the meaning of memory layout, loop order, PE utilization, and tile sizing. A dense dataflow asks, "Which operand should stay near the PE?" A sparse dataflow also asks, "Which operand can reveal the next useful coordinate cheaply?"
+
+For hardware architects, sparsity affects:
+
+- **Energy:** fewer value reads, fewer metadata-dependent reads, fewer MACs, and fewer partial-sum updates.
+- **Latency:** skipping can reduce cycle count, but gating cannot.
+- **Bandwidth:** compression can reduce DRAM and SRAM traffic, but metadata must also move.
+- **Area:** sparse decoders, intersection units, metadata buffers, and flexible routers consume silicon.
+- **Utilization:** nonzero counts vary, so PEs may receive unequal work.
+- **Programmability:** the same mathematical tensor may need different formats depending on the loop order.
+
+Source note: these motivations follow Lecture 08 slides 2-7 and 25-26; the broader statement about sparse accelerator modeling is consistent with TeAAL Section 2.3.
+
+## Prerequisites and Mental Model
+
+You should be comfortable with:
+
+- A MAC computing \(o \leftarrow o + a \times b\).
+- A dot product \(Z = \sum_k A_k B_k\).
+- Density \(d\), the fraction of stored coordinates that are nonzero.
+- Dataflow, meaning the loop order and placement of weights, activations, and partial sums across memory and PEs.
+
+The central mental model is:
+
+> A sparse accelerator is a dense accelerator plus a **coordinate machine**.
+
+The dense part still multiplies values. The coordinate machine decides which coordinates should be visited, where their payloads live, and which output coordinate receives the result.
 
 ## Learning Objectives
 
-After this lecture you should be able to:
+After this lecture, you should be able to:
 
-- Explain the two root sources of sparsity in DNNs (**activation sparsity** from ReLU and **weight sparsity** from pruning) and define *effectual* vs. *ineffectual* operations.
-- Distinguish **gating** from **skipping** and state precisely what each saves (energy only vs. energy and time).
-- Explain **single-sided** vs. **dual-sided** intersection and derive the read/cycle counts for each case.
-- Name the four canonical representation formats (Uncompressed, Bitmask, Coordinate Payload, Run-Length Encoding) and compare their **compression efficiency** vs. **access efficiency** across the density spectrum.
-- Contrast **unstructured** and **structured** sparsity, and explain how **G:H sparsity** (e.g., NVIDIA's 2:4) and **Hierarchical Structured Sparsity (HSS)** extend the sparsity-degree spectrum while keeping hardware simple.
-- Describe the **uniform-occupancy vs. uniform-shape** tiling dilemma and explain how **overbooking with Tailors + Swiftiles** resolves it for ExTensor-style sparse accelerators.
+- Define effectual and ineffectual operations.
+- Distinguish total operations from total operations performed.
+- Explain gating, skipping, and format as separate sparse acceleration features.
+- Compare single-sided and dual-sided intersection.
+- Compute small read/cycle counts for a sparse dot product.
+- Compare uncompressed, bitmask, coordinate-payload, and run-length formats by compression efficiency and access efficiency.
+- Explain why metadata can dominate unstructured sparse storage.
+- Explain the flexibility/efficiency tradeoff in structured sparsity.
+- Compute the effective density of a hierarchical structured sparsity pattern.
+- Explain sparse tiling, tile occupancy, overbooking, Tailors, and Swiftiles at the conceptual level.
+- Connect sparse formats to later fibertree and sparse dataflow lectures.
 
----
+## Main Textbook-Style Narrative
 
-## Chapter 1 — Why Sparsity Matters (and Why It's Hard)
+### 1. From zeros to ineffectual work
 
-> *Slides: L08-1 … L08-8*
+Lecture 08 begins with two sources of sparsity:
 
-### Two sources of zeros
+- **Activation sparsity:** ReLU, input correlations, graph-like representations, and other input-dependent effects can produce zeros in activations.
+- **Weight sparsity:** pruning can set trained weights to zero.
 
-Sparsity arises from two largely independent phenomena:
+The useful distinction is not "zero vs. nonzero" alone, but **effectual vs. ineffectual operation**.
 
-- **Activation (input) sparsity** — the ReLU nonlinearity clamps every negative value to zero, often leaving 50–80% of feature-map values at zero. Correlation in the input data and structure in certain representations (e.g., graph adjacency matrices) can drive activation sparsity even higher.
-- **Weight sparsity** — network pruning (Han et al., NeurIPS 2015) removes small-magnitude weights, producing models where 50–90% of parameters are structurally zero without significant accuracy loss.
+For a multiplication, an operation is effectual only if both operands are nonzero. If either operand is zero, \(a \times b = 0\), so the multiplication does not change the partial sum. For an addition, adding zero is also ineffectual because \(x + 0 = x\).
 
-The two types compound: a pruned weight multiplied by a zero activation is doubly ineffectual.
+Lecture 08 uses two counts:
 
-### The arithmetic of ineffectual operations
+- \(N_\text{total} = N_\text{effectual} + N_\text{ineffectual}\).
+- \(N_\text{performed} = N_\text{effectual} + N_\text{unexploited ineffectual}\).
 
-The lecture formalizes two counts:
+The goal is not merely to have sparse tensors. The goal is to reduce \(N_\text{unexploited ineffectual}\) without making each remaining operation so expensive that the accelerator loses.
 
-- **Total operations** = effectual operations + **ineffectual operations**
-- **Total operations performed** = effectual operations + **unexploited** ineffectual operations
+### 2. Irregularity is the price of exploiting sparsity
 
-Any operation involving a zero is ineffectual: `anything × 0 = 0` and `anything + 0 = anything`. These contribute nothing to the final output but consume storage bandwidth, PE cycles, and energy if the hardware does not detect and suppress them. The goal of sparse acceleration is to drive *unexploited ineffectual operations* toward zero — but doing so is not free.
+Dense tensors are regular: the \(k\)-th loop iteration usually maps to the \(k\)-th stored value. Sparse tensors break this:
 
-### The irregularity problem
+- The number of nonzeros can vary across vectors, rows, channels, tiles, and layers.
+- The positions of nonzeros may be unknown until metadata is decoded.
+- A PE assigned to a dense sparse tile may run longer than a PE assigned to an empty sparse tile.
+- A compressed tensor may require metadata reads before value reads.
 
-Exploiting sparsity makes processing **irregular**. Non-zero counts vary within and across tensors, causing:
+This is why Lecture 08 says exploiting sparsity makes processing irregular. The accelerator saves work only after paying for metadata, decoding, coordinate arithmetic, intersection, and scheduling.
 
-- **Variation in cycles** — different tiles finish at different times, leaving PEs idle.
-- **Variable storage demand** — compressed tiles have different sizes, complicating buffer management.
-- **Unknown non-zero locations** — the hardware must discover or pre-compute where the non-zeros reside.
+### 3. Sparse Acceleration Features: gating, skipping, format
 
-The irregularity problem motivates every design choice in this lecture.
+The lecture organizes sparse hardware mechanisms as **Sparse Acceleration Features (SAFs)**:
 
-![Sparse Acceleration Feature (SAF) taxonomy — gating, skipping, format](../../assets/L08/L08-p07-saf-overview.png)
+| SAF | What it does | Saves energy? | Saves cycles? | Needs sparse metadata before the cycle? |
+|---|---|---:|---:|---:|
+| Gating | Detect a zero and idle some hardware for that cycle | Yes | No | Usually no |
+| Skipping | Jump directly to useful nonzero coordinates | Yes | Yes | Yes |
+| Format | Store and move only useful payloads plus metadata | Yes | Sometimes | Yes, for skipping |
 
-> **Why it matters:** Both training-side (pruning) and inference-side (ReLU) produce zero-rich tensors. A hardware design that ignores this is wasting at least half its memory bandwidth and compute cycles on useless work — which, given that DRAM access costs ~200× an ALU operation, translates directly into energy and time wasted.
+The key transition is: gating can discover zeros during the dense schedule; skipping must already know where to jump. That is why representation format becomes an architectural concern instead of a software detail.
 
----
+### 4. The dot-product example
 
-## Chapter 2 — Gating vs. Skipping: The Two Modes of Sparse Acceleration
+Use the lecture's 1-D dot product:
 
-> *Slides: L08-9 … L08-22*
-
-### The running example
-
-The lecture uses a 1-D dot product of two 6-element vectors to build intuition:
-
+```text
+A = [0, 0, c, d, 0, f]
+B = [g, h, 0, j, k, l]
+Z = A dot B = d*j + f*l
 ```
-A = [ 0  0  c  d  0  f ]
-B = [ g  h  0  j  k  l ]
-Z = A · B = c·0 + d·j + f·l = dj + fl
+
+There are six algorithmic multiply positions, but only coordinates \(3\) and \(5\) are effectual. The nonzero coordinate sets are \(A_\text{nz} = \{2,3,5\}\) and \(B_\text{nz} = \{0,1,3,4,5\}\). Their intersection is \(\{3,5\}\).
+
+The strategies differ:
+
+| Strategy | Cycles | A value reads | B value reads | Computes performed | Explanation |
+|---|---:|---:|---:|---:|---|
+| Dense baseline | 6 | 6 | 6 | 6 | Visit every coordinate |
+| Gate \(B \leftarrow A\) | 6 | 6 | 3 | 3 | A is leader; B is read only when A is nonzero |
+| Skip \(B \leftarrow A\) | 3 | 3 | 3 | 3 | Visit A's nonzero coordinates only |
+| Dual-sided skip \(A \cap B\) | at least 2 | 2 | 2 | 2 | Visit only coordinates present in both operands |
+
+Source note: the counts are slide-derived from Lecture 08 slides 9-20. The table excludes metadata reads, matching the slide note.
+
+The important misconception is that "skip A's zeros" is already optimal. It is not. If A is nonzero at coordinate 2 but B is zero, the operation \(c \times 0\) is still ineffectual. Full work reduction requires finding the intersection of both operands.
+
+### 5. Single-sided vs. dual-sided intersection
+
+**Single-sided intersection** chooses a leader. If A is the leader, the hardware visits A's nonzero coordinates and then asks for B at those same coordinates. This is simpler, but its benefit depends on whether the leader is a good predictor of useful work.
+
+**Dual-sided intersection** treats both operands as sparse lists and emits only matching coordinates. A simple merge-style intersection compares the current coordinate from each list:
+
+```text
+A coordinates: 2, 3, 5
+B coordinates: 0, 1, 3, 4, 5
+
+compare 2 and 0 -> advance B
+compare 2 and 1 -> advance B
+compare 2 and 3 -> advance A
+compare 3 and 3 -> emit 3
+compare 5 and 4 -> advance B
+compare 5 and 5 -> emit 5
 ```
 
-Total operations = 6; effectual operations = 2; ineffectual operations = 4.
+Dual-sided skipping is powerful, but the number of comparisons is data-dependent. Hardware often bounds the number of metadata steps per cycle; if no match is found quickly, the PE may idle. Lecture 08 notes that ExTensor uses binary search over remaining coordinates, which can be effective when the next match is far away.
 
-![The 1-D dot product example — 6 total, 2 effectual, 4 ineffectual operations](../../assets/L08/L08-p09-dot-product-example.png)
+### 6. Format: compression efficiency and access efficiency
 
-### Finding the intersection
+A sparse format must answer two questions:
 
-To know which operations are effectual, the hardware must determine which positions in A and B are *simultaneously* non-zero — this is the **intersection** problem. Two orthogonal design axes:
+1. **Compression efficiency:** How many bits are needed relative to dense storage?
+2. **Access efficiency:** How cheaply can the hardware find the next nonzero coordinate or test whether a coordinate is present?
 
-1. **Single-sided vs. dual-sided**: Does the hardware check one operand (the *leader*) or both?
-   - *Single-sided (leader → follower)*: Scan the leader for non-zeros; fetch the follower only when the leader is non-zero.
-   - *Dual-sided*: Scan both operands and compute the intersection of their non-zero coordinate sets.
+The four lecture formats are:
 
-2. **Gating vs. skipping**: What does the hardware *do* with zero-valued leader reads?
-   - **Gating**: The cycle still runs; the hardware simply suppresses the memory read of the follower and the multiply, staying idle — saving **energy but not cycles**.
-   - **Skipping**: The hardware jumps to the *next non-zero coordinate* in the leader (or the intersection), eliminating the cycle entirely — saving **both energy and time**.
-
-### The cycle/read accounting
-
-The lecture works through all four combinations on the A-B example and tabulates the results:
-
-| Strategy | Cycles | A reads | B reads | Operations performed |
-|---|---|---|---|---|
-| None (baseline) | 6 | 6 | 6 | 6 |
-| Gating (Gate B ← A) | 6 | 6 | 3 | 3 |
-| Skipping (Skip B ← A) | 3 | 3 | 3 | 3 |
-| Dual-sided skipping (A ⋂ B) | 2 | 2 | 2 | 2 |
-
-Gating reduces reads and compute operations but leaves the cycle count unchanged, because the hardware must *check* the leader in every cycle even when it is zero. Skipping requires that the next non-zero coordinate be available *before* the cycle starts — which is exactly the job of a **representation format**.
-
-![Impact of different SAF approaches — cycle, read, and compute counts](../../assets/L08/L08-p12-impact-approaches-detail.png)
-
-### Gating vs. Skipping — practical implications
-
-Because gating leaves cycles unchanged, the hardware can discover zeros **in real time** (no pre-computation needed). Skipping requires that the coordinate of the next non-zero be available *a priori* — this is why the lecture immediately turns to compressed tensor formats.
-
-Table of SAFs used in real accelerators (slide 11):
-
-| Accelerator | SAF strategy |
-|---|---|
-| Eyeriss [JSSC 2017] | Single-sided gating: Gate W ← I, Gate O ← I |
-| Eyeriss v2 [JETCAS 2019] | Single-sided skipping: Skip W ← I, Skip O ← I & W |
-| SCNN [ISCA 2017] | Single-sided skipping: Skip W ← I, Skip O ← I & W |
-| ExTensor [MICRO 2019] | Dual-sided skipping: Skip A ⋂ B, Skip Z ← A & B |
-| DSTC [ISCA 2021] | Dual-sided skipping: Skip A ⋂ B, Skip Z ← A & B |
-
-![SAF taxonomy table — which accelerators use which strategies](../../assets/L08/L08-p11-saf-table.png)
-
-### Dual-sided intersection mechanics
-
-Dual-sided skipping requires finding *matching* non-zero coordinates in both A and B simultaneously — a harder problem. The lecture describes a serial merge-style scan: compare the current leading coordinate in each operand; advance the one at the smaller coordinate; repeat until a match is found or one list is exhausted. ExTensor [MICRO 2019] improves on this with a **binary search** of remaining coordinates, which is especially effective when the next matching coordinate is far away. A design choice is a **maximum iteration count**: if no match is found within that bound, emit an idle cycle and continue.
-
-![Gating: dual-sided access pattern — both operands scanned sequentially](../../assets/L08/L08-p17-gating-dual-sided.png)
-
-> **Why it matters:** Gating is easy but only saves energy; skipping saves both energy and time and can deliver a speedup equal to the *effectual density*, but it requires compressed metadata to locate non-zeros. The compression format choice is therefore load-bearing for the overall system.
-
----
-
-## Chapter 3 — Representation Formats: Compressing the Sparse Tensor
-
-> *Slides: L08-23 … L08-48*
-
-### Two goals: compression and access
-
-The **Format** layer of the TeAAL Pyramid serves two purposes simultaneously:
-
-1. **Compression efficiency** — reduce the bits required to store a tensor. Fewer bits in memory means either a smaller (cheaper, lower-energy) buffer or a larger tile for the same buffer size, increasing data reuse and reducing DRAM traffic.
-2. **Access efficiency** — make it fast and cheap to locate the next non-zero value. This is what enables *skipping*.
-
-These two goals are in tension: formats that compress aggressively (e.g., Coordinate Payload at high sparsity) store fewer metadata bits per non-zero but require more computation to locate the next non-zero when the density changes. The lecture evaluates four canonical formats.
-
-### The four formats
-
-![The four canonical representation formats: Uncompressed, Bitmask, Coordinate Payload, Run-Length Encoding](../../assets/L08/L08-p27-compression-formats.png)
-
-**Uncompressed (U):** Store every value, including zeros. No metadata. Compression ratio = 1 always.
-- Best for: dense data.
-
-**Bitmask (B):** One bit per coordinate indicates zero (0) or non-zero (1); non-zero values stored separately.
-- Metadata overhead: 1 bit per coordinate in the full vector.
-- Best for: moderate sparsity. Maximum compression ratio is 1 / (bits per value) — e.g., for 8-bit values, 1/8 of uncompressed at extreme sparsity.
-- Finding next non-zero: scan the bitmask sequentially (1-bit reads per coordinate).
-
-**Coordinate Payload (CP):** Each non-zero is paired with its coordinate index stored as an n-bit field.
-- Metadata overhead: n bits per non-zero, where n = ⌈log₂(vector length)⌉.
-- Best for: very high sparsity.
-- Finding next non-zero: direct — just read the next (coordinate, value) pair. No computation needed.
-- Caveat: at low sparsity, CP is *larger* than uncompressed (metadata per non-zero grows faster than the savings).
-
-**Run-Length Encoding (RLE):** Instead of the coordinate, store the *run length* (number of zeros between consecutive non-zeros) as an r-bit field.
-- Metadata overhead: r bits per run segment. When runs exceed 2^r − 1, multiple metadata entries are needed.
-- Best for: very high sparsity with long runs of zeros (structured data).
-- Finding next non-zero: accumulate run lengths — requires an adder and a running counter. When r = 1, RLE degenerates to Bitmask.
-- Design choice: value of r is chosen based on the expected run-length distribution.
-
-### Compression efficiency across the density spectrum
-
-The lecture provides a worked example (K=16, 8-bit values):
-
-| Format | 1 non-zero (6.25% density) | 8 non-zeros (50%) | 16 non-zeros (100%) |
+| Format | Metadata idea | Good density regime | Access behavior |
 |---|---|---|---|
-| Uncompressed | 128 bits | 128 bits | 128 bits |
-| Bitmask (1 bit/coord) | 24 bits | 80 bits | 144 bits |
-| CP (4 bits/coord) | 12 bits | 96 bits | 192 bits |
-| RLE (4 bits/run) | 12 bits | 96 bits | 192 bits |
+| Uncompressed | No metadata; store every value | Dense | Direct coordinate access, but no compression |
+| Bitmask | One bit per coordinate | Moderate sparsity | Scan bits or perform bit operations |
+| Coordinate payload | Store coordinate per nonzero | High sparsity | Direct next-nonzero access |
+| Run-length encoding | Store zeros between nonzeros | High sparsity with long zero runs | Accumulate run lengths |
 
-Key insight: **Bitmask is worse than Uncompressed at 100% density** (because the metadata itself adds overhead). **CP and RLE are worse than Bitmask at 50% density**. There is no universally superior format — the right choice depends on the expected density of the tensor.
+For vector \(A=[0,0,c,d,0,f]\) with 8-bit values:
 
-![Compression efficiency table — formats vs. density for K=16, 8-bit values](../../assets/L08/L08-p34-compression-efficiency-table.png)
+- Uncompressed uses \(6 \times 8 = 48\) bits.
+- Bitmask uses \(6 \times 1 + 3 \times 8 = 30\) bits.
+- Coordinate payload with 3-bit coordinates uses \(3 \times 3 + 3 \times 8 = 33\) bits.
+- RLE with 3-bit runs uses \(3 \times 3 + 3 \times 8 = 33\) bits.
 
-An important practical point (slide 35): for *unstructured* sparsity, the metadata to encode coordinates accounts for approximately **half of the total compressed storage** (from Han, ICLR 2016). Minimizing metadata overhead is therefore as important as minimizing zero-value storage.
+For a length-16 vector with 8-bit values and 4-bit coordinates:
 
-### Eyeriss: Run-Length Encoding in practice
+| Nonzeros | Density | Uncompressed | Bitmask | Coordinate payload | RLE with 4-bit runs |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 6.25% | 128 bits | 24 bits | 12 bits | 12 bits |
+| 8 | 50% | 128 bits | 80 bits | 96 bits | 96 bits |
+| 16 | 100% | 128 bits | 144 bits | 192 bits | 192 bits |
 
-Eyeriss (Chen, ISSCC 2016) implements RLE on the off-chip DRAM link for both input activations and output feature maps. The encoding uses 5-bit run-length fields and 16-bit values, transmitted over a 64-bit wide DRAM bus. Results show that RLE compression achieves **1.2× to 1.9× reduction in DRAM access volume** across AlexNet's convolutional layers — within 5–10% of the theoretical entropy limit.
+The lesson is not "compressed is better." At 100% density, every compressed format in this example is worse than uncompressed because metadata adds overhead.
 
-![Eyeriss RLE compression — diagram and DRAM access reduction results](../../assets/L08/L08-p33-eyeriss-rle.png)
+### 7. The hardware meaning of metadata
 
-### Access efficiency and the "concordant traversal" requirement
+Metadata is not passive. It changes the datapath.
 
-For skipping, the hardware must find the *coordinate of the next non-zero* quickly. The access-efficiency summary:
+- A bitmask needs bit reads and often popcount or bit-scan logic.
+- Coordinate payload needs coordinate storage, coordinate comparison, and sometimes random lookup in the other operand.
+- RLE needs accumulation state to reconstruct absolute coordinates.
+- Dual-sided skipping needs an intersection unit.
 
-| Format | Steps to find next non-zero | Scales with |
-|---|---|---|
-| Uncompressed | Compare every coordinate until non-zero found | Vector size |
-| Bitmask | Read 1-bit metadata at each coordinate | Vector size |
-| RLE | Accumulate run lengths | Number of runs |
-| CP | Read next (coordinate, value) pair directly | Number of non-zeros |
+Slide 35 cites Han et al. to make a practical point: for unstructured sparsity, index metadata can account for roughly half of storage. Treat this as a warning, not as a universal constant; it depends on value precision, coordinate width, and sparsity pattern.
 
-An important caveat: all of the above assumes **concordant traversal** — i.e., the hardware traverses the tensor in the same order the data is compressed. If the dataflow requires a different traversal order (*discordant traversal*), the compressed data must be re-indexed or decompressed, incurring significant extra cost. The choice of representation format is therefore coupled to the dataflow (loop order).
+### 8. Structured sparsity
 
-> **Why it matters:** Compression is not free. The metadata cost of encoding coordinates can negate much of the benefit. The right format matches both the expected density distribution and the hardware's traversal order — and that coupling propagates all the way up to the Mapping layer of the TeAAL pyramid.
+Unstructured sparsity allows nonzeros anywhere. It is flexible for model design, but expensive for hardware because each nonzero may need coordinate metadata.
 
----
+**Structured sparsity** restricts the legal positions of nonzeros. The hardware benefit is that the search space is smaller and the metadata can be compact.
 
-## Chapter 4 — Structured Sparsity and Hierarchical Structured Sparsity (HSS)
+The common \(G:H\) pattern means: in every group of \(H\) values, exactly \(G\) values are nonzero. NVIDIA's 2:4 pattern is the lecture's canonical example: exactly two nonzeros per group of four, i.e., 50% density.
 
-> *Slides: L08-49 … L08-66*
+The benefit is simple decode. The limitation is also simple: one \(G:H\) ratio supports one sparsity degree. If a layer wants 30% sparsity or 80% sparsity, fixed 2:4 hardware cannot translate that smoothly into proportional savings.
 
-### The tradeoff: flexibility vs. hardware simplicity
+### 9. Hierarchical Structured Sparsity
 
-**Unstructured sparsity** allows non-zeros to appear at any coordinate. This maximizes model-design flexibility (and typically accuracy), but the hardware cost is high: finding non-zeros requires searching the full coordinate range, and metadata overhead is large.
+Hierarchical Structured Sparsity (HSS) composes simple \(G:H\) rules at multiple nested granularities. Suppose we use a two-level pattern \(3:4 \rightarrow 2:4\):
 
-**Structured sparsity** constrains where non-zeros can appear, reducing the search space and metadata overhead at the cost of model-design flexibility (and potentially accuracy). The lecture illustrates the granularity spectrum:
+- Outer rule: keep 3 non-empty blocks out of 4.
+- Inner rule: within each surviving block, keep 2 values out of 4.
 
-![Granularity spectrum of sparsity — weight pruning to channel pruning](../../assets/L08/L08-p51-granularity-sparsity.png)
+The resulting density is \((3/4)(2/4)=3/8=37.5\%\), so the sparsity is \(62.5\%\).
 
-From fine-grained to coarse-grained: *weight pruning* → *filter pruning* → *row pruning* → *channel pruning*. As granularity coarsens, hardware becomes simpler (non-zero locations are predictable), but the model has fewer degrees of freedom for maintaining accuracy.
+Lecture 08's HSS example combines outer options \(\{4:4,4:5,4:6,4:7\}\) with inner options \(\{4:4,2:4,1:4\}\), yielding \(4 \times 3 = 12\) possible sparsity degrees. The hardware does not need twelve unrelated decoders; it composes simple per-rank decoders.
 
-### G:H structured sparsity (NVIDIA Sparse Tensor Core)
+This is a format-level trick with architecture-level consequences: the model can choose more sparsity degrees while the hardware remains closer to a small set of simple structured primitives.
 
-NVIDIA's 2:4 structured sparsity (also called the **Sparse Tensor Core** pattern) enforces that in every contiguous group of 4 values, exactly 2 must be non-zero (50% sparsity exactly). This is the canonical **G:H** pattern with G=2, H=4.
+### 10. Sparse tiling and overbooking
 
-The hardware benefit is substantial: the non-zero locations within each H-element group can be encoded with just ⌈log₂(C(H,G))⌉ bits of metadata — for 2:4, only 2 bits per pair of non-zeros. The metadata overhead is minimal compared to unstructured sparsity, enabling extremely efficient skipping.
+Dense tiling asks: "What rectangular tile fits in the buffer?" Sparse tiling asks: "How many nonzeros will this tile contain?"
 
-![NVIDIA 2:4 Sparse Tensor Core — per-row structured sparsity pattern](../../assets/L08/L08-p52-structured-2-4.png)
+Two same-shape sparse tiles can have very different occupancies. If the buffer is sized for the densest tile, most average tiles waste capacity. If tiles are split by equal nonzero count, the coordinate ranges become irregular, making it hard to tile the other operand.
 
-The limitation: the design locks in 50% sparsity. If the model is only 30% sparse, no speedup; if it is 80% sparse, the hardware still runs at 50% utilization. A single G:H value is inflexible.
+The lecture contrasts:
 
-### The inflexibility problem
+- **Uniform occupancy:** balanced nonzero count, irregular shape.
+- **Uniform shape:** regular shape, variable nonzero count.
 
-Modern DNNs use a wide mix of operations:
-- **Pruning** (Han, NeurIPS 2015) → sparse weights, variable degree.
-- **Activation functions** (ReLU, etc.) → sparse or dense activations depending on input.
-- **Attention modules** (Vaswani, NeurIPS 2017) → dense or variable-sparse attention maps.
-- **Depth-wise separable layers** (Howard, CVPR 2017) → dense weights, fewer parameters.
+**Overbooking** chooses a larger nominal tile than the buffer could hold in the worst case, betting that most tiles are sparse enough to fit. When a tile has too many nonzeros, the overflow is **bumped data**. Tailors streams bumped data instead of buffering it. Swiftiles estimates how much to overbook using random sampling of tile occupancy.
 
-A single G:H value cannot efficiently serve all of these. The naïve solution — support multiple G:H ratios (2:4, 2:6, 2:8, …) in hardware — does not scale: the hardware complexity grows roughly linearly with the number of ratios supported.
+The hardware implication is subtle: overbooking increases average tile size, improving reuse, while accepting occasional streamed overflow. It is a controlled violation of worst-case dense tiling assumptions.
 
-### Hierarchical Structured Sparsity (HSS)
+## Worked Examples
 
-Wu et al. [MICRO 2023] introduce **HSS** as a composable solution. Instead of designing hardware for each G:H ratio separately, HSS **composes simple G:H patterns hierarchically**:
+### Example 1: Density and expected useful work
 
-An N-rank HSS pattern applies the G:H rule at each of N nested granularities. For example, the **3:4 → 2:4** pattern:
-- **Rank 1 (outer)**: Select 3 non-empty blocks out of every 4 blocks.
-- **Rank 0 (inner)**: Within each block, keep 2 non-zero values out of 4 elements (standard 2:4).
+If weight density is \(d_W=0.4\) and activation density is \(d_A=0.5\), and if nonzero locations are independent for this toy estimate, dual-sided skipping would visit roughly \(d_W d_A = 0.2\) of dense multiply positions.
 
-The effective sparsity of the 3:4→2:4 pattern is 1 − (3/4)(2/4) = 1 − 6/16 = 62.5%.
+For a dense loop with 1000 multiplications, the idealized effectual count is \(1000 \times 0.2 = 200\). A single-sided scheme using only activations as leader would visit \(1000 \times 0.5 = 500\) positions. It saves work, but still performs many multiplications where the corresponding weight is zero.
 
-![Hierarchical Structured Sparsity — composing 3:4 and 2:4 patterns](../../assets/L08/L08-p58-hss-pattern.png)
+Teaching interpretation: independence is a simplifying assumption for the example. Real DNN sparsity can be correlated by layer, channel, and input.
 
-Because sparsity fractions multiply, a 2-rank HSS with m rank-1 options and n rank-0 options covers m×n distinct sparsity degrees — far more than m+n ratios would. A concrete example from slide 64: combining rank-1 options {4:4, 4:5, 4:6, 4:7} with rank-0 options {4:4, 2:4, 1:4} yields **12 distinct sparsity degrees** spanning 0% to 86%.
+### Example 2: Metadata can defeat compression
 
-![HSS sparsity degrees — 12 degrees from two 3-option ranks](../../assets/L08/L08-p64-hss-sparsity-degrees.png)
+Suppose values are 8 bits, the vector length is 16, and coordinates need 4 bits. Coordinate payload size is \(n_\text{nz}(8+4)\). Dense size is \(16 \times 8 = 128\) bits.
 
-The key hardware benefit: **the hardware only needs to implement simple G:H acceleration at each rank independently** — the hierarchical composition is a representation/format choice, not an additional hardware mode. This keeps the sparsity-acceleration overhead low.
+Coordinate payload is smaller than dense only when \(12n_\text{nz} < 128\), or \(n_\text{nz} < 10.67\). If the vector has 11 or more nonzeros, coordinate payload is larger than dense.
 
-### HighLight: HSS in silicon
+Hardware meaning: if a layer has high density, sparse decoding burns area and bandwidth to move metadata that does not remove much work.
 
-The **HighLight** accelerator [Wu, MICRO 2023] implements HSS on a 16×16 PE array with a two-level skipping hierarchy:
-- **Rank-1 acceleration** reduces storage requirements and energy consumption by skipping entire empty blocks.
-- **Rank-0 acceleration** (inside the PE) reduces latency and energy by skipping zero elements within a block.
+### Example 3: Effective sparsity in HSS
 
-The compressed representation uses an HSS-based format that is simple enough for hardware to decode efficiently. HighLight is evaluated against baselines (STC and DSTC) on ResNet50 and Transformer-Big across a range of pruning sparsity degrees, reaching the **accuracy–energy-delay product Pareto frontier** — meaning it achieves the best tradeoff between model accuracy and hardware efficiency across the full sparsity spectrum.
+For \(4:6 \rightarrow 1:4\):
 
-![HighLight accelerator architecture — 16×16 PE array with hierarchical skipping](../../assets/L08/L08-p65-highlight-accelerator.png)
+- Outer density is \(4/6\).
+- Inner density is \(1/4\).
+- Effective density is \((4/6)(1/4)=1/6\).
+- Effective sparsity is \(1-1/6=5/6\approx 83.3\%\).
 
-> **Why it matters:** The sparsity degree in deployed models is not fixed — it varies by layer, by pruning method, and by input data. Hardware that can exploit *any* sparsity degree efficiently (rather than locking to a single G:H ratio) is essential for practical deployment across diverse models and workloads.
+The point is not that this exact pattern is always best. The point is that nested ratios multiply, giving a compact way to cover many sparsity degrees.
 
----
+## Key Equations and How to Read Them
 
-## Chapter 5 — Tiling Sparse Tensors: The Overbooking Problem
+### Effectual work
 
-> *Slides: L08-67 … L08-94*
+\[
+N_\text{performed}=N_\text{effectual}+N_\text{unexploited ineffectual}.
+\]
 
-### Why tiling is hard with sparsity
+Read this as an accounting identity. Sparse hardware improves performance only by reducing the second term, and only if the overhead per performed operation remains reasonable.
 
-A fundamental principle from earlier lectures: to maximize energy efficiency, you want to choose the **largest tile that fits in the on-chip buffer**, because larger tiles enable more data reuse and reduce DRAM traffic. With dense tensors, tile size is determined by the tensor dimensions and a simple capacity constraint.
+### Ideal independent two-sided work
 
-With sparse tensors, the *number of non-zeros* in a tile (its **occupancy**) varies unpredictably. Two tiles of the same shape can have wildly different numbers of non-zeros. Sparsity varies not just between different workloads but within a single tensor, as illustrated for graph computing, scientific simulations, and recommendation systems (slide 68).
+\[
+N_\text{effectual}\approx d_A d_B N_\text{dense}.
+\]
 
-The challenge: if you size the tile to fit the **maximum-occupancy** tile, most tiles will be only partially full — wasting buffer space and reducing effective tile size (and thus data reuse).
+This is a teaching approximation. It says that if operand A is nonzero with probability \(d_A\) and operand B is nonzero with probability \(d_B\), both are nonzero with probability \(d_A d_B\). It clarifies why dual-sided intersection can be much better than exploiting only one sparse operand.
 
-### The two imperfect tiling strategies
+### HSS density
 
-**Uniform occupancy** (tile size chosen to equalize non-zero counts):
-- Low occupancy variation — all tiles have about the same number of non-zeros.
-- Problem: the non-uniform shape means the companion operand is hard to tile (irregular addressing).
+\[
+d_\text{HSS}=\prod_i \frac{G_i}{H_i}.
+\]
 
-**Uniform shape** (tile size chosen by tensor dimensions, independent of sparsity):
-- Easy to tile both operands simultaneously (regular addressing).
-- Problem: high occupancy variation — some tiles are dense, some nearly empty. If you size the buffer for the worst-case (maximum-occupancy) tile, average utilization is very low.
+Each hierarchy level keeps \(G_i\) entries out of \(H_i\). The kept fractions multiply because a value must survive all levels.
 
-Neither strategy is satisfactory in isolation.
+## Hardware Implications
 
-### Overbooking: the airline seat analogy
+- **Gating:** needs zero detection and enable signals; it preserves dense timing, which makes control simple but leaves latency unchanged.
+- **Skipping:** needs metadata that can produce next coordinates early enough; it changes cycle count and can create pipeline bubbles.
+- **Dual-sided intersection:** needs coordinate comparison/search logic; performance depends on sparsity pattern and metadata format.
+- **Compression:** saves capacity and bandwidth only when metadata is smaller than omitted zero payloads.
+- **Structured sparsity:** reduces decoder complexity and metadata width but constrains the model.
+- **HSS:** expands the sparsity-degree menu without requiring a fully independent decoder for every degree.
+- **Sparse tiling:** buffer sizing must consider occupancy distributions, not just tensor shape.
+- **Parallel sparse execution:** PEs can become imbalanced because different tiles contain different numbers of nonzeros.
 
-The lecture introduces **overbooking** as the solution, using the airline seat analogy:
-- Airlines overbook flights because on average not all ticketed passengers show up. The expected number of passengers who actually board is close to the number of seats.
-- Analogously: if tiles are overbooked (nominally larger than the buffer), *on average* the number of non-zeros that actually land in the buffer will be close to the buffer capacity — because most tiles are sparse.
+## Common Misconceptions
 
-When a tile's non-zeros exceed the buffer capacity (**"bumped data"**), the excess is **streamed** directly to compute without being buffered (losing the reuse benefit for those values, but not blocking progress).
+### Misconception: Sparsity automatically gives speedup.
 
-![Overbooking concept — tile occupancy vs. buffer capacity, with bumped data](../../assets/L08/L08-p84-overbooking-concept.png)
+Sparsity gives an opportunity. Speedup requires skipping cycles. Gating can reduce energy without reducing latency.
 
-### Tailors: handling bumped data
+### Misconception: The sparsest format is always best.
 
-The **Tailors** mechanism [Xue, MICRO 2023] manages the two data streams:
-- **Unbumped data**: loaded into the buffer normally and reused across multiple passes of the traversal loop.
-- **Bumped data**: streamed from DRAM in a separate pass — this data loses its reuse opportunity but the traversal continues unblocked.
+A format with excellent compression can have poor access efficiency. If the hardware must scan, accumulate, or randomly probe metadata for every useful value, the saved payload bits may not translate into throughput.
 
-The traversal order for bumped data is adjusted to maintain as much reuse as possible given the streaming constraint.
+### Misconception: Single-sided skipping is equivalent to dual-sided skipping.
 
-### Swiftiles: predicting tile occupancy
+Single-sided skipping avoids zeros in the leader only. If the follower is zero at a leader nonzero coordinate, the operation is still ineffectual.
 
-To determine *how much* to overbook, the hardware needs to estimate the occupancy distribution of tiles. A full traversal of the tensor (to count all non-zeros in every tile) is too expensive. **Swiftiles** [Xue, MICRO 2023] uses **random sampling**: sample a small fraction of tiles, build an approximate occupancy distribution, then scale it to the buffer size. The target is to set the overbook ratio so that a chosen percentile (e.g., 90th) of tiles fits in the buffer.
+### Misconception: Structured sparsity is simply worse model quality for easier hardware.
 
-Evaluation on ExTensor [Hegde, MICRO 2019]:
-- **ExTensor-Naive**: no sparsity-aware tiling; tiles are sized as if dense (worst case). 90th-percentile occupancy is only 6% of buffer; tiles are vastly undersized.
-- **ExTensor-Overbooking** (Tailors + Swiftiles, 90th-percentile target): **52.7× speedup** and **22.5× energy efficiency improvement** over ExTensor-Naive.
-- **ExTensor-Prescient** (oracle: knows exact tile occupancy in advance): Overbooking achieves **2.3× speedup** and **2.5× energy efficiency** over even this ideal baseline, because the Swiftiles prediction is good enough that most tiles fit — and the benefit of larger tiles (more reuse) outweighs the cost of occasional bumped-data streaming.
+That tradeoff exists, but structured sparsity is also a way to make savings predictable. HSS tries to recover flexibility by composing simple structures.
 
-> **Why it matters:** Choosing the right tile size for sparse data is as important as choosing the right compression format. A naïvely sized tile wastes nearly all the buffer capacity; overbooking with lightweight occupancy prediction recovers most of the theoretical maximum efficiency — without requiring a full pre-scan of the data.
+### Misconception: Sparse tiles should be sized by worst case.
 
----
+Worst-case sizing can waste most buffer capacity when occupancy is highly variable. Overbooking is valuable precisely because average occupancy can be far below maximum occupancy.
 
-## Chapter 6 — Interplay with Dataflow and Summary
+## Connections to Previous and Later Lectures
 
-> *Slides: L08-94 … L08-96*
+- **L05-L06 mapping/dataflows:** sparse formats only work well when loop order matches storage order. This is the same mapping concern, now with metadata in the loop.
+- **L07 sparsity/pruning:** pruning creates weight sparsity; L08 asks what hardware must do to exploit it.
+- **L09 sparse architectures part 2:** fibertrees, CSR/CSC, projection, and intersection formalize the ideas introduced here.
+- **L10 sparse architectures part 3:** TeAAL and sparse accelerator specifications give a language for describing these design choices.
+- **Lab 4/SparseLoop:** the lecture's SAF language becomes a modeling vocabulary for analyzing sparse accelerator tradeoffs.
 
-### Dataflow affects sparsity exploitation
+## Paper Bridge: TeAAL
 
-The lecture closes by connecting sparsity back to the **Mapping** layer of the TeAAL pyramid. The loop order (dataflow) must be aligned with the storage order of the representation format to enable **concordant traversal** — i.e., the hardware accesses non-zeros in the order they are stored in memory. Discordant traversal requires random access into the metadata, which is expensive.
+### Bibliographic identity
 
-Additional dataflow considerations:
-- **Increasing stationarity** for a data type (moving its loop to the outermost/spatial position) amortizes the per-access cost of metadata decoding over more computations.
-- **Parallelism and workload balance**: when loops are parallelized across PEs (spatial_for), sparsity causes *workload imbalance* — some PEs get dense tiles and run for many cycles, while others finish quickly. The choice of which loop to parallelize should account for expected sparsity variation.
+- **Title:** TeAAL: A Declarative Framework for Modeling Sparse Tensor Accelerators
+- **Authors:** N. Nayak et al.
+- **Year / venue:** MICRO 2023
+- **Used in lecture(s):** L01, L08, L09, L10
+- **Local PDF:** `papers/TeAAL.pdf`
 
-These interactions are explored in Lab 4 (SparseLoop tool) and the Final Project (Chapter 8.3 of the textbook, *Efficient Processing of Deep Neural Networks*, Sze & Emer).
+### Problem addressed
 
-### Summary of the lecture
+TeAAL addresses the difficulty of specifying and comparing sparse tensor accelerators. Sparse accelerators differ not only in PE arrays, but also in loop order, tensor formats, partitioning, rank transformations, and sparse orchestration. Informal descriptions make these differences hard to compare.
 
-The lecture closes with a precise statement of the challenges and costs:
+### Core idea
 
-**Irregularity** from sparsity causes: underutilization of buffers and PEs; workload imbalance across the PE array; random data access patterns.
+The paper represents sparse accelerators using cascades of mapped Einsums plus content-preserving transformations on fibertrees. It separates computation from mapping and format, which matches Lecture 08's separation of skipping, format, and dataflow.
 
-**Overheads** that must not exceed sparsity benefits: storage for coordinate metadata; intersection logic for checking operand zero-ness.
+### Relevance to this lecture
 
-Every design in this lecture — Eyeriss, SCNN, ExTensor, HighLight, Swiftiles — represents a different point on the tradeoff curve between **exploiting sparsity** and **paying for the hardware complexity** needed to find, compress, and intersect sparse data.
+Lecture 08 uses TeAAL's concern stack to explain why **Format** and **Mapping** are separate but coupled. A compressed format is useful only if the mapping traverses it concordantly. Sparse tiling is also a mapping/format problem because partitioning by shape and partitioning by occupancy expose different tradeoffs.
 
-> **Why it matters:** Sparsity is not a minor optimization — it is a first-order determinant of energy efficiency and throughput in production DNN accelerators. But the hardware cost of exploiting it correctly (intersection logic, metadata decoders, tiling controllers) requires careful co-design across Format, Mapping, and Architecture layers of the pyramid. The next two lectures (L09–L10) will examine specific sparse accelerator architectures in more depth.
+### Key claims used in this chapter
 
----
+- Sparse tensors are naturally represented as fibertrees with missing coordinate/payload pairs; see TeAAL Section 2.1.
+- Einsums specify computation but not iteration order; mapping chooses loop order and affects locality and load balance; see Section 2.2 and Section 2.3.
+- Sparse tensors are typically compressed to remove zero elements, but sparse execution can introduce memory footprint variation, transfer imbalance, and compute load imbalance; see Section 2.3.
+- Rank flattening, rank partitioning, and rank swizzling capture common sparse data orchestration behaviors; see Section 3.2.
+
+### What students should remember
+
+1. Sparse architecture is not just a PE microarchitecture problem.
+2. Format, mapping, binding, and architecture must be specified together.
+3. Fibertree transformations are a precise way to talk about sparse layout and tiling.
+4. Load imbalance is a first-class sparse design issue.
+
+### Limitations and assumptions
+
+TeAAL is a modeling/specification framework, not a single accelerator design. This chapter uses it as conceptual support, not as proof that a specific SAF is optimal.
+
+### Suggested insertion points
+
+Use TeAAL when explaining why format choice is coupled to traversal order, why sparse tiling needs occupancy-aware partitioning, and why later lectures introduce fibertrees.
+
+## Paper Bridge: SCNN
+
+### Bibliographic identity
+
+- **Title:** SCNN: An Accelerator for Compressed-sparse Convolutional Neural Networks
+- **Authors:** A. Parashar et al.
+- **Year / venue:** ISCA 2017
+- **Local PDF:** `papers/L17_SCNN_Parashar_ISCA2017.pdf`
+
+### Problem addressed
+
+SCNN asks how to exploit both pruned weights and ReLU-induced activation sparsity in convolutional layers while keeping activations and weights compressed through most of the computation.
+
+### Core idea
+
+SCNN uses a planar-tiled input-stationary Cartesian-product sparse dataflow. It delivers vectors of nonzero weights and nonzero activations to a multiplier array, computes their Cartesian product, and scatters products to output accumulators.
+
+### Relevance to this lecture
+
+Lecture 08 uses SCNN as an example of single-sided skipping and as evidence that sparsity benefits are not free. SCNN's scatter network, compressed buffers, and metadata handling are exactly the overheads that the lecture warns about.
+
+### Key claims used in this chapter
+
+- The abstract states SCNN exploits zero-valued weights from pruning and zero-valued activations from ReLU, while using compressed encoding to reduce transfers and storage.
+- Section II reports that typical layers can reduce work by a factor of 4 and up to a factor of 10 under the paper's measured density products.
+- Section III introduces the PT-IS-CP-sparse dataflow and explains why input-stationary Cartesian-product computation matches sparse weights and activations.
+- Section IV describes the PE with compressed storage, all-to-all multiplication, and scatter accumulation.
+- The conclusion states SCNN uses both weight and activation sparsity and becomes more efficient than dense architectures when weights and activations are each below roughly 85% density.
+
+### What students should remember
+
+1. Dual-sparse work reduction requires both values and coordinates.
+2. Cartesian products increase useful multiply opportunities but scatter output addresses.
+3. Compression saves bandwidth only when decoders and routers can keep up.
+
+### Limitations and assumptions
+
+SCNN targets CNN inference and depends on compressed sparse blocks and sufficient nonzero work per PE. It is not a universal sparse tensor accelerator.
+
+### Suggested insertion points
+
+Use SCNN when discussing why avoiding zero work requires extra routing and metadata machinery, and as a preview of Lecture 09's sparse convolution dataflows.
+
+## Paper Bridge: Eyeriss v2
+
+### Bibliographic identity
+
+- **Title:** Eyeriss v2: A Flexible Accelerator for Emerging Deep Neural Networks on Mobile Devices
+- **Authors:** Y.-H. Chen et al.
+- **Year / venue:** JETCAS 2019
+- **Local PDF:** `papers/L17_EyerissV2_Chen_JETCAS2019.pdf`
+
+### Problem addressed
+
+Eyeriss v2 addresses compact and sparse DNNs whose layer shapes and sparsity patterns vary. The goal is to keep throughput and energy efficiency high when dense reuse assumptions no longer hold.
+
+### Core idea
+
+It combines a hierarchical mesh NoC with sparse PE support. The sparse PE stores activations and weights in a CSC-like compressed format, skips zeros directly in the compressed domain, and uses SIMD support to recover utilization.
+
+### Relevance to this lecture
+
+Eyeriss v2 demonstrates the distinction between gating and skipping. Original Eyeriss used gating for zero activations; Eyeriss v2 keeps data compressed on-chip and skips zeros to improve throughput.
+
+### Key claims used in this chapter
+
+- Section IV states original Eyeriss exploited input-activation zeros by gating logic/data accesses, while Eyeriss v2 skips zeros to improve throughput as well as energy.
+- Section IV describes CSC encoding for both activations and weights and notes that compressed-domain processing can skip zeros without spending extra cycles.
+- Section V reports large improvements for sparse AlexNet and sparse MobileNet under the paper's evaluation setup, while also noting workload imbalance and layer-shape limitations.
+
+### What students should remember
+
+1. Moving from gating to skipping changes the PE pipeline and storage format.
+2. Sparse support adds control and storage overhead.
+3. Workload imbalance remains even in a carefully designed sparse accelerator.
+
+### Limitations and assumptions
+
+The quantitative results are tied to Eyeriss v2's 65 nm implementation, benchmark models, batch size, and comparison baselines. This chapter uses them as evidence of design tradeoffs, not as universal speedup claims.
+
+### Suggested insertion points
+
+Use Eyeriss v2 in the gating/skipping distinction and in the discussion of compressed formats with throughput impact.
+
+## Paper Bridge: The State of Sparsity in Deep Neural Networks
+
+### Bibliographic identity
+
+- **Title:** The State of Sparsity in Deep Neural Networks
+- **Authors:** D. Blalock et al.
+- **Year / venue:** MLSys 2020
+- **Local PDF:** `papers/L16_StateOfPruning_Blalock_MLSys2020.pdf`
+
+### Problem addressed
+
+The paper surveys pruning methods and shows that pruning research often suffers from inconsistent comparisons and metrics.
+
+### Core idea
+
+It distinguishes unstructured pruning from structured pruning and argues that pruning should be evaluated as an efficiency/quality tradeoff curve rather than a single compression number.
+
+### Relevance to this lecture
+
+Lecture 08's structured sparsity section depends on the model-side fact that sparsity patterns are design choices. A hardware-friendly pattern can simplify metadata and traversal, but may change the model's accuracy/efficiency frontier.
+
+### Key claims used in this chapter
+
+- Section 2 defines pruning as producing a model with masked or removed parameters and distinguishes unstructured and structured pruning.
+- Section 2 emphasizes the tradeoff between model efficiency and quality.
+- The paper's literature review warns that reported compression and speedup metrics are not interchangeable.
+
+### What students should remember
+
+1. Sparsity is produced by model decisions, not only hardware decisions.
+2. Structured sparsity is valuable only if the model can tolerate the constraint.
+3. Theoretical speedup and realized hardware speedup are different metrics.
+
+### Limitations and assumptions
+
+The paper is about pruning evaluation, not sparse accelerator design. This chapter uses it to contextualize why hardware-friendly sparsity patterns must be evaluated with accuracy tradeoffs.
 
 ## Standalone Study Guide
 
-### What to master before moving on
+Read the lecture in this order:
 
-- Distinguish gating, skipping, and compressed-format representation as separate sparse acceleration features.
-- Compare uncompressed, bitmask, coordinate-payload, and run-length formats by compression and access efficiency.
-- Explain why structured sparsity lowers metadata and decoder cost.
-- Explain the sparse tiling problem: occupancy varies, so fixed-shape dense-style tiles waste buffer capacity.
-- Describe Tailors and Swiftiles as an overbooking strategy for sparse tiles.
+1. Reproduce the dot-product accounting table without looking.
+2. Explain why skipping needs format metadata but gating does not.
+3. For each sparse format, ask: "How do I find the next nonzero?"
+4. Compute one HSS density by multiplying kept fractions.
+5. Explain overbooking as an average-case buffer-utilization strategy.
 
-### Self-check questions
+## Self-Check Questions
 
-1. Which sparse acceleration feature saves energy but not cycles?
-2. Why can a compressed format be larger than uncompressed storage at high density?
-3. What is the difference between a bumped and unbumped tile in Tailors?
+1. Why does gating save energy but not cycles?
+2. In the dot-product example, why does \(A\)-leader skipping still perform three computes when only two are effectual?
+3. Why can bitmask compression be worse than uncompressed storage at 100% density?
+4. What hardware state does RLE need that coordinate payload does not?
+5. Why does a fixed 2:4 accelerator fail to exploit arbitrary 80% sparsity?
+6. How does HSS produce more sparsity degrees than a flat list of \(G:H\) modes?
+7. Why does sparse tiling make "largest tile that fits" difficult?
+8. What is bumped data in overbooking?
 
-### Exercises
+## Exercises
 
-1. For a length-16 vector with four non-zeros, encode it using bitmask and coordinate-payload formats. Count metadata bits separately from payload bits.
-2. Pick a 2:4 sparse group and calculate how many bits are needed to encode the non-zero positions.
-3. Explain why choosing a tile size from maximum occupancy can destroy reuse for the average tile.
-
-### Common traps
-
-- Treating compression ratio as the only format metric. Access efficiency can dominate runtime.
-- Assuming structured sparsity is always better. It may reduce model flexibility or accuracy.
-- Ignoring workload balance: skipping can make different PEs finish at different times.
-
----
+1. **Format calculation:** For a length-32 vector with six nonzeros, 8-bit values, and 5-bit coordinates, compute uncompressed, bitmask, coordinate-payload, and 5-bit RLE storage sizes.
+2. **Intersection trace:** Intersect \(A=\{1,4,9,10\}\) and \(B=\{0,4,5,10,11\}\) using a merge-style algorithm. Count metadata comparisons.
+3. **Leader choice:** Suppose \(A\) has density 0.2 and \(B\) has density 0.8. Which operand should be the leader for single-sided skipping, and why?
+4. **HSS design:** Choose two \(G:H\) levels that produce 75% sparsity. Explain the hardware and model-flexibility tradeoff.
+5. **Tiling reasoning:** Describe a sparse tensor distribution where uniform-shape tiling wastes buffer capacity, then describe how overbooking changes the average tile size.
+6. **Paper bridge:** Use SCNN to explain why a sparse accelerator may need a scatter network even when it performs fewer multiplications.
 
 ## Key Terms
 
-| Term | Gloss |
+| Term | Definition |
 |---|---|
-| **Effectual operation** | An operation where neither operand is zero; it contributes to the output. |
-| **Ineffectual operation** | An operation involving at least one zero operand; `anything × 0 = 0`. |
-| **Gating** | A SAF that suppresses the memory read and multiply for a zero operand, saving energy but not cycles. The cycle still occurs. |
-| **Skipping** | A SAF that eliminates the entire cycle for zero or non-intersecting operand pairs, saving both energy and time. Requires pre-computed non-zero coordinates. |
-| **SAF (Sparse Acceleration Feature)** | Collective term for gating, skipping, and compressed-format strategies (Wu, MICRO 2022). |
-| **Single-sided intersection** | One operand (the *leader*) drives the access pattern; the other (*follower*) is fetched only when the leader is non-zero. |
-| **Dual-sided intersection** | Both operands' non-zero coordinate sets are searched to find matching pairs; only matching non-zeros are processed. |
-| **Representation format** | How a sparse tensor is encoded in memory, including both values and coordinate metadata. |
-| **Uncompressed (U)** | Every value stored, including zeros. No metadata overhead; works best for dense data. |
-| **Bitmask (B)** | One bit per coordinate; works best for moderate sparsity. |
-| **Coordinate Payload (CP)** | Explicit coordinate stored per non-zero; best for high sparsity; access is direct. |
-| **Run-Length Encoding (RLE)** | Count of zeros between non-zeros; best for high sparsity with long zero runs; requires accumulation to find next coordinate. |
-| **Compression efficiency** | Ratio of compressed representation size to uncompressed size; depends on density and metadata overhead. |
-| **Access efficiency** | Computational cost of locating the next non-zero from the metadata; determines skipping hardware complexity. |
-| **Concordant traversal** | Accessing non-zeros in the same order they are stored — the efficient default. |
-| **Discordant traversal** | Accessing data in a different order from storage — expensive; requires random access into metadata. |
-| **Structured sparsity** | Sparsity patterns constrained so non-zeros appear only at predictable positions; reduces hardware complexity. |
-| **Unstructured sparsity** | No constraint on non-zero locations; maximum model flexibility but higher hardware cost. |
-| **G:H sparsity** | Exactly G non-zeros in every contiguous group of H values. NVIDIA's 2:4 is the canonical example. |
-| **HSS (Hierarchical Structured Sparsity)** | Composing multiple G:H patterns at nested granularities to cover a broad sparsity-degree spectrum with simple hardware (Wu, MICRO 2023). |
-| **Tile occupancy** | The number of non-zeros in a given tile; varies unpredictably with unstructured sparsity. |
-| **Overbooking** | Nominating tiles larger than the buffer capacity; works because most tiles are sparse and their actual occupancy fits on average. |
-| **Tailors** | Hardware mechanism that handles "bumped" (overflow) tile data by streaming it rather than buffering it, without stalling compute [Xue, MICRO 2023]. |
-| **Swiftiles** | Lightweight tiling algorithm using random sampling to predict tile occupancy distribution and set the overbook ratio [Xue, MICRO 2023]. |
-| **Workload imbalance** | Variation in non-zero counts across tiles assigned to different PEs, causing some PEs to finish earlier and idle. |
-
----
+| **Activation sparsity** | Zeros in activations, often input-dependent; hardware must detect or encode them at runtime. |
+| **Weight sparsity** | Zeros in trained weights, often produced by pruning; can often be known before inference. |
+| **Effectual operation** | An operation that can change the output, e.g., multiplying two nonzero operands. |
+| **Ineffectual operation** | An operation involving a zero operand or zero addend that cannot affect the final value. |
+| **Gating** | Suppressing reads or compute in a cycle after detecting a zero; saves energy but not time. |
+| **Skipping** | Advancing directly to useful coordinates; saves time and energy but requires metadata and traversal logic. |
+| **Format** | The representation of values and coordinates in memory. |
+| **Metadata** | Non-payload information such as bitmasks, coordinates, run lengths, segment pointers, or offsets. |
+| **Single-sided intersection** | One operand's nonzeros drive traversal; the other operand is checked or fetched as follower. |
+| **Dual-sided intersection** | Both operands' coordinate streams are intersected so only matching nonzero coordinates are processed. |
+| **Bitmask** | A format with one bit per coordinate indicating whether the payload is nonzero. |
+| **Coordinate payload** | A format storing each nonzero value with its coordinate. |
+| **Run-length encoding** | A format storing the number of zeros before each nonzero. |
+| **Structured sparsity** | Sparsity constrained to a predictable pattern, reducing metadata and decoder cost. |
+| **\(G:H\) sparsity** | Exactly \(G\) nonzeros in every group of \(H\) values. |
+| **HSS** | Hierarchical Structured Sparsity; nested \(G:H\) patterns whose densities multiply. |
+| **Tile occupancy** | Number of nonzeros in a sparse tile. |
+| **Overbooking** | Choosing nominal tiles larger than worst-case buffer capacity because most sparse tiles fit on average. |
+| **Bumped data** | Nonzeros that overflow an overbooked buffer and must be streamed instead of reused from the buffer. |
+| **Workload imbalance** | Unequal work across PEs caused by different nonzero counts. |
 
 ## Takeaways
 
-- Every DNN inference operation can be classified as **effectual** or **ineffectual**; exploiting ineffectual operations is the entire goal of sparse acceleration.
-- **Gating** saves energy only; **skipping** saves energy and time, but requires pre-computed non-zero location metadata — making the **representation format** a first-class architectural concern.
-- The four canonical formats (Uncompressed, Bitmask, CP, RLE) each have a density range where they are optimal; no single format dominates across all sparsity levels.
-- **Structured sparsity** (G:H, HSS) reduces hardware complexity at the cost of model flexibility; **HSS** extends coverage to a broad sparsity-degree spectrum by composing simple patterns hierarchically.
-- **Tiling sparse tensors** is fundamentally different from tiling dense tensors: the tile occupancy varies unpredictably, and naïve worst-case sizing wastes almost all buffer capacity. **Overbooking with Tailors + Swiftiles** recovers 52.7× speedup vs. naive tiling in the ExTensor example.
-- Sparsity, dataflow (loop order), and representation format are tightly coupled: the format must match the traversal order, and the parallelism choice must account for workload imbalance.
-
----
-
-## Connections to Later Lectures
-
-- **L07 (Sparsity)** — the preceding lecture established *why* and *how much* sparsity exists in DNNs; L08 picks up by asking *how* hardware exploits it.
-- **L09–L10 (Sparse Architectures II & III)** — dive into specific sparse accelerator architectures in greater detail, covering designs such as SCNN, ExTensor, and more advanced intersection hardware.
-- **Format layer (TeAAL Pyramid, L01)** — the representation formats introduced here are the concrete realization of the *Format* layer first mentioned in the introductory lecture.
-- **Mapping layer (L05–L06, Dataflows)** — the concordant/discordant traversal discussion here shows that the choice of dataflow (loop order) cannot be made independently of the choice of sparse representation format.
-- **Lab 4 (SparseLoop)** — uses the SparseLoop tool (sparseloop.mit.edu) to evaluate SAF strategies and compression formats on real workloads; the lab directly operationalizes the theory from this lecture.
-- **Textbook** — Sections 8.2 (Compression) and 8.3 (Sparse Dataflows) of *Efficient Processing of Deep Neural Networks*, Sze & Emer.
-
----
+- Sparse acceleration is an accounting problem: reduce unexploited ineffectual work without letting metadata/control overhead dominate.
+- Gating, skipping, and format are separate design levers; skipping is the only one that directly reduces cycles.
+- Format choice must be judged by compression efficiency and access efficiency.
+- Structured sparsity trades model flexibility for predictable metadata and decoder cost; HSS composes simple structures to regain degree flexibility.
+- Sparse tiling is occupancy-driven rather than shape-only; overbooking improves average buffer use while managing overflow.
 
 ## Appendix — Slide-to-Section Map
 
-| Slides | Section |
-|---|---|
-| L08-1 | Title |
-| L08-2 … L08-8 | Ch.1 — Why Sparsity Matters (sources, arithmetic, irregularity) |
-| L08-9 … L08-22 | Ch.2 — Gating vs. Skipping (intersection, single/dual-sided, accounting) |
-| L08-23 … L08-48 | Ch.3 — Representation Formats (U, B, CP, RLE; compression/access efficiency; Eyeriss RLE) |
-| L08-49 … L08-66 | Ch.4 — Structured Sparsity & HSS (G:H, 2:4 STC, HSS, HighLight) |
-| L08-67 … L08-93 | Ch.5 — Tiling Sparse Tensors (uniform occupancy/shape dilemma, overbooking, Tailors, Swiftiles, ExTensor evaluation) |
-| L08-94 … L08-96 | Ch.6 — Dataflow interplay, summary, recommended reading |
+| Slide range | Chapter section | Notes |
+|---|---|---|
+| L08-1 | Title | Administrative |
+| L08-2 to L08-8 | What problem, TL;DR, SAF overview | Expanded with definitions and irregularity explanation |
+| L08-9 to L08-22 | Dot-product example; gating vs. skipping | Rewritten as worked examples and accounting table |
+| L08-23 to L08-48 | Representation formats | Expanded with bit-count calculations and access-efficiency discussion |
+| L08-49 to L08-66 | Structured sparsity and HSS | Expanded with \(G:H\) and HSS density equations |
+| L08-67 to L08-93 | Sparse tiling and overbooking | Rewritten as buffer-utilization narrative |
+| L08-94 to L08-96 | Dataflow interplay, summary, reading | Integrated into hardware implications, connections, and source notes |
+
+## Source Notes
+
+- Lecture ordering and SAF definitions follow Lecture 08 slides 2-7.
+- Dot-product counts follow Lecture 08 slides 9-22.
+- Format bit-count examples follow Lecture 08 slides 27-36 and 37-47.
+- Structured sparsity and HSS follow Lecture 08 slides 50-66.
+- Sparse tiling, Tailors, and Swiftiles follow Lecture 08 slides 68-93. The local PDFs for Tailors/Swiftiles and HighLight were not provided in the Worker B input, so paper-specific claims for those works are kept slide-anchored.
+- TeAAL discussion uses `papers/TeAAL.pdf`, especially Sections 2.1, 2.2, 2.3, and 3.2.
+- SCNN discussion uses `papers/L17_SCNN_Parashar_ISCA2017.pdf`, especially Sections II-IV and VIII.
+- Eyeriss v2 discussion uses `papers/L17_EyerissV2_Chen_JETCAS2019.pdf`, especially Sections IV-V.
+- Pruning context uses `papers/L16_StateOfPruning_Blalock_MLSys2020.pdf`, especially Sections 2 and 3.
+
+## Uncertainty Notes
+
+- This chapter reconstructs the likely spoken explanation from slides and papers; the live lecture may have emphasized examples differently.
+- The chapter avoids embedded slide images. Existing files under `assets/L08/` may still be copyright-sensitive, but they are outside Worker B's requested write scope.
+- Quantitative claims from slides are cited as slide-derived unless independently checked against local PDFs.

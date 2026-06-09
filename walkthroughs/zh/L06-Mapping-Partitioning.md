@@ -1,43 +1,108 @@
-# L06 — 映射：切分（Mapping: Partitioning）
+# L06 - Mapping: Partitioning（映射：分割）
 
-> **課程：** 6.5930/1 — 深度學習硬體架構（Hardware Architectures for Deep Learning）
-> **講師：** Joel Emer 與 Vivienne Sze（MIT EECS）
-> **講授日期：** 2026 年 2 月 18 日 · **投影片：** 76 頁 · **來源：** [`Lecture/L06-Mapping-Partitioning.pdf`](../../Lecture/L06-Mapping-Partitioning.pdf)
+> **課程：** 6.5930/1 - Hardware Architectures for Deep Learning
+> **授課者：** Joel Emer & Vivienne Sze（MIT EECS）
+> **日期：** 2026-02-18 · **投影片：** 76 頁 · **來源：** [`Lecture/L06-Mapping-Partitioning.pdf`](../../Lecture/L06-Mapping-Partitioning.pdf)
 >
-> *本文是以「概念」為單位重建講課脈絡的導讀（walkthrough），依主題而非逐頁編排。每一節都標註其對應的投影片範圍，方便你對照原始投影片閱讀。*
+> 本章重建投影片之間缺少的教學敘事。投影片提供順序與符號；paper bridge 提供外部技術脈絡；直覺、例子、硬體意義與常見誤解則是為了自學者重新撰寫。
 
 ---
 
-## 一句話總結（TL;DR）
+## TL;DR
 
-切分（partitioning）是映射層的核心決策——它將張量（tensor）的索引空間拆分成更小的分塊（tile），每切一個維度就為 Einsum 增加一個新的秩（rank）。切分服務於兩個彼此正交的目標：**(1) 時間性複用（temporal reuse）** ——把工作集（working set）縮小到足以放入快速緩衝區並跨迴圈迭代複用；**(2) 空間平行性（spatial parallelism）** ——把獨立的子任務分配到多個處理單元（PE）同時執行。本講由淺入深地展開這個概念——從對一維向量做切分，到二維矩陣，再到完整的切分矩陣-向量計算——並透過兩個實質案例研究加以深化：**分散式矩陣乘法**（基於 ThunderKittens 演算法）與 **Transformer 注意力機制的三種切分策略**。關鍵代數事實是：切分一個秩就新增一層下標，迴圈巢狀（loop nest）相應擴充，而哪些迴圈是時間性（`for`）、哪些是空間性（`spatial-for`）的選擇，決定了*資料在何處停留、停留多久*。
+Partitioning（分割）是 mapping（映射）裡把 tensor index 切成「外層 tile index」與「內層 in-tile index」的決策。如果原本的 index 是 $i$、範圍是 $I$，切成 $(i_1,i_0)$ 之後，會有 $I=I_1I_0$ 與 $i=i_1I_0+i_0$。這個看似單純的代數變形，會產生兩個硬體後果。第一，它讓 working set（工作集合）變小，資料比較可能留在快速 buffer，而不是反覆從遠端記憶體讀回來。第二，它暴露出可以分配給不同 processing elements（PEs）的獨立 partitions。
 
----
+真正困難的地方不是符號，而是要決定：哪些 ranks 要切？哪些外層 split 是 temporal（時間上依序執行）？哪些是 spatial（空間上平行分配到 PEs）？哪些 split 會讓 reduction 或 communication 變成必要？
 
-## 學習目標（Learning Objectives）
-
-讀完本講後，你應該能夠：
-
-- 說出**切分的兩大目標**：控制複用距離以使緩衝區能保留資料，以及實現平行運算。
-- 解釋為何**切分必然新增秩**：把索引 `i` 拆成 `(i1, i0)`，其中 `i = i1 × I0 + i0`。
-- 追蹤張量被切分後迴圈巢狀的變化（新的外層迴圈、不變的內層迴圈、縮小的工作集）。
-- 區分**時間性切分**（`for` 迴圈）與**空間性切分**（`spatial-for` / `parallel_for`）。
-- 分析**分散式矩陣乘法**案例研究（ThunderKittens）：A、B、Z 如何在 G 個 PE 間切分，如何引入延遲規約（delayed reduction），以及 Einsum 如何串聯。
-- 比較**三種注意力切分策略**——張量平行（Tensor Parallel）、頭平行（Head Parallel）、資料平行（Data Parallel）——在切分哪個秩、哪些維度並行執行上的差異。
+L06 接續 L05 的 dataflow。L05 問：「loop 用什麼順序跑？weights、activations、partial sums 放在哪裡？」L06 進一步問：「每個 loop tile 多大？哪些 tile loops 要平行跑？」loop order、tile shape、spatial assignment 合在一起，才是一個完整 mapping。
 
 ---
 
-## 第一章 — 什麼是切分，為什麼需要它
+## 這堂課要解決什麼問題
 
-> *投影片：L06-2 … L06-8*
+天真的 mapping 想法是：把 loop nest 寫出來，然後讓硬體跑。但硬體通常做不到這麼理想。DNN layer 的 tensor 可能遠大於 PE 附近的 buffer，而 accelerator 又可能有很多 PEs 必須被餵飽。如果 loop nest 沒有 partitioning，會出現兩個問題。
 
-### 切分要解決的問題
+第一，reuse 來得太晚。假設某個 $B_k$ 會被很多輸出 $Z_m$ 使用。如果 computation 要走過很大的矩陣之後才回來重用它，那 $B_k$ 可能早就被 local buffer 淘汰。數學答案仍然正確，但 energy 被浪費在重讀資料上。
 
-不做切分時，矩陣-向量乘法對每個輸出元素都要遍歷整個張量 A。任一 A 元素的**複用距離（reuse distance）**——同一值兩次被存取之間的間隔——會隨著問題規模增大而增大。一旦複用距離超過緩衝區容量，資料就必須被驅逐（evict）並從更慢的記憶體層重新載入，而 L01 已確立 DRAM 存取的能耗約為 ALU 運算的 200 倍。
+第二，parallelism 仍然只是隱含存在。tensor expression 可能有上千個互相獨立的 output elements，但硬體需要明確規則：哪個 PE 負責哪一部分？Partitioning 透過把一個 index 變成多層 index，讓其中某些外層 index 可以成為 spatial loops。
 
-![未切分的矩陣-向量乘法——每個輸出都需遍歷整個 A 張量](../../assets/L06/L06-p04-unpartitioned-matvec.png)
+Source note：L06 slide 3 與 slide 8 直接列出兩個 partitioning 目標：降低 reuse distance，以及辨識可平行計算的資料集合。
 
-投影片展示了 `Zm = Ak,m × Bk` 未切分的迴圈巢狀：
+---
+
+## 為什麼這堂課重要
+
+Partitioning 是抽象 tensor algebra 變成 machine schedule 的地方。同一個 matrix multiplication，可以映射成小型 local tile、大型 streaming tile，也可以分散到多個 devices 上執行。這些選擇會影響：
+
+- **Energy（能量）：**資料來自 RF、SRAM、global buffer，還是 DRAM。
+- **Bandwidth（頻寬）：**記憶體系統是否餵得動 PEs。
+- **Latency（延遲）：**工作是依序跑，還是分散到多個 PEs 跑。
+- **Utilization（利用率）：**PEs 是否拿到均衡且足夠的工作。
+- **Communication（通訊）：**split 的 rank 是否需要跨 partitions reduction。
+- **Programmability（可程式化性）：**mapping 能否被 Timeloop 或 TeAAL 這類工具系統化描述。
+
+一個有用的心智模型是：partitioning 會把 computation 在 Roofline plot 上移動。好的 tiling 可以減少每個 operation 需要搬動的 bytes，因此提高 operational intensity；更多 spatial partitioning 可以暴露 compute throughput，但前提是 memory 和 communication system 撐得住。
+
+---
+
+## 先備知識與心智模型
+
+讀本章前，最好熟悉前面幾堂課的四個觀念。
+
+**Einsum notation：**重複出現的 indices 會被加總；留在左側的 indices 是 output free indices。例如 $Z_m=\sum_k A_{k,m}B_k$ 是 matrix-vector multiply。
+
+**Loop nests：**einsum 可以實作成 loops。free indices 與 reduction indices 的 loop order 會控制 locality 與 accumulation。
+
+**Memory hierarchy：**越靠近 PE 的資料越便宜；DRAM 通常最貴。精確能耗比取決於製程與設計，但「local reuse 很重要」這個質性結論穩定成立。
+
+**Dataflow：**dataflow 是 weights、activations、partial sums 的儲存與排程策略。Partitioning 是創造 dataflow 的主要旋鈕之一。
+
+Teaching interpretation：可以把 partitioning 想成把方格紙蓋到 tensor 上。每一格是一個 tile。Temporal tile 表示「同一份硬體先處理這格，再處理下一格」；spatial tile 表示「不同 PEs 同時處理不同格」。
+
+---
+
+## 學習目標
+
+讀完本章後，你應該能夠：
+
+- 解釋為什麼 partitioning 一個 index 會增加一個 rank。
+- 把簡單 tensor expression 從未分割形式改寫成 partitioned notation。
+- 區分 temporal partitioning 與 spatial partitioning。
+- 解釋 partition size 如何改變 reuse distance 與 working-set size。
+- 判斷 split reduction rank 什麼時候會產生跨 partition reduction。
+- 追蹤 distributed matrix multiply 例子裡，partitioned tensors 如何導向 delayed reduction。
+- 比較 attention 的 tensor parallel、head parallel、data/model-dimension parallel。
+- 用 Roofline reasoning 解釋為什麼更好的 tiling 可能提高 attainable performance。
+
+---
+
+## 主要教材式敘事
+
+### 1. Partitioning 改變結構，但不改變數學
+
+L06 最重要的規則是：
+
+$$
+i \rightarrow (i_1,i_0), \qquad i = i_1 I_0 + i_0, \qquad I = I_1 I_0.
+$$
+
+tensor 裡的值沒有變，變的是 address 方式。原本的 vector $A_i$ 變成 $A_{i_1,i_0}$。如果 $I=16$、$I_0=4$，則 $I_1=4$。原本的 $A_{11}$ 會變成 $A_{2,3}$，因為 $11=2\cdot4+3$。
+
+這就是投影片說「partitioning always adds a rank」的意思。原本一個 index $i$，現在用兩個 indices 表示。mapper 因此有兩個 loops 可以安排、重排，或分配到不同 PEs。
+
+常見誤解：partitioning 不是把 tensor 切得比較好看而已。它改變硬體看到的 loop structure；而 loop structure 會決定 locality、communication、PE assignment。
+
+Source note：vector 與 matrix 的 index identities 直接根據 L06 slides 5-6。
+
+### 2. Temporal partitioning 降低 reuse distance
+
+考慮投影片中的 matrix-vector multiply：
+
+$$
+Z_m = \sum_k A_{k,m}B_k.
+$$
+
+未分割 loop nest 是：
 
 ```python
 for m in range(M):
@@ -45,53 +110,21 @@ for m in range(M):
         Z[m] += A[k, m] * B[k]
 ```
 
-對每個 `m` 值，內層的 `k` 迴圈會遍歷 A 的所有 `K` 列。若 A 放不進本地緩衝區，則每次外層迴圈迭代都必須從 DRAM 重新取回整列資料。
+對每個 output $m$，computation 都走過所有 $k$。如果 $K$ 很大，active row/column working set 可能放不進 PE 附近的 buffer。原本稍後要 reuse 的值，可能在 reuse 前就被逐出。
 
-投影片 3 明確指出切分的兩大目標：
+現在把 $m$ 與 $k$ 都切開：
 
-1. **降低複用距離**，使張量值能在需要它的那些存取之間被保留在快速緩衝區中。
-2. **識別可平行計算的獨立資料集**，分配給不同的 PE 同時運算。
+$$
+m = m_1 M_0 + m_0, \qquad k = k_1 K_0 + k_0.
+$$
 
-![切分的目標——降低複用距離並實現平行性](../../assets/L06/L06-p03-objectives.png)
+同一個 computation 變成：
 
-### 切分必然新增秩
+$$
+Z_{m_1,m_0} = \sum_{k_1,k_0} A_{k_1,k_0,m_1,m_0} B_{k_1,k_0}.
+$$
 
-切分的基本代數操作，是用一對索引取代單一索引。對於以 `i` 為索引的一維張量：
-
-```
-i  →  (i1, i0)   其中  i = i1 × I0 + i0
-```
-
-原來的範圍 `I` 被因式分解為 `I = I1 × I0`。張量 `A_i` 變成 `A_{i1,i0}`。這不是不同的張量——它持有相同的值，只是以不同方式定址。
-
-![切分一維向量——將秩 I 拆分為 (I1, I0)](../../assets/L06/L06-p05-partitioning-vector.png)
-
-> **為什麼重要：** 切分所引入的每個秩都會在迴圈巢狀中產生一個新的迴圈。**外層迴圈**控制哪一個分塊（tile）是當前活躍的；**內層迴圈**在分塊內部迭代。正是這種結構性的新增，創造了本課用來推理資料搬移的時間性迴圈與空間性迴圈的層次結構。
-
-### 切分矩陣——兩個維度，兩次秩分裂
-
-當二維張量 `A_{k,m}` 在兩個維度上都被切分時，`k` 與 `m` 都各自被拆分：
-
-```
-k → (k1, k0)   其中  k = k1 × K0 + k0
-m → (m1, m0)   其中  m = m1 × M0 + m0
-```
-
-張量變為 `A_{k1,k0,m1,m0}`。視覺上，矩陣被劃分成一個分塊網格，每個分塊的形狀為 `K0 × M0`。
-
-![切分二維矩陣——切成 (K1,K0) × (M1,M0) 的分塊網格](../../assets/L06/L06-p06-partitioning-matrix.png)
-
-分塊邊界正是約束工作集的關鍵。當外層迴圈 `(m1, k1)` 固定時——也就是選定某一特定分塊時——計算只會觸及 A 的 `K0 × M0` 子區塊和 B 中對應的 `K0` 個元素。
-
-### 切分後的迴圈巢狀
-
-在矩陣-向量範例中同時切分 A 和 B 後，Einsum 變為：
-
-```
-Z_{m1,m0} = A_{k1,k0,m1,m0} × B_{k1,k0}
-```
-
-迴圈巢狀變為：
+一種可能 loop nest 是：
 
 ```python
 for m1 in range(M1):
@@ -101,287 +134,465 @@ for m1 in range(M1):
                 Z[m1, m0] += A[k1, k0, m1, m0] * B[k1, k0]
 ```
 
-在內層 `(m0, k0)` 迴圈執行期間，計算始終停留在 A 的 `M0 × K0` 分塊和 B 的 `K0` 個元素之中。若分塊能放入片上緩衝區，這些值就能以 SRAM 的成本（6×）而非 DRAM 的成本（200×）被複用。
+當 $m_1$ 與 $k_1$ 固定時，內層 loops 只碰到形狀為 $K_0\times M_0$ 的 $A$ tile、$K_0$ 個 $B$ values，以及 $M_0$ 個 $Z$ partial sums。如果這個 working set 放得進 local buffer，硬體可以在移到下一個 tile 前重用這些值。
 
-![切分後的矩陣-向量計算——內層迴圈始終在 M0×K0 分塊內運作](../../assets/L06/L06-p07-partitioned-matvec-computation.png)
+小例子：令 $M=8$、$K=8$、$M_0=2$、$K_0=4$。固定 $(m_1,k_1)$ 時，內層工作使用 $2\times4=8$ 個 $A$ values、$4$ 個 $B$ values、$2$ 個 $Z$ partial sums。partitioned version 給 mapper 一個明確 local working set：$8+4+2=14$ 個 tensor values。如果 PE-local buffer 放得下，tile 就能用較少高層記憶體流量完成。
 
-### 空間性切分：parallel_for
+硬體意義：temporal partitioning 主要是 locality 工具。它不會自動增加 PEs，而是讓 reuse 及早發生，進而降低 energy 與 bandwidth pressure。
 
-以上描述的都是**時間性切分（temporal partitioning）**：外層迴圈依序執行，內層迴圈在分塊內利用複用。切分的第二種用途是**空間性（spatial）**：把不同的分塊指派給不同的 PE，並行執行。
+### 3. Spatial partitioning 把 tile loops 變成平行工作
 
-空間執行的記法是 `spatial-for`（亦寫作 `parallel_for`）：
+同一個 split 也可以用於 spatial execution。對 elementwise multiply：
+
+$$
+Z_i = A_iB_i,
+$$
+
+把 $i$ 切成 $(i_1,i_0)$：
+
+$$
+Z_{i_1,i_0}=A_{i_1,i_0}B_{i_1,i_0}.
+$$
+
+如果有 $I_1$ 個 PEs，外層 loop 可以是 spatial：
 
 ```python
-spatial-for i1 in range(I1):      # 在 I1 個不同的 PE 上並行執行
+spatial_for i1 in range(I1):
     for i0 in range(I0):
         Z[i1, i0] = A[i1, i0] * B[i1, i0]
 ```
 
-在這個逐元素乘法的例子中，`i1` 將輸出切分為 `I1` 個彼此獨立的子問題，各自指派給一個 PE。不同的 `i1` 值之間沒有資料相依，因此可以真正地平行執行。
+這個例子容易平行化，是因為 $i_1$ 是 output free partition。不同 $i_1$ 寫入不同 output elements，不需要彼此通訊。
 
-![為平行性而切分——spatial-for i1 將工作分發給各個 PE](../../assets/L06/L06-p08-partitioning-for-parallelism.png)
+因此可以得到一條實用規則：
 
-> **為什麼重要：** 產生時間性外層迴圈（用於複用）的同一個秩分裂，也可以改為空間性。`for` 與 `spatial-for` 之間的選擇，是決定加速器 PE 利用率與資料搬移模式的核心設計旋鈕。許多實際的映射同時混用兩者：部分秩是時間性的（外層迴圈餵入緩衝區），其他秒則是空間性的（平行 PE 指派）。
+- split **free rank** 通常會產生獨立 output partitions。
+- split **reduction rank** 會產生 partial sums，最後必須合併。
 
----
+這條規則是後半堂課的核心轉折。
 
-## 第二章 — 案例研究：分散式矩陣-矩陣乘法
+### 4. Distributed matrix multiply：partitioning 會創造 communication
 
-> *投影片：L06-9 … L06-18*
+matrix multiply case study 從下式開始：
 
-### 動機與問題設置
+$$
+Z_{m,n}=\sum_k A_{k,m}B_{k,n}.
+$$
 
-第一個完整案例研究將切分應用於**多 PE（多 GPU）環境下的稠密矩陣-矩陣乘法**，採用的演算法來自 [Spector 等人，*ThunderKittens*，ICLR 2025]。基礎運算為：
+投影片說此 implementation based on ThunderKittens distributed matrix multiply algorithm，但本 worker pass 在 local repository 沒有找到該 paper PDF。因此本章把 ThunderKittens 細節視為 slide-derived anchors；一般 partitioning 解釋則是 teaching interpretation。
 
-```
-Z_{m,n} = A_{k,m} × B_{k,n}
-```
+partitioned expression 是：
 
-限制條件是：沒有任何單一 PE 能容納完整的 A、B 或 Z——張量必須分散到 `G` 個 PE，使每個 PE 只持有並操作屬於自己的那一部分。
+$$
+Z_{m_1,m_0,n}=\sum_{k_1,k_0}A_{k_1,k_0,m_1,m_0}B_{k_1,k_0,n}.
+$$
 
-![分散式矩陣乘法概觀——橫跨 G 個 PE 的切分 Einsum](../../assets/L06/L06-p11-distributed-matmul-overview.png)
+flattening 可確認它仍然是同一個 matrix multiply：
 
-### 切分策略
+$$
+Z_{m_1M_0+m_0,n}
+=\sum_{k_1,k_0}A_{k_1K_0+k_0,m_1M_0+m_0}B_{k_1K_0+k_0,n}.
+$$
 
-同時切分 `k` 與 `m`：
+如果 $k_1$ 被分散到 $G$ 個 PEs，每個 PE 只擁有 reduction dimension 的一部分。PE $g$ 可以計算自己 local $k_1=g$ slice 的貢獻，但無法單獨產生 final $Z$，因為最後答案需要跨所有 $k_1$ partitions 加總。
 
-```
-k → (k1, k0)   K = K1 × K0，  G = K1
-m → (m1, m0)   M = M1 × M0
-```
+這就是 communication lesson：split reduction rank 可以買到 parallel work，但結果是 partial；parallelism 的代價是 reduction。
 
-設 `G = K1`，意味著 G 個 PE 各自負責 `k` 維度中一個不同的 `k1` 切片——即運算 `k` 維度的一個不同分區。切分後張量上的 Einsum 為：
+### 5. Delayed reduction 把 dependency 明確化
 
-```
-Z_{m1,m0,n} = A_{k1,k0,m1,m0} × B_{k1,k0,n}
-```
+投影片引入 delayed-reduction variant。不要立刻對 $k_1$ reduction，而是先把 $k_1$ 放到左側：
 
-透過展開元組索引並代回，可驗證其在數學上等價於原始式：
+$$
+ZT_{k_1,m_1,m_0,n}
+=\sum_{k_0}A_{k_1,k_0,m_1,m_0}B_{k_1,k_0,n}.
+$$
 
-```
-Z_{(m1×M0+m0),n} = A_{(k1×K0+k0),(m1×M0+m0)} × B_{(k1×K0+k0),n}
-→  Z_{m,n} = A_{k,m} × B_{k,n}   ✓
-```
+再另外 reduction：
 
-### 分散張量的形狀
+$$
+Z_{m_1,m_0,n}=\sum_{k_1}ZT_{k_1,m_1,m_0,n}.
+$$
 
-每個 PE `g`（對應某個 `k1` 值）接收到：
+這不是改變答案的數學技巧，而是改變 communication 發生時間的 scheduling trick。每個 PE 可以先用 local data 算出自己的 $ZT$ slice，再由獨立 communication/reduction stage 合併。
 
-- **分散 A**（`AD_{g,k0,m1,m0}`）：G 個矩陣，每個形狀為 `K0 × (M1×M0)`，行以展平的 `(m1,m0)` 對為索引，列以 `k0` 為索引。
-- **分散 B**（`BD_{g,k0,n}`）：G 個矩陣，每個形狀為 `K0 × N`。
-- **分散 Z**（`ZD_{g,m0,n}`）：G 個矩陣，每個形狀為 `M0 × N`，以 `m1` 為索引。
+硬體意義：delayed reduction 可以讓 PEs 在同步前做更久的 local matrix multiply，改善 utilization。它也讓 compiler 或 runtime 能明確看見 communication boundary，選擇 all-reduce、reduce-scatter 或其他 collective pattern。代價是 $ZT$ 比 $Z$ 多帶一個 $k_1$ rank，在 reduction 前需要額外暫存。
 
-![分散張量 A——G 個形狀為 K0 × (M1×M0) 的切片](../../assets/L06/L06-p14-distributed-A.png)
+### 6. Distributed tensor shapes 是 mapping contracts
 
-### 延遲規約（Delayed Reduction）
+Slides 13-17 介紹 $AD_{g,k_0,m_1,m_0}$、$BD_{g,k_0,n}$、$ZD_{g,m_0,n}$。這些不是單純重新命名的 arrays，而是 mapping 與 machine 之間的 contracts。
 
-一個關鍵挑戰在於：每個 PE 用自己的 `k1` 切片計算出本地的 `Z_{m1,m0,n}` 之後，所有 PE 的部分結果都需要被**規約（reduce，即求和）**。若直接歸約，需要一個集中式收集步驟；ThunderKittens 的做法是採用**延遲規約**來重整計算：
+- $AD_{g,k_0,m_1,m_0}$ 表示 PE/group $g$ 擁有 $A$ 的 $k_1=g$ slice。
+- $BD_{g,k_0,n}$ 表示同一 PE/group 擁有 matching $k_1=g$ 的 $B$ slice。
+- $ZD_{g,m_0,n}$ 表示某個 output partition 在 communication 前後由 local side 持有。
 
-1. **把 `k1` 移到 Einsum 的左側**，推遲對 `k1` 的求和：
-   ```
-   ZT_{k1,m1,m0,n} = A_{k1,k0,m1,m0} × B_{k1,k0,n}
-   ```
-   現在 `ZT` 具有顯式的 `k1` 維度——每個 PE 產生 `ZT` 的一個 `k1` 切片。
+讀 distributed tensor name 時，可以問三個問題：
 
-2. **在獨立的步驟中執行規約**：
-   ```
-   Z_{m1,m0,n} = sum over k1 of ZT_{k1,m1,m0,n}
-   ```
+1. 哪個 rank 決定 PE ownership？
+2. 哪些 ranks 是 PE 內部 local loops？
+3. 哪些缺失的 ranks 代表 replication、reduction 或後續 assembly？
 
-![延遲規約——將 k1 求和推遲到獨立的 Einsum 步驟](../../assets/L06/L06-p12-delayed-reduction.png)
+### 7. Attention partitioning：三種切 Transformer work 的方式
 
-這樣做的回報是：規約可以與計算重疊，並以高效的全規約（all-reduce）模式在 PE 間執行，而非在每次本地乘法後強制設置同步屏障。
+attention section 把同樣的 rank-splitting logic 用在 transformer equations。投影片列出三種策略。
 
-### 完整 Einsum 鏈
+**Tensor parallel：**把 batch dimension $b\rightarrow(b_1,b_0)$，並平行執行 $b_1$。forward pass 中不同 batch elements 彼此獨立，所以 attention core 的 communication 較少。代價是 weight replication：每個 PE group 都需要 projection weights。
 
-整個演算法由三個階段的 Einsum 構成：
+**Head parallel：**把 attention head dimension $h\rightarrow(h_1,h_0)$，並平行執行 $h_1$。不同 heads 在 concatenation 與 output projection 前大多可獨立計算。這很自然，因為 transformer attention 本來就把 computation 分解到 heads。
 
-**分散（Distribution）**（從全域儲存將切分後的張量載入每個 PE 的本地儲存）：
+**Data/model-dimension parallel：**把 $h$ 與 $d$ 都切開，並平行執行 $h_1$ 與 $d_1$。這暴露更多 parallelism，但 split $d$ 會碰到 projection reductions，因此 partial results 可能需要 communication。
 
-```
-AD_{g,k0,m1,m0} = A_{g,m1,k0,m0}   （重排／置換）
-BD_{g,k0,n}     = B_{g,k0,n}        （選取 k1=g 的切片）
-```
+Slides 20-22 的 tensor names 很密，但設計問題很簡單：你切的是 free rank、自然獨立的 structural rank，還是 contraction rank？
 
-**主要計算（Main computation）**（本地矩陣乘法＋部分累加）：
+小例子：假設 transformer layer 有 $H=8$ heads 與 $4$ 個 PE groups。head-parallel split 可以選 $H_1=4$、$H_0=2$。每個 PE group 計算兩個 heads，這些 heads 的 attention score 與 value contraction 可以 local 執行。之後 outputs 必須 concatenated 到 model dimension，再交給 output projection。如果改成 split model dimension $d$，Q/K/V projections 會產生 $d$ 上的 partial sums，所以 reduction 或 collective communication 會出現。
 
-```
-ZL_{g,m1,m0,n}  = AD_{g,k0,m1,m0} × BD_{g,k0,n}
-ZD_{g,m0,n}     = ZL_{h,g,m0,n}     （對 h 規約——跨 PE 的規約）
-```
-
-**收尾（Finalization）**（從分散結果組裝最終 Z）：
-
-```
-ZM_{g,m0,n} = ZD_{g,m0,n}
-```
-
-![分散式矩陣乘法的完整 Einsum 鏈](../../assets/L06/L06-p17-distributed-einsums.png)
-
-> **為什麼重要：** 這個案例研究表明，切分不僅僅是一個軟體迴圈排序技巧——它直接決定了資料如何在平行機器上分散、通訊（規約）如何組織，以及每個 PE 的工作集是什麼。用 Einsum 鏈來表達演算法，使每個階段的資料搬移與規約都變得顯式，從而能使用 Timeloop 等工具進行系統性分析。
+連結 L04：L04 把 attention 介紹為 query、key、value、sequence、head dimensions 上的 einsums；L06 問的是這些 ranks 哪些該為硬體被 split。
 
 ---
 
-## 第三章 — 案例研究：Transformer 注意力機制的切分
+## Worked Examples
 
-> *投影片：L06-19 … L06-22*
+### Example 1：還原原始座標
 
-### 為什麼要切分注意力機制
+令 $I=12$、$I_0=3$、$I_1=4$。原始 index 是 $i=i_1I_0+i_0$。
 
-Transformer 注意力（attention）涉及多個大型矩陣乘法的鏈式計算（Q/K/V 投影、QK^T、softmax、AV 縮并、輸出投影）。這些操作記憶體密集，天然適合在多個 PE 間切分執行。本講提出**三種不同的切分策略**，各自切分不同的秩：
+- $(i_1,i_0)=(0,2)$ 對應 $i=2$。
+- $(i_1,i_0)=(2,1)$ 對應 $i=7$。
+- $(i_1,i_0)=(3,2)$ 對應 $i=11$。
 
-### 策略一 — 張量平行（Tensor Parallel，切分批次維度 B）
+硬體意義：$i_1$ 可以命名 tile 或 PE assignment；$i_0$ 命名 tile 內的位置。
 
-批次索引 `b` 被拆分：`b → (b1, b0)`。
+### Example 2：Free-rank split vs. reduction-rank split
 
-所有以 `b` 為自由索引（free index）的矩陣乘法都以拆分後的索引重複執行。由於 `b1` 的各分區彼此獨立（前向傳播中不同批次元素不共享資料），`b1` 可以用 `spatial-for` 執行——將每個 `b1` 切片指派給不同的 PE（或 PE 群組）。
+對 $Z_m=\sum_kA_{k,m}B_k$：
 
-![注意力——張量平行：切分批次維度 B](../../assets/L06/L06-p20-attention-tensor-parallel.png)
+- split $m$ 會產生不同 output tiles。不同 PEs 可以擁有不同 $m_1$，因為它們寫不同 $Z$ elements。
+- split $k$ 會產生 partial sums。不同 PEs 可以擁有不同 $k_1$，但它們都貢獻到同一批 final $Z_m$，所以需要 reduction。
 
-權重矩陣 `W_I, W_Q, W_K, W_V, W_Z` 在所有 `B1` 個 PE 間**複製（replicated）**（因為它們與 `b` 無關）。每個 PE 持有完整的權重副本，但只持有 `B0` 大小的激活值切片。當批次大小相對於權重大小較大時，張量平行的優勢最為顯著。
+硬體意義：兩種 split 都暴露 parallelism，但只有 free-rank split 通常不需要 communication。
 
-### 策略二 — 頭平行（Head Parallel，切分頭維度 H）
+### Example 3：用 Roofline 讀 tile
 
-頭索引 `h` 被拆分：`h → (h1, h0)`。
+Operational intensity 是：
 
-不同的注意力頭之間彼此獨立；每個頭都有自己的 Q、K、V 與輸出投影。切分 `h` 並用 `spatial-for` 執行 `h1`，就能把不同頭的群組指派到不同的 PE。每個 PE 持有完整的輸入 `I_{b,m,d}`，但只持有屬於自己的那部分頭的權重與激活值。
+$$
+\text{operational intensity}=\frac{\text{operations}}{\text{bytes moved from the chosen memory level}}.
+$$
 
-![注意力——頭平行：切分注意力頭維度 H](../../assets/L06/L06-p21-attention-head-parallel.png)
+假設一個小 tile 做 $128$ 個 MACs。如果 implementation 從 DRAM 搬 $512$ bytes，operational intensity 是 $128/512=0.25$ MAC/byte。若更好的 temporal partitioning 讓同樣 $128$ MACs 只需從 DRAM 搬 $128$ bytes，operational intensity 變成 $1$ MAC/byte。MAC 數沒有變，變的是 mapping 導致的 memory traffic。
 
-頭平行是目前多 GPU 系統中最常見的注意力切分方式（例如 Megatron-LM 中的張量平行性正是採用這種策略）。輸出串接 `C_{b,p,(h1×H0+h0)×F+f}` 將各頭的輸出重新組合。
-
-### 策略三 — 資料平行（Data Parallel，同時切分 H 與 D）
-
-最激進的策略同時切分頭維度 `h → (h1, h0)` *和*模型維度 `d → (d1, d0)`。對 `h1` 和 `d1` 進行空間性執行，可達到更高的平行度，代價是需要通訊來合并部分 `d` 的求和（因為 `d` 在 Q/K/V 投影中是縮并索引）。
-
-三種策略都展示了同一個模式：**選擇一個可將計算切分為獨立（或近乎獨立）子問題的秩，拆分該秩，並將外層迴圈標記為空間性**。
-
-> **為什麼重要：** 現代大規模推論與訓練系統正是建立在這些切分選擇之上。了解哪個秩被切分——以及它是否引入規約相依性（如矩陣乘法中的 `k`）還是自由秩（如 `b` 或 `h`）——決定了平行執行是否需要全規約（all-reduce），或者是令人省心的「令人尷尬地可平行（embarrassingly parallel）」。架構師必須在設計階段就對此做出推理。
+Source note：這是原創教學例子。definition 與 performance-bound interpretation 依據 Williams、Waterman、Patterson 的 Roofline paper，CACM 2009，Roofline Model section 與 Figure 1 討論。
 
 ---
 
-## 第四章 — 迴圈巢狀框架中的切分
+## Key Equations and How to Read Them
 
-> *投影片：L06-2 … L06-8（在兩個案例研究的背景下回顧）*
+### Partition identity
 
-### 代數規則總結
+$$
+i=i_1I_0+i_0,\qquad I=I_1I_0.
+$$
 
-每一個切分決策都遵循同一個模板：
+$i_1$ 選 tile；$i_0$ 選 tile 內座標。硬體設計者在意的是：$i_1$ 可以成為 temporal tile loop，也可以成為 spatial PE-assignment loop。
 
-| 切分前 | 切分後 |
-|---|---|
-| 索引 `i`，範圍 `I` | 索引 `(i1, i0)`，範圍 `(I1, I0)`，其中 `I = I1 × I0` |
-| Einsum 中的一個秩 `i` | Einsum 中的兩個秩 `(i1, i0)` |
-| 一個迴圈 | 兩個迴圈：外層迭代 `i1`，內層迭代 `i0` |
+### Partitioned matrix-vector multiply
 
-多個獨立維度可以同時被切分；結果是所有切分的乘積被體現在 Einsum 中。
+$$
+Z_{m_1,m_0}
+=\sum_{k_1,k_0}A_{k_1,k_0,m_1,m_0}B_{k_1,k_0}.
+$$
 
-### 時間性迴圈 vs. 空間性迴圈
+free ranks $(m_1,m_0)$ 識別 output elements；repeated ranks $(k_1,k_0)$ 識別 reduction。如果 $k_1$ 是 spatial，final output correctness 需要跨 $k_1$ partitions 加總。
 
-秩一旦被拆分，外層迴圈 `i1` 可以是：
+### Delayed reduction
 
-- **時間性（temporal）**（`for i1 in range(I1)`）：迭代在*同一個* PE 上依序執行。好處是內層分塊（`i0`）能放入本地緩衝區，緩衝區內容在內層迴圈迭代中被**複用**，然後再被驅逐。
-- **空間性（spatial）**（`spatial-for i1 in range(I1)`）：迭代被指派給*不同的* PE 並行執行。每個 PE 持有自己的 `i0` 大小的工作集，並獨立執行內層迴圈。
+$$
+ZT_{k_1,m_1,m_0,n}
+=\sum_{k_0}A_{k_1,k_0,m_1,m_0}B_{k_1,k_0,n},
+\qquad
+Z_{m_1,m_0,n}=\sum_{k_1}ZT_{k_1,m_1,m_0,n}.
+$$
 
-單一 Einsum 可能有多個被切分的秩，部分是時間性的，部分是空間性的。完整的映射是所有這些選擇在所有秩上的組合。
+temporary tensor $ZT$ 保留 partitioned reduction rank，讓 communication stage 清楚浮現。
 
-### 與 L05（映射——資料流）的連結
+### Roofline bound
 
-L05 引入了 DNN 運算的迴圈巢狀表示，並將**資料流（dataflow）**描述為迴圈執行的*順序*以及資料在記憶體階層中的*放置方式*。L06 透過加入**切分（partitioning）**完成了映射的圖景：哪些維度邊界被分塊、分塊的形狀是什麼、哪些迴圈是空間性的。迴圈順序＋分塊大小＋空間性／時間性標記，合起來構成了 Timeloop 等工具所評估的完整映射規格。
+$$
+\text{attainable performance}
+=\min(\text{peak compute},\ \text{peak bandwidth}\times\text{operational intensity}).
+$$
 
-> **為什麼重要：** 切分是將抽象演算法帶入與硬體有限資源（有限的 PE 數、有限的緩衝區容量、有限的頻寬）相對應的機制。正確地設定分塊大小，是使硬體達到算術強度（arithmetic intensity）閾值——在該閾值以上硬體受計算限制而非記憶體頻寬限制——的首要槓桿。
-
----
-
-## 獨立學習指南（Standalone Study Guide）
-
-### 進入下一講前必須掌握
-
-- 把切分視為秩分裂：`i -> (i1, i0)`，原始座標可由這對索引還原。
-- 區分用於重用的時間切分與用於平行化的空間切分。
-- 說明為什麼切分 reduction rank 會在 partition 之間引入 reduction。
-- 依「切分哪個秩」比較 attention 的 tensor、head 與 data parallelism。
-
-### 自我檢核問題
-
-1. 在矩陣乘法中切分 `k` 與 `m` 後，會新增哪些迴圈？
-2. 為什麼切分自由秩通常比切分 reduction rank 容易？
-3. 在 delayed reduction 中，最後 reduction 前先把哪個值顯式放到左側？
-
-### 練習
-
-1. 將 `Z[m] = A[k,m] * B[k]` 同時切分 `k` 與 `m`，再寫出新的迴圈巢。
-2. 選一種 attention partitioning 策略，列出哪些張量被複製、切片或 reduction。
-3. 對四個 PE 的系統提出一種矩陣乘法切分方式，並指出需要溝通的步驟。
-
-### 常見誤區
-
-- 把 tiling 和 parallelization 當成同一件事。兩者可使用相同 split，但 loop annotation 不同。
-- 忘記切分會改變 mapper 看到的 rank structure。
-- 假設所有平行策略都不需要溝通。切分 reduction rank 一定會帶來 communication。
+這條式子說，一個 mapping 可能 compute-bound，也可能 bandwidth-bound。當 partitioning 降低同樣 operations 所需 bytes moved 時，就可能提高 operational intensity。
 
 ---
 
-## 關鍵詞彙（Key Terms）
+## Hardware Implications
 
-| 詞彙 | 說明 |
-|---|---|
-| **切分（Partitioning）** | 將張量索引範圍拆分為分塊；每次切分都為 Einsum 新增一個秩。 |
-| **分塊（Tiling）** | 時間性切分的同義詞；將迭代空間劃分為固定大小的區塊以改善資料局部性。 |
-| **秩（Rank）** | Einsum 記法中張量的一個維度（下標）；切分會增加秩。 |
-| **分塊／分區（Tile / Partition）** | 能放入記憶體階層某一層或被指派給一個 PE 的張量子區塊。 |
-| **複用距離（Reuse distance）** | 同一資料值兩次被存取之間的間隔存取次數；分塊可降低複用距離。 |
-| **時間性切分（Temporal partitioning）** | 對外層（分塊）索引使用 `for` 迴圈；在同一個 PE 上依序執行，以在內層分塊內實現資料複用。 |
-| **空間性切分（Spatial partitioning）** | 對外層（分塊）索引使用 `spatial-for` / `parallel_for`；不同分塊指派給不同 PE 並行執行。 |
-| **工作集（Working set）** | 內層迴圈中被主動使用的資料集合；分塊將工作集縮小以放入快速本地緩衝區。 |
-| **延遲規約（Delayed reduction）** | 將對切分索引的求和（規約）推遲為一個獨立的、後續的 Einsum 步驟，從而使規約能與計算重疊。 |
-| **分散式矩陣乘法（Distributed matrix multiply）** | 基於切分的平行演算法（此處為 ThunderKittens），G 個 PE 各持有 `k` 維度的 `1/G`，然後規約部分結果。 |
-| **張量平行（Tensor Parallel）** | 切分批次維度 B 的注意力切分策略；權重在所有 PE 間複製。 |
-| **頭平行（Head Parallel）** | 切分注意力頭維度 H 的注意力切分策略；不同的頭在不同的 PE 上執行。 |
-| **資料平行（Data Parallel）** | 同時切分 H 和 D 的注意力切分策略；實現更高的 PE 數，但需要對 D 維度做規約。 |
-| **spatial-for / parallel_for** | 迴圈標記，表示該迴圈的各次迭代在不同的 PE 上同時執行（空間性，而非時間性）。 |
-| **Einsum** | 本課程貫穿始終使用的張量縮并記法；切分透過新增下標的方式在現有 Einsum 中表達。 |
-| **ThunderKittens** | 高效能 GPU 矩陣乘法核心 [Spector 等人，ICLR 2025]，作為分散式切分矩陣乘法的案例研究。 |
+**Buffer sizing：**tile dimensions 必須讓 active weights、activations、partial sums 放進目標 buffer level。
+
+**Bandwidth：**temporal tile 太大會 spill 到高層 memory；太小則可能 reuse 不足、loop overhead 過高。
+
+**PE utilization：**spatial partitioning 暴露 parallel work，但每個 partition 必須有足夠且相近的工作量。
+
+**Reduction cost：**split reduction rank 會創造 communication；mapping 必須考慮 collective bandwidth 與 synchronization。
+
+**Area：**更多 local storage 可支援較大 tile，但會消耗 area，也可能影響 clock 或 PE count。
+
+**Correctness：**partitioning 必須保留原本 flattened coordinate mapping，且不能漏掉 reductions。
+
+**Programmability：**明確 rank splits 讓 mapping 更容易被 formal tools 描述，因為 tile shape 與 spatial assignment 變成一等公民。
 
 ---
 
-## 重點回顧（Takeaways）
+## Common Misconceptions
 
-- **切分必然新增秩。** 將索引 `i` 拆分為 `(i1, i0)` 在 Einsum 中引入了新的下標層次，在迴圈巢狀中引入了新的迴圈。每一個切分決策都具有這種形式。
-- **時間性切分控制複用距離。** 透過分塊，內層迴圈能將工作集保留在快速片上緩衝區（SRAM ≈ 6×）中，而非反覆從 DRAM（≈ 200×）取回資料。
-- **空間性切分實現平行性。** 將外層迴圈標記為 `spatial-for`，使每個分塊被指派給不同的 PE。自由秩的切分（如批次 `b` 或頭 `h`）可令人尷尬地平行（embarrassingly parallel）；縮并秩的切分（如 `k`）則需要規約步驟。
-- **兩大目標正交卻常常組合。** 實際的加速器映射通常在同一迴圈巢狀中同時包含空間性迴圈（用於 PE 平行性）和時間性迴圈（用於緩衝區複用）。
-- **延遲規約將計算與同步解耦。** 透過將 `k1` 求和改為獨立的 Einsum 步驟，ThunderKittens 演算法使每個 PE 能計算完整的本地分塊而無需等待，然後再非同步地規約。
-- **注意力機制有多種切分策略。** 張量平行（切分 B）、頭平行（切分 H）、資料平行（切分 H+D）代表了在複製成本與通訊成本之間的不同權衡。頭平行是目前部署的多 GPU 推論中最常見的方式。
+### 誤解：partitioning 和 parallelism 是同一件事。
+
+Partitioning 只是在 tensor/loop 結構中加入 rank levels。只有當某個 level 被 spatial assignment 到 PEs，parallelism 才真正出現。
+
+### 誤解：split 任何 rank 都不需要 communication。
+
+split free output rank 通常容易；split reduction rank 會產生 partial sums，最後必須合併。
+
+### 誤解：tile 越小越好。
+
+小 tile 可能放進 local memory，但也可能降低 reuse、增加 loop overhead、讓 PEs 吃不飽。tile size 是 tradeoff，不是單調越小越好。
+
+### 誤解：$AD$、$BD$ 這種 tensor name 只是 bookkeeping。
+
+Distributed tensor names 編碼了 ownership。它們告訴我們哪個 PE 持有哪些資料，以及哪個 communication step 會出現。
 
 ---
 
-## 與後續講次的連結（Connections）
+## Connections to Previous and Later Lectures
 
-- **與 L05 共同完成映射層。** L05 涵蓋了迴圈排序與資料流（哪些迴圈在最內層、資料如何放置）。L06 加入了切分（分塊大小與空間性指派）。兩者合起來完整地規格化了 TeAAL 關注點金字塔的映射節點。
-- **稀疏架構（L07–L10）** 將同樣的切分思路擴展到*非均勻*的分塊大小——跳過零元素的分塊——但秩分裂的代數運算完全相同。
-- **記憶體階層與頻寬**（在 L04 中討論，並貫穿各講）：正確地調整切分大小以適應緩衝區階層的每一層（RF → 本地 SRAM → 全域緩衝區 → DRAM）是分塊重要性的根本原因；這在 L01 的能耗表中已建立。
-- **分散式推論系統**：本講介紹的張量平行、頭平行、資料平行策略，正是實際分散式推論框架（Megatron-LM、DeepSpeed、TensorRT-LLM）中所使用的策略，使本講直接適用於系統層級的 DNN 部署。
+**L01-L03：**memory hierarchy 與 operational intensity 解釋 partitioning 為何重要。數學 computation 一樣，但 energy 與 bandwidth 可能差很多。
+
+**L04：**attention 被介紹成 tensor algebra。L06 使用同樣 ranks 推理 transformer execution 的 parallelism。
+
+**L05：**loop order 與 dataflow 描述資料如何穿越 PE array。L06 加上 tile shape 與 spatial assignment。
+
+**L07-L10：**sparse architectures 仍需要 partitioning，但 sparsity 讓 tile work 不均、metadata 出現，load balance 更難。
+
+**L13：**calculating motion 會把這些 qualitative mapping choices 轉成 explicit reads、writes、transfers 計數。
 
 ---
 
-## 附錄 — 投影片對照表（Slide-to-Section Map）
+## Paper Bridge: Roofline
 
-| 投影片 | 章節 |
-|---|---|
-| L06-1 | 標題 |
-| L06-2 | 第一章 — 切分小節標頭 |
-| L06-3 | 第一章 — 切分的目標 |
-| L06-4 … L06-5 | 第一章 — 未切分矩陣-向量乘法；切分一維向量 |
-| L06-6 … L06-7 | 第一章 — 切分矩陣；切分後的矩陣-向量計算 |
-| L06-8 | 第一章 — 為平行性而切分（spatial-for） |
-| L06-9 | 第二章 — 分散式矩陣乘法小節標頭 |
-| L06-10 … L06-11 | 第二章 — 目標與概觀 |
-| L06-12 | 第二章 — 延遲規約 |
-| L06-13 … L06-16 | 第二章 — 分散張量的形狀（AD、BD、ZD） |
-| L06-17 … L06-18 | 第二章 — 完整 Einsum 鏈；方法總結 |
-| L06-19 | 第三章 — 切分注意力機制小節標頭 |
-| L06-20 | 第三章 — 注意力：張量平行 |
-| L06-21 | 第三章 — 注意力：頭平行 |
-| L06-22 | 第三章 — 注意力：資料平行 |
-| L06-23 … L06-76 | 動畫影格（迴圈巢狀視覺化與執行追蹤） |
+### Bibliographic identity
+
+- **Title:** "Roofline: An Insightful Visual Performance Model for Multicore Architectures"
+- **Authors:** Samuel Williams, Andrew Waterman, and David Patterson
+- **Year / venue:** Communications of the ACM, 2009
+- **Used in lecture(s):** 支撐 L01/L02 的 roofline material，也支撐 L06 的 partitioning-as-locality 討論。
+
+### Problem addressed
+
+這篇 paper 要解決的是：在 compute capability 與 memory bandwidth 都差異很大的 multicore systems 上，如何用簡單模型理解 performance bottleneck。它不是精準預測 runtime，而是提供 bound-and-bottleneck model，幫助判斷 kernel 是 compute throughput limited 還是 memory bandwidth limited。
+
+### Core idea
+
+Roofline 把 attainable performance 對 operational intensity 作圖。Operational intensity 是 operations per byte of DRAM traffic，而且 traffic 是經過 cache hierarchy 過濾後到 DRAM 的 bytes。performance 被 peak compute 與 peak memory bandwidth times operational intensity 的較小者限制。
+
+### Relevance to this lecture
+
+Partitioning 會改變同樣 arithmetic operations 需要搬動多少 bytes。因此，partitioning 可以透過提高 operational intensity，把 kernel 在 Roofline plot 上往右移。它也能提醒我們：如果 bandwidth 已經是限制，單純加更多 spatial PEs 不一定會更快。
+
+### Key claims used in this chapter
+
+- Operational intensity 定義為 operations per byte of DRAM traffic，且 memory traffic 是 cache-filtered traffic。Source：Roofline paper，Roofline Model section，CACM 2009，pp. 66-67。
+- Roofline bound 是 $\min(\text{peak compute},\text{peak bandwidth}\times\text{operational intensity})$。Source：Roofline paper，p. 67 formula。
+- Ridge point 表示達到 peak compute 所需的最小 operational intensity。Source：Roofline paper，Figure 1 discussion，p. 67。
+
+### What students should remember
+
+- Roofline 不會替你選 partition，但會解釋 partition 為何有意義。
+- 能 local reuse data 的 mapping 可以提高 operational intensity。
+- 沒有足夠 bandwidth 的 spatial parallelism，只是在同一條 bandwidth roof 上更用力。
+
+### Limitations and assumptions
+
+Roofline 是 bound model，不是精準 simulator。它抽象掉 control overhead、synchronization、bank conflicts、irregular sparsity 等細節。在 DNN accelerators 中，它適合作為進入 detailed mapping/energy tools 前的 intuition。
+
+### Suggested insertion points
+
+在說明 temporal partitioning 如何降低 bandwidth pressure，以及評估 spatial partition 是否可能 compute-bound 或 bandwidth-bound 時引用。
+
+---
+
+## Paper Bridge: TeAAL
+
+### Bibliographic identity
+
+- **Title:** "TeAAL: A Declarative Framework for Modeling Sparse Tensor Accelerators"
+- **Authors:** Nayak et al.
+- **Year / venue:** MICRO 2023
+- **Used in lecture(s):** L01 pyramid context、L06 mapping formalism，以及後續 sparse accelerator lectures。
+
+### Problem addressed
+
+Sparse tensor accelerators 很難比較，因為每個設計都混合 algorithm、tensor formats、mappings、architecture resources 與 bindings。TeAAL 提供 declarative 方法描述這些 concerns，並生成 accelerator models。
+
+### Core idea
+
+TeAAL 把 tensor computation 與 mapping 分開。Extended einsums 描述要算什麼；mapping specifications 描述 ranks 如何排序、partition、schedule。這正對應 L06：partitioning 改變 mapping，但不改變 mathematical einsum。
+
+### Relevance to this lecture
+
+L06 可以視為 TeAAL mapping layer 的手算版。當我們把 $i$ 切成 $(i_1,i_0)$，再決定 $i_1$ 是 temporal 或 spatial，我們就在做 TeAAL 想明確表示的 mapping choice。
+
+### Key claims used in this chapter
+
+- TeAAL 使用 einsums 指定 computation，並用 mapping specifications 描述 rank ordering、partitioning、scheduling。Source：TeAAL Sections 2.2 and 2.3。
+- TeAAL 包含 mapping、tensor format、architecture、binding 等 separate specifications。Source：TeAAL Sections 3-4。
+- 該 framework 針對 sparse tensor accelerators，其中 mapping 與 format choices 強烈互動。Source：TeAAL abstract and Section 2。
+
+### What students should remember
+
+- Einsum 說要算什麼；mapping 說如何執行。
+- Partitioning 是 mapping operation，不是改變數學結果。
+- 明確 rank splits 有用，因為工具可以分析 locality、parallelism、communication。
+
+### Limitations and assumptions
+
+TeAAL 是 modeling framework，不是會自動找出最佳 mapping 的萬能 optimizer。本章用 TeAAL 釐清 abstraction，不主張 L06 例子有特定 speedup。
+
+### Suggested insertion points
+
+在 partition identity 之後，以及說明 distributed tensors 是 mapping contracts 時引用。
+
+---
+
+## 獨立學習指南
+
+### 如何讀這堂課
+
+1. 練習把一個 index $i$ 轉成 $(i_1,i_0)$，直到 coordinate mapping 變直覺。
+2. 對每個 split 問：這是 free rank 還是 reduction rank？
+3. 對每個 outer split rank 標記 temporal 或 spatial。
+4. 估算 inner tile 的 active working set。
+5. 找出是否需要 communication 或 reduction。
+
+### Self-check questions
+
+1. 為什麼把 $i$ partition 成 $(i_1,i_0)$ 會增加 tensor rank？
+2. 在 $Z_m=\sum_kA_{k,m}B_k$ 中，split $m$ 和 split $k$ 差在哪裡？
+3. partitioned matrix-vector tile 需要哪些資料放進 local buffer？
+4. 為什麼 delayed reduction 會引入 $ZT_{k_1,m_1,m_0,n}$？
+5. 在 attention 中，為什麼 head parallelism 通常比 split contraction dimension 容易？
+6. partitioning 如何提高 operational intensity？
+
+### Exercises
+
+1. **Conceptual：**各用一句話說明 tile loop 與 spatial loop 的差別。
+2. **Small calculation：**令 $I=24$、$I_0=6$。$I_1$ 是多少？$i=17$ 的 partitioned coordinate 是什麼？
+3. **Loop-nest rewrite：**用 $M_0=2$、$K_0=4$ partition $Z_m=\sum_kA_{k,m}B_k$，並寫出 loop nest。
+4. **Design tradeoff：**你有四個 PEs。matrix-vector multiply 會先 split $m$ 還是 $k$？說明 communication tradeoff。
+5. **Paper bridge：**用 Roofline 說明，為什麼減少 DRAM traffic 的 tile 即使 MAC count 不變，也可能改善 attainable performance。
+6. **Open-ended architecture reasoning：**對 $H=16$ heads 與 $8$ PE groups 的 attention，提出 head-parallel split，並列出哪些 tensors 被 sharded 或 replicated。
+
+---
+
+## 關鍵詞彙
+
+### Partitioning（分割）
+
+把 index range 切成多個 rank levels，例如 $i\rightarrow(i_1,i_0)$。硬體上重要，因為新的 rank levels 可以成為 tile loops 或 PE-assignment loops。
+
+### Tile（分塊）
+
+由固定 outer partition indices 選出的 tensor 或 iteration-space 子集合。好的 tile 要大到能 reuse，也要小到能放進目標 buffer。
+
+### Reuse distance（重用距離）
+
+同一個 value 兩次使用之間隔了多少 accesses。Temporal partitioning 試圖縮短 reuse distance，讓 value 留在快速儲存中。
+
+### Temporal partitioning（時間式分割）
+
+outer tile loop 依序執行的 partition。主要用途是 locality 與 buffer management。
+
+### Spatial partitioning（空間式分割）
+
+outer tile loop 被分散到多個 PEs 的 partition。主要用途是 parallelism。
+
+### Free rank（自由 rank）
+
+出現在 output 的 index。split free rank 通常會產生獨立 output partitions。
+
+### Reduction rank（歸約 rank）
+
+只出現在 einsum 右側、最後被加總掉的 index。split reduction rank 會產生需要合併的 partial sums。
+
+### Working set（工作集合）
+
+tile inner loops 執行期間必須保持 live 的資料，包括 input tiles 與 partial sums。
+
+### Delayed reduction（延遲歸約）
+
+先把 partitioned reduction rank 留在 temporary output，再於後續 stage reduction。它讓 communication stage 明確化。
+
+### Operational intensity（操作強度）
+
+每搬動一 byte 可執行的 operations，classic Roofline 通常以 DRAM traffic 為基準。operational intensity 越高，越可能發揮 compute throughput。
+
+### Ridge point（屋脊點）
+
+Roofline 中 bandwidth roof 與 compute roof 相交的位置，表示要變成 compute-bound 所需的 operational intensity。
+
+### Distributed tensor（分散式 tensor）
+
+indices 中包含 PE/device ownership rank 的 tensor，例如 $AD_{g,k_0,m_1,m_0}$ 裡的 $g$。
+
+---
+
+## 重點回顧
+
+- Partitioning 改變 tensor rank structure，但不改變數學結果。
+- Temporal partitioning 是 locality；spatial partitioning 是 parallel work。
+- Free-rank splits 通常比 reduction-rank splits 更容易平行化。
+- Delayed reduction 讓 communication 明確，給 mapper 安排 collectives 的位置。
+- Attention partitioning 是同一套 rank-splitting idea 套用到 transformer dimensions。
+- Roofline 解釋 partitioning 為何能透過減少 bytes moved per operation 改善 performance。
+
+---
+
+## 連結
+
+本章往回連到 L05，因為 dataflow 需要 tile shapes 與 spatial loops 才能形成完整 mapping。它也連到 L03/L04，因為 einsum notation 讓 rank splitting 變得精確。往後它連到 L07-L10，因為 sparse tensors 會讓 partitioning 遇到 irregular densities 與 load balance 問題。它也直接連到 L13，因為 calculating data motion 必須知道精確的 partitioned loop nest。
+
+---
+
+## 附錄 - Slide-to-Section Map
+
+| Slide range | Chapter section | Notes |
+|---|---|---|
+| L06-1 | Title and metadata | Lecture identity |
+| L06-2 | Main narrative | Partitioning topic setup |
+| L06-3 | 這堂課要解決什麼問題 | objectives 直接來自投影片 |
+| L06-4 | Temporal partitioning | unpartitioned matrix-vector example |
+| L06-5 | Partitioning 改變結構 | vector rank split |
+| L06-6 | Partitioning 改變結構 | matrix rank split |
+| L06-7 | Temporal partitioning | partitioned matrix-vector loop nest |
+| L06-8 | Spatial partitioning | `spatial_for` example |
+| L06-9-L06-18 | Distributed matrix multiply | 擴充 reduction/communication 解釋 |
+| L06-19-L06-22 | Attention partitioning | 擴充 transformer-rank interpretation |
+| L06-23-L06-76 | Source notes | extracted text 多數為空白或 animation frames，未視為新增概念內容 |
+
+---
+
+## Source Notes
+
+- 本章順序與主要 examples 依據 `Lecture/L06-Mapping-Partitioning.pdf`。
+- partitioning objectives 直接來自 L06 slide 3。
+- vector 與 matrix partition identities 直接來自 L06 slides 5-7。
+- distributed matrix multiply notation 與 delayed reduction 依據 L06 slides 10-18。ThunderKittens 由 slide deck 引用，但本 worker pass 沒有 local paper PDF，因此 ThunderKittens-specific claims 僅視為 slide-stated。
+- attention partitioning strategies 依據 L06 slides 20-22，並使用 L04 的 standard transformer background。
+- Roofline bridge 使用 `papers/Roofline Model.pdf`，尤其 Roofline Model section 與 Figure 1 discussion。
+- TeAAL bridge 使用 `papers/TeAAL.pdf`，尤其 Sections 2.2、2.3、3、4。
+- worked examples 除非另有標註，都是原創教學例子。
+
+## Uncertainty Notes
+
+- live lecture 可能對後段 animation frames 有不同強調；L06-22 之後的 extracted text 多數是空白頁面。
+- 若之後加入 ThunderKittens 原 paper，distributed matrix multiply 的 implementation details 應再核對。
+- 本章沒有刪除或審核 `assets/L06` 既有 slide-derived assets；只是避免新增 copied figures。

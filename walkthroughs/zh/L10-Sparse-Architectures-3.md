@@ -1,18 +1,62 @@
 # L10 — 稀疏架構三（Sparse Architectures 3）
 
 > **課程：** 6.5930/1 — 深度學習硬體架構（Hardware Architectures for Deep Learning）
-> **講師：** Joel Emer 與 Vivienne Sze（MIT EECS）
+> **講師：** Joel Emer 與 Vivienne Sze
 > **講授日期：** 2026 年 3 月 9 日 · **投影片：** 66 頁 · **來源：** [`Lecture/L10-Sparse_Architectures-3.pdf`](../../Lecture/L10-Sparse_Architectures-3.pdf)
 >
-> *本文是以「概念」為單位重建講課脈絡的導讀（walkthrough），依主題而非逐頁編排。每一節都標註其對應的投影片範圍，方便你對照原始投影片閱讀。*
+> 本章以投影片重建缺少的講課脈絡。為了 copyright safety，本章不重貼投影片或論文圖，而用文字、小例子與必要的程式式 loop nest 說明。
 >
-> **追溯註記：** 這份 PDF 內部投影片標號是 `L06-*`，但本 repo 將它視為第 10 講。下方引用保留 PDF 標號以利精確對照；檔名與圖片資產則使用 `L10-*`。
+> **追溯註記：** 這份 PDF 內部標號是 `L06-*`。本 repository 將它作為 Lecture 10，因此下文 source anchors 會同時用 Lecture 10 與 `L06-n` slide label。
 
 ---
 
 ## 一句話總結（TL;DR）
 
-稀疏架構系列的第三講、也是最終講，核心問題是：**真實加速器如何同時利用稀疏權重（sparse weights）與稀疏激活值（sparse activations）？** 本講以閘控（gating）和單維稀疏跳過（skipping）的快速回顧開場，隨後逐步深入困難的「聯合稀疏（joint sparsity）」情形。兩個里程碑架構是本講的錨點：**SCNN**（Sparse CNN，ISCA 2017）以卡式積（Cartesian-product）乘法陣列加散射網路（scatter network）處理輸入駐留（input-stationary）的稀疏乘稀疏計算；**ISOSceles**（HPCA 2023）則把計算拆成兩階段的 **IS→OS 資料流（IS-OS dataflow）** 管線，透過纖維交集（fiber intersection）與張量秩重排（tensor swizzling）實現最高 **7.5 倍的加速**。本講把 L08–L09 引入的所有表示法、交集、投影與跳過機制串聯為一幅完整圖像，並展示它們如何落地為真實晶片。
+稀疏加速真正困難的時刻，是**權重（weights）與激活值（activations）同時被壓縮**的時候。如果只有一邊稀疏，硬體可以走訪稀疏 operand，然後直接索引另一個 dense operand。如果兩邊都稀疏，硬體還要解一個座標問題：哪些非零權重與非零激活值真的會在同一個輸出座標相遇？
+
+Lecture 10 從容易情形推到 joint case。它先區分**閘控（gating）**與**跳過（skipping）**，再回顧 sparse-weight-only 與 sparse-activation-only convolution，最後比較兩種 joint sparsity 解法。**SCNN** 採用 input-stationary Cartesian product，把非零激活值與非零權重全對全相乘，再把 products scatter 到輸出累加器。**ISOSceles** 採用兩階段 **IS-OS dataflow**：input-stationary pass 先建立小型中間張量，再由 output-stationary pass 在 rank swizzling 之後讀取。核心教訓是：sparsity 不只是 format 決策；它會同時牽動 representation、loop order、coordinate generation、routing、buffer sizing 與 load balance。
+
+---
+
+## 本講解決什麼問題
+
+前幾講已經說明 zeros 可以降低 arithmetic 與 memory traffic。剩下的問題是架構問題：
+
+> 如果 weights 和 activations 都 sparse，真實 accelerator 要如何跳過無用乘法，同時不被 metadata、random access、scatter traffic 與 load imbalance 淹沒？
+
+天真的答案是「把兩個 tensors 都壓縮，然後 loop over nonzeros」。這不夠。Convolution product 只有在 weight coordinate 與 activation coordinate 對應到合法 output coordinate 時才成立。在 dense code 裡，nested loops 自動保證合法性；在 sparse code 裡，硬體必須從 metadata 重建這件事。
+
+所以本講解的是 mapping problem，不只是 storage problem。它問的是：哪一種 dataflow 能讓 coordinate problem 便宜到足以實作？
+
+---
+
+## 為什麼本講重要
+
+Sparsity 在數學上很誘人，因為 zero product 沒有貢獻：$0 \times x = 0$。但硬體不會自動獲得這個好處。一個 zero 可能帶來：
+
+- **只省 energy**：硬體 gating multiplier，但 cycle 仍被占用。
+- **energy 與 time 都省**：硬體把那次 operation 從 schedule 移除。
+- **什麼都沒省**：metadata 與 routing overhead 大於省下的 work。
+
+對 hardware architect 而言，關鍵問題不是「tensor sparse 嗎？」而是「sparsity 出現在哪裡、coordinate stream 是否規則到能利用、需要加什麼硬體才能讓 nonzero work 持續流動？」
+
+---
+
+## 先備知識與心智模型
+
+你需要記得 L07-L09 的三個想法：
+
+- **纖維（fiber）**是 tensor 的一維切片，常表示成 coordinate-payload pairs，例如 `(coord, value)`。
+- **協調遍歷（concordant traversal）**依照壓縮座標的儲存順序走訪；**不協調遍歷（discordant traversal）**則要求以 format 不自然支援的順序存取資料。
+- **資料流（dataflow）**決定哪個 tensor 停在 PE 附近，哪個 tensor 經由 memory/interconnect 串流。
+
+本講的心智模型是一個很小的 1-D convolution：
+
+$$
+o[q] = \sum_s i[q+s] \cdot f[s].
+$$
+
+如果 `f` sparse 而 `i` dense，非零 weight coordinate `s` 直接告訴硬體要讀 `q+s` 的 input。如果 `i` sparse 而 `f` dense，非零 input coordinate `w` 直接告訴硬體要讀 `w-q` 的 filter location。如果兩者都 sparse，兩種直接 lookup 都不再免費：機器必須找 coordinate matches，或先產生 products 再 scatter 到 output coordinates。
 
 ---
 
@@ -20,372 +64,416 @@
 
 讀完本講後，你應該能夠：
 
-- 解釋**閘控（gating）**（省能源，不省時間）與**跳過（skipping）**（能源與時間均省）對於零值運算元的差異。
-- 追蹤從 1-D 卷積迴圈巢（loop nest）推導出**輸出駐留（output-stationary）、權重駐留（weight-stationary）、輸入駐留（input-stationary）** 三種資料流的轉換，並辨識各自利用了哪種稀疏性。
-- 描述 **Cambricon-X** 如何透過壓縮權重流（compressed weight stream）加間接激活值查表（indirect activation lookup）處理稀疏權重卷積。
-- 說明 **Cnvlutin** 如何藉由跳過零值激活值達到加速，以及它為何需要「每通道編碼器（per-channel encoder）＋重索引權重查表」的機制。
-- 描述 **SCNN** 的卡式積架構：全對全乘法為何可行、散射網路的功能，以及**展平（flattening）**如何把 2-D 卷積對應為 1-D 內積。
-- 說明 SCNN 的**延遲與能耗**如何隨聯合稀疏度變化。
-- 描述 ISOSceles 採用的 **IS-OS 兩階段資料流**，包括張量**秩重排（swizzleRanks）** 在把不協調遍歷（discordant traversal）轉換為協調遍歷（concordant traversal）上扮演的角色。
-- 解讀 ISOSceles 加速比圖表，並說明 **IS 前端／OS 後端管線** 為什麼能從聯合稀疏中產生乘法疊加的收益。
+- 區分**閘控（gating）**與**跳過（skipping）**，並解釋為什麼只有 skipping 會降低 latency。
+- 將 1-D convolution loop 改寫為 sparse weights、sparse inputs 與 joint sparsity 版本。
+- 解釋為什麼 sparse-weight-only 與 sparse-input-only accelerator 比 joint-sparse accelerator 容易。
+- 描述 **Cambricon-X** 與 **Cnvlutin** 如何對應到投影片中的 single-sparsity cases。
+- 解釋 SCNN 的 **input-stationary Cartesian-product** dataflow，以及為什麼它需要 scatter accumulator。
+- 解釋為什麼 SCNN 的 useful work 會隨 activation density 與 weight density 的乘積縮放，但硬體 overhead 不會消失。
+- 解釋 ISOSceles 的 **IS-OS** 拆分、中間張量為什麼出現，以及 **swizzling** 為什麼能把 discordant traversal 轉成 concordant traversal。
+- 評估 sparse-accelerator claims 時能問清楚：計入的是 arithmetic、memory traffic、metadata、routing、utilization，還是 end-to-end speedup。
 
 ---
 
-## 第一章 — 回顧：閘控 vs. 跳過，以及 1-D 卷積範本
+## 主要教材式敘事
 
-> *投影片：L06-1 … L06-9*
+### 1. Gating 不是 Skipping
 
-![L10 標題——稀疏架構第三部](../../assets/L10/L10-p01-title.png)
+Lecture 10 一開始提醒我們，zero operand 提供兩種不同機會。**Gating** 偵測到 zero 後，關閉 multiplier 或 memory read port 等 datapath 活動。Cycle 仍然存在，因此 latency 不會改善。**Skipping** 則把那次 operation 從動態 schedule 中移除；機器實際執行較少 useful cycles。
 
-### 處理零值運算元的兩種槓桿
+Lecture 10 slide `L06-7` 以 Eyeriss 作為 gating 例子，並報告 input activation 為 zero 時可降低 45% PE power。這是 slide-derived quantitative claim。教學解讀是：gating 是低風險的第一步，因為 dense schedule 完全保留，不需要複雜的 metadata-driven load balancing。但它的限制也很清楚：即使一半 activations 是 zero，accelerator 也不會自動用一半時間完成。
 
-每個稀疏加速器都必須決定：當輸入激活值或權重為零時，該怎麼辦？有兩個選項：
+### 2. 只有 Sparse Weights：走訪 Weights，索引 Inputs
 
-- **閘控（Gating）：** 照常執行乘加（MAC）週期，但透過時脈或資料閘控，切斷乘法器與記憶體讀取的電源。這省的是**能源，而非時間**——那個週期的時間槽依然被占用，只是什麼有用的事也沒做。
-- **跳過（Skipping）：** 直接把零值運算元的那次操作從排程中刪除，讓硬體根本不發出那個週期。這**能源和時間都省**。
+對 sparse weights 而言，compressed filter 只儲存非零 `(s, f_val)` pairs。簡單的 output-stationary loop 是：
 
-兩者的區別至關重要，因為跳過的實作難度更高：它需要提前（或極快地）知道哪個運算元是零、把資料流壓縮，以及能夠把在不可預知位置抵達的結果正確合併。
-
-### 1-D 輸出駐留卷積——貫穿全講的範例
-
-本講以 `o[q] += i[w] * f[s]`（`w = q + s`）這個簡單的 1-D 卷積作為教學範本。這個輸出駐留迴圈巢是一切推導的起點——透過改變迴圈順序與哪個張量（tensor）被壓縮，可以派生出四種情形：僅稀疏權重、僅稀疏激活值、兩者皆稀疏。
-
-**Eyeriss — 閘控（投影片 L06-7）：**
-Eyeriss（Chen et al., ISSCC 2016）在輸入激活值為零時，對兩級流水線乘法器及兩個記憶體讀取埠施加閘控，省下約 **45% 的 PE 功耗**，吞吐量不變。
-
-![Eyeriss 閘控電路——乘法器致能與零值緩衝器](../../assets/L10/L10-p07-eyeriss-gating.png)
-
-> **為什麼重要：** 閘控是最簡單的稀疏性利用形式，不需要改變迴圈結構或資料格式。它的限制——省能源但不省時間——正是後續設計採用更複雜跳過機制的動機。
-
----
-
-## 第二章 — 僅利用稀疏權重
-
-> *投影片：L06-8 … L06-25*
-
-### 輸出駐留＋稀疏權重
-
-當權重稀疏並以壓縮格式（座標＋酬載列表，coordinate + payload list）儲存時，外層迴圈透過**協調遍歷（concordant traversal）**走訪非零的濾波器條目 `(s, f_val)`，直接取得座標 `s`。對每個非零權重，內層輸出迴圈計算 `w = q + s` 並查表（密集、未壓縮）輸入位置 `w`。這就是**輸出駐留稀疏權重**資料流：
-
-```
+```text
 for q in [0, Q):
-  for (s, f_val) in f:          # 稀疏濾波器的協調遍歷
+  for (s, f_val) in f:
     w = q + s
     o[q] += i[w] * f_val
 ```
 
-由於濾波器纖維（fiber）以協調方式遍歷，乘加次數恰好正比於非零權重的數量——直接線性加速。
+Sparse tensor 以 concordant traversal 走訪。Dense input tensor 仍可直接 index。重要硬體含義是 coordinate generator 必須計算 `w = q + s`，但不需要搜尋 matching input coordinate。這就是 sparse-weight-only 設計相對乾淨的原因。
 
-### 權重駐留＋稀疏權重
+Weight-stationary 版本把前兩層 loop 對調：
 
-把迴圈順序調換為 `for (s, f_val) in f: for q in [0, Q):` 即得到**權重駐留**變體。權重 `f[s]` 只載入一次並在所有輸出間複用——這正是權重駐留資料流的標誌。跳過同樣透過對非零權重的協調遍歷實現。
-
-### 平行性：位置空間中的纖維切分（fiber splitting）
-
-為了平行計算多個輸出，濾波器纖維被切分成**在位置空間均等的區塊** `f.splitEqual(K)`，每個 PE 組處理一個區塊。這暴露了對權重區塊的 `spatial-for` 迴圈。一個關鍵細節：按「位置」（而非座標）切分，能確保每個 PE 取得相同數量的權重位置槽——無論稀疏程度如何，這讓同步保持簡單。
-
-### Cambricon-X——工業界實作
-
-**Cambricon-X**（Zhang et al., MICRO 2016）是一個權重駐留的稀疏加速器。壓縮權重（元資料＋數值）以流的方式送入，每個 PE 用權重的座標作為索引，到共享的輸入激活值緩衝區進行查表。
-
-![Cambricon-X 激活值存取——權重元資料驅動的間接輸入查表](../../assets/L10/L10-p23-cambricon-x.png)
-
-每個非零權重的座標直接定址輸入，查表是一次簡單的索引讀取。這在輸入激活值密集（或接近密集）時效率很高，但無法利用輸入稀疏性。
-
-> **為什麼重要：** 僅稀疏權重的情形有一個乾淨的實作：壓縮權重，協調遍歷，用座標查表取密集輸入。Cambricon-X 表明這可以在不需要過多硬體開銷的情況下規模化。它的限制在於讓激活值的稀疏性白白浪費。
-
----
-
-## 第三章 — 僅利用稀疏激活值
-
-> *投影片：L06-26 … L06-38*
-
-### 權重駐留＋稀疏輸入
-
-當輸入稀疏（座標＋酬載）而權重密集時，權重 `f[s]` 保持駐留，輸入纖維 `i` 被遍歷。迴圈把輸入座標限制在當前權重視窗範圍內：
-
-```
-for s in [0, S):
-  for (w, i_val) in i if s <= w < Q + s:   # 視窗化遍歷
-    q = w - s
-    o[q] += i_val * f[s]
+```text
+for (s, f_val) in f:
+  for q in [0, Q):
+    w = q + s
+    o[q] += i[w] * f_val
 ```
 
-濾波器權重每個視窗位置只讀取一次——它是駐留的——而只有非零輸入才產生 MAC。這就是**權重駐留稀疏輸入**跳過資料流。
+現在 weight 可以停在 PE 附近，被多個 outputs 重用。代價是 output partial-sum traffic。若 outputs 很多、local accumulator capacity 很小，設計可能省下 weight reads，卻增加 partial-sum movement。
 
-### 輸出駐留＋稀疏輸入
+Lecture 10 slides `L06-22` 到 `L06-24` 介紹用 fiber splitting 做 parallel sparse-weight traversal。細節在於 compressed fiber 可以依照**壓縮 stream 中的位置**切分，而不是依 coordinate value 切分。Position splitting 讓每個 PE 取得相近的 nonzero 數量，但 coordinate range 可能不規則。Coordinate splitting 讓 spatial ownership 清楚，但 nonzeros 聚集時 load balance 可能很差。
 
-輸出駐留的變體先迭代輸出，再把輸入纖維限制在對應於每個輸出的視窗：
+### 3. 只有 Sparse Inputs：走訪 Activations，索引 Weights
 
-```
+當 input activations sparse、weights dense，角色反過來：
+
+```text
 for q in [0, Q):
-  for (w, i_val) in i if q <= w < q + S:   # 稀疏滑動視窗
+  for (w, i_val) in i if q <= w < q + S:
     s = w - q
     o[q] += i_val * f[s]
 ```
 
-「稀疏滑動視窗（sparse sliding window）」視覺化（投影片 L06-29…L06-34）展示了活躍輸入座標集如何隨 `q` 滑動。權重查表 `f[s]` 需要計算 `s = w - q`——一次簡單減法。
+Input fiber 是 sparse，因此只有非零 activations 產生 MAC。Dense filter 用 `s = w - q` 直接索引。Lecture 10 slides `L06-28` 到 `L06-35` 把它呈現為 sparse sliding window。Window condition 很重要：不是每個非零 activation 都貢獻到每個 output。
 
-### Cnvlutin——規模化跳過零激活值
+Cnvlutin 在 Lecture 10 slides `L06-36` 到 `L06-38` 中作為 activation skipping 的 case study。Slide-derived lesson 是：per-channel encoders 移除 zero activations，硬體用 activation coordinates 選出正確 weight。架構限制是 dense side 必須便宜地 index。如果 weights 也被壓縮，直接 `getPayload(s)` 就不再是簡單 array lookup。
 
-**Cnvlutin**（ISCA 2016）在完整的 2-D 多通道卷積中利用稀疏激活值。每通道編碼器壓縮輸入激活值圖，去除零項並記錄座標。輸出駐留的計算隨後透過重索引把每個非零激活值對應到對應的權重：
+### 4. Joint Sparsity：Coordinate Problem 出現
 
-```
-for q in [0, Q]:
-  for m, f_c in f:
-    for (c, (f_s, i_w)) in f_c & i_c:       # 通道的隱式交集
-      for (w, i_val) in getWindow(i_w, q, S):
-        s = w - q
-        o[m, q] += i_val * f_s.getPayload(s)  # 未壓縮的權重查表
-```
+當兩個 tensors 都 sparse，loop 不能單純走訪一個 compressed stream，然後直接 index 另一個。假設：
 
-保留權重未壓縮，使 `getPayload(s)` 查表代價很低（直接索引）。Cnvlutin 表明，壓縮零激活值並跳過其 MAC 可以直接轉化為吞吐量的加速，收益隨網路激活值稀疏度成比例增長。
+- 非零 input coordinates 是 $i = \{0, 3, 4\}$。
+- 非零 filter coordinates 是 $f = \{0, 2\}$。
+- Output coordinate 由 $q = w - s$ 計算。
 
-![Cnvlutin 架構——每通道編碼器為 PE 陣列提供重索引的權重流](../../assets/L10/L10-p36-cnvlutin.png)
+Cartesian products 如下：
 
-> **為什麼重要：** 僅稀疏輸入的情形與稀疏權重互補：壓縮激活值，透過協調遍歷跳過其 MAC，用座標查表取得權重。Cnvlutin 表明這確實帶來實際加速——但與 Cambricon-X 類似，它把另一個維度的稀疏性留在桌上了。
+| Input `w` | Weight `s` | Output `q = w-s` | 如果 output range 包含 `q` 是否合法？ |
+|---:|---:|---:|---|
+| 0 | 0 | 0 | yes |
+| 0 | 2 | -2 | usually no |
+| 3 | 0 | 3 | yes |
+| 3 | 2 | 1 | yes |
+| 4 | 0 | 4 | maybe yes |
+| 4 | 2 | 2 | yes |
 
----
+這個例子顯示新的工作：accelerator 必須計算 output coordinates、丟棄 illegal products，並把 legal products route 到 accumulators。Dense loop indices 原本默默替我們完成這些事。
 
-## 第四章 — 同時利用稀疏權重與稀疏激活值（SCNN）
+### 5. SCNN：Cartesian Products 加 Scatter
 
-> *投影片：L06-39 … L06-51*
+SCNN 在 Lecture 10 slides `L06-45` 到 `L06-51` 被歸屬於 Parashar et al., ISCA 2017。它選擇 **input-stationary Cartesian-product** 策略。在每個 PE 中，一組非零 activations 與一組非零 weights 全對全相乘。如果有 $I$ 條 activation lanes 與 $F$ 條 weight lanes，PE 每一步產生 $I \times F$ 個 candidate products。
 
-### 聯合稀疏的挑戰
+概念 loop 是：
 
-當權重**和**激活值都稀疏時，任何一個都無法作為「外層」迴圈的驅動者，同時讓另一個以密集方式查表。兩者都被壓縮，都必須被遍歷，而且它們的乘積必須被**散射（scatter）** 到在執行時才能確定的輸出位置。
-
-### 輸入駐留＋兩者稀疏——卡式積的思路
-
-**輸入駐留（input-stationary）** 資料流讓每個輸入激活值保持駐留，同時乘以所有非零濾波器權重，產生散佈到不同輸出的部分結果：
-
-```
-for (w, i_val) in i:
-  for (s, f_val) in f if w-Q <= s < w:    # 把權重限制在當前輸入
+```text
+for (w, i_val) in sparse_inputs:
+  for (s, f_val) in sparse_weights if product_is_legal(w, s):
     q = w - s
+    scatter_add(o[q], i_val * f_val)
+```
+
+乘法步驟規則；累加步驟不規則。每個 product 可能指向不同 output coordinate，因此 SCNN 需要 scatter network 與 banked accumulators。這是 sparse hardware 的典型模式：移除 zero MACs 之後，不規則 communication 露出來了。
+
+從 SCNN paper 來看，該架構把 weights 與 activations 都保留為 compressed-sparse form，在 PE 內做 Cartesian product，從 sparse indices 計算 output coordinates，並用 scatter accumulator array route products（SCNN Sections III-IV，特別是 paper Figures 5 and 6 的相關說明）。該 paper 報告相對 dense accelerator 有 2.7x performance improvement 與 2.3x energy reduction（SCNN Abstract and Section VI）。這些是 paper-derived claims。
+
+### 6. ISOSceles：把工作拆成 IS 再 OS
+
+Lecture 10 slides `L06-53` 到 `L06-66` 展示另一種 joint sparsity 解法。與其產生大量 irregular products 並立即 scatter，ISOSceles 使用 **IS-OS** decomposition。
+
+Output-stationary joint-sparse 想法可以寫成 intersection：
+
+```text
+for q in [0, Q):
+  for (coord, (f_val, i_val)) in f.project(+q) & i:
     o[q] += i_val * f_val
 ```
 
-平行化後，輸入切分和濾波器切分都以空間方式遍歷。這產生了**全對全（all-to-all，即卡式積）乘法**：K 個空間活躍的輸入值各自乘以 K' 個空間活躍的濾波器值，同時產生 K×K' 個部分乘積。
+Projection 會平移 filter coordinates，使它們與 input coordinates 對齊。Intersection 只輸出同時非零的 pairs。數學上很漂亮，但如果 participating fibers 的 storage order 與 loop order 不一致，就會變成 discordant traversal。
 
-### SCNN 架構
+ISOSceles 把計算拆成：
 
-**SCNN**（Parashar et al., ISCA 2017）正是這樣實作的：
+- **IS pass：** 以 input-oriented sparse streams 建立 intermediate tensor `T`。
+- **OS pass：** 以 output order 走訪 `T`，累加 final outputs。
 
-- **展平（Flattening）：** 透過替換索引變數，把 2-D 卷積重新表述為對展平索引 `(hw)` 和 `(mrs)` 的 1-D 內積，讓全對全乘法變得規整。
-- **稀疏壓縮前端（Sparse-compressed frontend）：** 非零輸入 `i[C][W*H]` 與非零權重 `f[C][M*R*S]` 以壓縮格式儲存，PE 前端並行消耗它們。
-- **密集後端／散射網路（Dense backend / scatter network）：** 每個 K×K' 乘積附帶計算好的輸出座標 `(m, p, q)`。散射網路把每個乘積路由到輸出部分和緩衝區中正確的累加器。
+關鍵轉換是 **swizzling**，也就是重新排列 `T` 的 ranks，使第二階段能 concordantly consume intermediate tensor。教學上可以把 ISOSceles 理解為：付出小型 intermediate buffer 的代價，換掉更混亂的 scatter pattern。
 
-![SCNN 架構——卡式積乘法加散射網路，利用稀疏輸入與稀疏權重](../../assets/L10/L10-p45-scnn-architecture.png)
-
-![SCNN PE 微架構——稀疏壓縮前端與密集散射後端](../../assets/L10/L10-p49-scnn-pe-microarchitecture.png)
-
-### 展平：為何能實現卡式積
-
-替換 `h = p + r, w = q + s` 把 2-D 卷積 `O[m,p,q] += I[c,h,w] * F[m,c,r,s]` 轉化為以展平座標索引的形式。把展平後的輸入和權重纖維均等切分，再以空間方式遍歷，就得到全對全結構：
-
-```
-for (hw1, i_split) in i.splitEqual(4):
-  for (mrs1, f_split) in f.splitEqual(4):
-    spatial-for ((h,w), i_val) in i_split:
-      spatial-for ((m,r,s), f_val) in f_split if "legal":
-        p = h - r;  q = w - s
-        o[m,p,q] += i_val * f_val
-```
-
-### SCNN 延遲與能耗隨聯合密度的變化
-
-SCNN 的延遲與**激活值密度 × 權重密度**的乘積成正比（兩個張量中非零值的比例）。在高聯合稀疏度下（例如兩個張量各有 90% 的零），SCNN 的 MAC 週期數按比例減少。然而，散射網路引入了面積和能耗開銷，限制了在中等稀疏度下的收益。能耗曲線（投影片 L06-50 和 L06-51）表明 SCNN 的能效隨聯合稀疏度單調改善，但相對密集基準的交叉點取決於散射網路的代價。
-
-> **為什麼重要：** SCNN 表明聯合稀疏可以用相對簡單的硬體機制（卡式積＋散射）加以利用，但不規整的散射步驟是真實的代價。這正是像 ISOSceles 這樣尋求更結構化方式處理聯合稀疏的架構的動機。
+Lecture 10 slide `L06-66` 報告 ISOSceles 最高 7.5x speedup、平均約 1.7x speedup。這是 slide-derived quantitative claim，投影片歸屬於 Yang et al., HPCA 2023。由於本 worker 指定的 local paper list 中沒有 ISOSceles PDF，本章把 ISOSceles 的詳細解釋標記為 slide-derived 加 teaching interpretation，而非獨立 paper-verified。
 
 ---
 
-## 第五章 — IS-OS 兩階段資料流與 ISOSceles
+## Worked Examples
 
-> *投影片：L06-52 … L06-66*
+### 範例 1：Gating vs. Skipping
 
-### 權重駐留的迴圈翻轉及其代價
+假設 PE 收到八組 activation-weight pairs，其中四個 activations 是 zero。
 
-在介紹 ISOSceles 之前，本講展示了聯合稀疏迴圈的**權重駐留變體**（投影片 L06-52），其中濾波器切分是外層迴圈、輸入切分是內層。這種翻轉讓濾波器更加駐留，但*輸入*現在必須更頻繁地從更大的緩衝區讀取——一個明顯的不利之處，說明了資料流選擇對記憶體階層代價的高度敏感性。
+- 使用 **gating** 時，PE 仍消耗八個 cycle slots。四次 multiplier operation 被關閉，因此 PE dynamic energy 下降，但 latency 仍是八個 slots。
+- 使用 **skipping** 時，PE 只 schedule 四個 nonzero products。Latency 可能接近四個 slots，但前提是 compressed stream、coordinate generator 與 accumulator 都跟得上。
 
-### 輸出駐留聯合稀疏情形與纖維交集
+硬體意義：gating 容易，因為 dense schedule 保持完整。Skipping 更強，因為它改變 schedule，但需要 metadata 與 load balancing。
 
-**輸出駐留聯合稀疏**資料流迭代輸出 `q`，透過**纖維交集（fiber intersection）**找到同時貢獻到輸出 `q` 的（輸入, 權重）配對：
+### 範例 2：Sparse Sliding Window
 
-```
-for q in [0,Q):
-  for (s, (f_val, i_val)) in f.project(+q) & i:
-    o[q] += i_val * f_val
-```
+令 $Q = 4$、$S = 3$，sparse input coordinates 為 $\{0, 2, 4, 5\}$，dense weights 為 $f[0], f[1], f[2]$。對 output $q = 2$，window 是 $2 \le w < 5$，所以 active sparse inputs 是 $w = 2$ 與 $w = 4$。
 
-`f.project(+q)` 把權重纖維的座標平移 `+q`，使其與輸入座標對齊。交集 `&` 隨後找出同時存在於投影後的權重纖維**和**輸入纖維中的（座標, 酬載）配對。只有在兩個張量中都非零的配對才貢獻一次 MAC——實現了真正的聯合跳過。
+Weight coordinates 是：
 
-硬體元件圖（投影片 L06-56）展示了交集單元位於權重流和輸入流之間，連接至單個 MAC 單元和部分和累加器。
+- 對 $w = 2$，$s = w-q = 0$。
+- 對 $w = 4$，$s = w-q = 2$。
 
-### IS-OS 資料流：把計算拆成兩階段
+因此 $o[2]$ 只收到兩個 products：$i[2]f[0]$ 與 $i[4]f[2]$。Dense loop 還會測試 $i[3]f[1]$，但 sparse traversal 因為 `i[3]` 是 zero 或不存在而避開它。
 
-**ISOSceles**（Yang et al., HPCA 2023）的關鍵洞察是：試圖在單階段輸出駐留迴圈中同時利用兩種稀疏性，會導致對中間張量 `T` 的不協調遍歷。解法是把計算拆成兩個數學等價的階段：
+### 範例 3：Joint Density 是乘積，不是和
 
-**第一步（IS 輸入駐留階段）：**
+如果 activation density 是 $d_i = 0.3$，weight density 是 $d_f = 0.2$，在 independent-density model 下，預期 nonzero products 的比例是 $d_i d_f = 0.06$。
 
-```
-T[c,h-r,w-s] = I[c,h,w] × F[c,m,r,s]
-```
-
-以協調方式遍歷 `i`（輸入駐留），乘以交集得到的濾波器條目，並累加到以 `[h, r, w-s]` 索引的中間張量 `T` 中。
-
-**第二步（OS 輸出駐留階段）：**
-
-```
-O[m,p,q] = T[c,p+r,q]
-```
-
-遍歷 `T` 並累加到輸出，但 `T` 必須以**不同於寫入時**的秩順序存取。這是**不協調遍歷**——直觀上代價昂貴。
-
-**用秩重排修正遍歷順序：**
-
-修復方法是對 `T` 的秩進行**重排（swizzle）**：
-
-```python
-t = t.swizzleRanks(["H", "R", "Q"] -> ["Q", "R", "H"])
-```
-
-重排後，第二步的遍歷變為協調的，整條管線為：
-
-- IS 前端處理稀疏輸入和稀疏權重 → 寫入部分結果到 `T`（小）。
-- OS 後端（重排後）協調讀取 `T` → 累加到輸出。
-
-![ISOSceles IS-OS 管線——IS 前端透過小型中間緩衝區連接 OS 後端](../../assets/L10/L10-p64-isosceles-pipeline.png)
-
-### 管線為何有效
-
-IS 前端和 OS 後端形成一條**兩階段管線**：
-
-1. **IS 前端：** 輸入波前（Input wavefront）以協調方式遍歷非零激活值，與非零濾波器條目求交集，把部分和寫入小型 `T` 緩衝區。
-2. **OS 後端：** 輸出波前（Output wavefront）協調讀取 `T`（重排後），把部分和排空到輸出圖。
-
-圖中 `T` 緩衝區上的「small」標注強調了一個關鍵實作事實：由於 `T` 以位移後的座標索引，其**任意時刻的活躍佔用空間非常小**，可放入片上記憶體，避免 DRAM 流量。
-
-### ISOSceles 加速比
-
-ISOSceles 相對密集基準的實測加速比最高達 **7.5 倍**，各基準測試的平均約為 **1.7 倍**。
-
-![ISOSceles 加速比——相對密集基準最高 7.5 倍，平均 1.7 倍](../../assets/L10/L10-p66-isosceles-speedup.png)
-
-7.5 倍的峰值出現在聯合稀疏度極高時，此時 IS 和 OS 兩個階段都按比例跳過了大量運算。峰值與平均之間的差距，反映了並非所有層都同等稀疏、且重排＋管線開銷為可達加速比設定了下限。
-
-> **為什麼重要：** ISOSceles 為稀疏架構系列畫上了完整的句號。它表明完整的 IS-OS 拆分——結合纖維交集、投影與張量秩重排——可以在真實硬體中實作並帶來可觀的實測加速。兩階段結構以一個小型中間緩衝區替換了 SCNN 的不規整散射網路，這是一個有理論根據的工程取捨，且具有推廣到其他工作負載的潛力。
+教學解讀：這就是 joint sparsity 看起來很有吸引力的原因。不過 accelerator 仍要付 fixed 與 semi-fixed costs：metadata reads、coordinate arithmetic、scatter/intersection logic、underutilized lanes 與 synchronization。Sparse accelerator 只有在 skipped work 大於這些 overhead 時才真的優秀。
 
 ---
 
-## 獨立學習指南（Standalone Study Guide）
+## 關鍵方程式與讀法
+
+本講反覆使用的 dense 1-D convolution 是：
+
+$$
+o[q] = \sum_s i[q+s] f[s].
+$$
+
+讀法是：對一個 output coordinate $q$，沿著 filter coordinate $s$ 滑動，對應 input coordinate $w=q+s$。
+
+Input-stationary traversal 的 output coordinate 是：
+
+$$
+q = w - s.
+$$
+
+讀法是：一旦 coordinate $w$ 的非零 input 與 coordinate $s$ 的非零 filter entry 相遇，output coordinate 不是獨立 loop index；它必須被計算出來並用於 accumulation。
+
+簡單 independent-density model 是：
+
+$$
+d_{\text{joint}} = d_i d_f.
+$$
+
+讀法是：如果 activations 與 weights 分別以 $d_i$、$d_f$ 的 density 獨立非零，預期只有兩者乘積比例的 work 會產生 nonzero multiplication。這個式子不包含 metadata、routing 或 load-balance overhead。
+
+---
+
+## 硬體含義
+
+- **Metadata bandwidth：** Sparse formats 用 coordinate reads 取代部分 payload reads。若 coordinates 很寬或很不規則，metadata 會變成一級成本。
+- **Coordinate generation：** Sparse convolution 需要 $w=q+s$ 或 $q=w-s$ 這類 arithmetic。邏輯本身不大，但必須跟上 PE rate。
+- **Accumulator design：** SCNN-style scatter 需要 banked accumulators 與 conflict management。ISOSceles-style decomposition 需要 intermediate buffer 與 rank-swizzled access。
+- **Load balance：** Equal nonzero counts 不必然等於 equal execution time。Products 可能 illegal，scatter conflicts 可能不同，不同 layers 的 densities 也不同。
+- **Memory hierarchy：** Sparse weights、sparse activations 與 sparse outputs 會壓力到不同 memories。最佳 dataflow 取決於哪個 buffer 小、哪個 tensor 被重用、哪個 tensor 可以 stream。
+- **Programmability：** Dataflow-specific sparse hardware 很有效率但較不 general。前面課程介紹的 TeAAL 很有用，因為它把 format、mapping、architecture、binding 分開思考。
+
+---
+
+## 常見誤解
+
+### 誤解：Sparsity 自動帶來 speedup。
+
+只有當機器真的 skipping work，而不只是 gating；且 metadata 與 routing overhead 沒有主導時，sparsity 才會帶來 speedup。
+
+### 誤解：Joint sparsity 只是 sparse weights 加 sparse activations。
+
+Joint case 多了一個 coordinate matching 問題。兩個 operands 都 compressed 時，accelerator 必須 intersection coordinate streams，或先產生 products 再 scatter 到 runtime 計算出的 output locations。
+
+### 誤解：Cartesian-product multiplication 很浪費，因為它產生很多 products。
+
+如果許多 products illegal 或撞到同一 accumulator bank，它確實可能浪費。但它也規則且平行。SCNN 正是利用這種 regularity 同時處理兩個 compressed streams。
+
+### 誤解：Peak sparse speedup number 描述整個 network。
+
+Layer densities 會變。Early layers 與 later layers 的 activation density 常不同，有些 layers 可能太 dense 或太小，無法攤平 sparse overhead。
+
+---
+
+## 與前後講次的連結
+
+- **L05 Mapping/Dataflows：** L10 是 mapping 的直接應用。Output-stationary、weight-stationary、input-stationary 與 IS-OS choices 決定哪些 sparse operations 便宜。
+- **L07-L09 Sparse Formats：** Fibers、concordant traversal、discordant traversal、projection 與 intersection 在本講變成具體硬體機制。
+- **L11 Advanced Technologies：** Compute-in-memory 改變 weights 與 partial sums 的 movement cost，但不會讓 sparse coordinate management 消失。
+- **L12 Reduced Precision：** Quantization 可能創造更多 zeros，也可能降低 metadata/payload width。Precision 與 sparsity 在 accuracy 與 hardware cost 上都會交互作用。
+- **後續 accelerator modeling：** 本講的 sparse cases 正是 cost model 需要 source discipline 的地方：arithmetic count、memory traffic、metadata traffic 與 utilization 必須分開。
+
+---
+
+## Paper Bridge: SCNN
+
+### Bibliographic Identity
+
+- **Title:** SCNN: An Accelerator for Compressed-sparse Convolutional Neural Networks
+- **Authors:** Angshuman Parashar et al.
+- **Year / venue:** ISCA 2017
+- **Local PDF:** [`papers/L17_SCNN_Parashar_ISCA2017.pdf`](../../papers/L17_SCNN_Parashar_ISCA2017.pdf)
+- **Used in lecture:** Lecture 10 slides `L06-45` 到 `L06-51`
+
+### Problem Addressed
+
+SCNN 處理 sparse models 與 dense accelerator schedules 之間的落差。早期設計可以 gating zeros 省 energy，或只利用一邊 sparse operand。SCNN 問的是：accelerator 能否讓 weights 與 activations 都保持 compressed、跳過 zero-valued products，並仍然正確累加 convolution outputs？
+
+### Core Idea
+
+核心 abstraction 是 **PlanarTiled-InputStationary-CartesianProduct-sparse** dataflow。每個 PE 取一組 nonzero activations 與一組 nonzero weights，形成 Cartesian product，從 sparse indices 計算 output coordinates，再經由 scatter accumulator route products。
+
+### Relevance to This Lecture
+
+SCNN 是 Lecture 10 從 single-sparse skipping 走到 joint-sparse skipping 的具體架構。它說明 joint sparsity 需要的不只是 compressed storage：PE 還要計算 coordinates 並 route partial sums。
+
+### Key Claims Used in This Chapter
+
+- SCNN 將 sparse weights 與 sparse activations 都以 compressed form 儲存並利用兩者 sparsity；見 paper abstract 與 Sections III-IV。
+- PE 對 compressed activation 與 weight vectors 形成 Cartesian products，接著計算 output coordinates 並 scatter products；見 SCNN Section III-B 與 Section IV，尤其是 Figures 5 and 6 周邊說明。
+- 評估設計使用 64 PEs，每個 PE 16 multipliers，總計 1024 multipliers；見 SCNN Table IV 與 Section IV。
+- Paper 報告相對 dense accelerator 有 2.7x performance improvement 與 2.3x energy reduction；見 abstract 與 Section VI。
+- Paper 指出 accumulator 與 activation memories 是 PE area 的大宗；見 Table III 附近的 area discussion。
+
+### What Students Should Remember
+
+1. SCNN 的 multiplication 規則；accumulation 不規則。
+2. 兩個 operands 都 compressed 可以省 payload movement，但引入 coordinate 與 scatter overhead。
+3. Sparse speedup 取決於 density，也取決於 PE array 如何避免 bank conflicts 與 load imbalance。
+4. SCNN 是一個 design point，不是 universal sparse recipe。它選擇以 scatter hardware 作為 joint skipping 的代價。
+
+### Limitations and Assumptions
+
+SCNN 的 published results 依賴 evaluated CNNs、pruning/activation sparsity patterns 與特定 area/performance model。未檢查 density、layer shape 與 accumulator behavior 前，不應把該 speedup 泛化到所有 networks 或 sparsity structures。
+
+### Suggested Insertion Points
+
+解釋 joint-sparse Cartesian products、scatter accumulators，以及 arithmetic reduction 與 end-to-end accelerator speedup 差異時引用 SCNN。
+
+---
+
+## Paper Bridge: State of Pruning
+
+### Bibliographic Identity
+
+- **Title:** What is the State of Neural Network Pruning?
+- **Authors:** Davis Blalock et al.
+- **Year / venue:** MLSys 2020
+- **Local PDF:** [`papers/L16_StateOfPruning_Blalock_MLSys2020.pdf`](../../papers/L16_StateOfPruning_Blalock_MLSys2020.pdf)
+- **Used in lecture:** 說明 sparse weights 從何而來的背景 bridge
+
+### Problem Addressed
+
+該 paper survey pruning literature，問 reported pruning results 是否可比較，以及能得出哪些一致結論。這對 Lecture 10 重要，因為 sparse accelerators 常假設 pruned weights 已經存在。
+
+### Core Idea
+
+Pruning 不是單一技術。該 paper 區分 unstructured pruning、structured pruning、scoring rules、local vs. global pruning、fine-tuning schedules、compression ratios 與 theoretical speedups。
+
+### Relevance to This Lecture
+
+Lecture 10 把 sparse weights 當成可用輸入。Pruning survey 提醒讀者：weight sparsity 來自 algorithmic pipeline，而且 reported compression 或 theoretical speedup 不一定轉化為 hardware speedup。
+
+### Key Claims Used in This Chapter
+
+- Paper 將 pruning 定義為產生 masked 或 reduced model $f(x; M \odot W')$；見 Section 2。
+- Paper 區分 unstructured pruning 與 structured pruning，並說明 unstructured pruning 未必能乾淨映射到 modern libraries and hardware speedups；見 Section 2。
+- Paper 指出 pruning papers 常使用不一致 metrics 與 baselines；見 Sections 3-5。
+- Paper 建議報告 compression、theoretical speedup、controls 與 tradeoff curves；見 Section 6。
+
+### What Students Should Remember
+
+1. Sparse weights 不是免費的；它們來自 accuracy-efficiency tradeoff。
+2. Unstructured sparsity 對 compression 很有吸引力，但硬體較難利用。
+3. Theoretical FLOP reduction 不等於 accelerator speedup。
+4. Sparse architecture paper 應清楚說明 sparsity pattern、density 與 evaluation baseline。
+
+### Limitations and Assumptions
+
+這份 survey 討論 pruning methodology，不是 accelerator microarchitecture。它支撐 sparse weights 的來源，但不驗證任何特定 sparse accelerator。
+
+### Suggested Insertion Points
+
+討論 sparse weight density 為何跨 layers 變動，以及 hardware speedup claims 為何需要謹慎評估時引用此 paper。
+
+---
+
+## 獨立學習指南
 
 ### 進入下一講前必須掌握
 
-- 重建從 gating 到 single-sparse skipping，再到 joint-sparse skipping 的推進順序。
-- 在處理 joint case 之前，先說清 sparse-weight-only 與 sparse-input-only dataflows。
-- 描述 SCNN 的 Cartesian-product multiplier 與 scatter backend。
-- 描述 ISOSceles 的 IS-OS split、temporary tensor `T` 與 swizzled traversal。
-- 將 reported speedup 與 energy results 解讀為 density、utilization、routing overhead 的結果。
+- 解釋 late detection 的 zero 與 schedule 前就被 skipped 的 zero 有何不同。
+- 從 $o[q] = \sum_s i[q+s]f[s]$ 推導 sparse-weight-only 與 sparse-input-only loops。
+- 解釋 joint sparsity 為什麼需要 coordinate matching。
+- 比較 SCNN 的 scatter-based design 與 ISOSceles 的 intermediate-tensor design。
+- 把 sparse speedup results 看成 density 加 overhead，而不是 density alone。
 
 ### 自我檢核問題
 
-1. 為什麼 Eyeriss gating 能降低 PE power，卻不降低 latency？
-2. joint sparse case 為什麼比 sparse weights only 更困難？
-3. SCNN 付出了什麼硬體成本，而 ISOSceles 試圖避免它？
+1. 為什麼 Eyeriss gating 可以省 PE power，卻不省 latency？
+2. 在 sparse-weight-only traversal 中，為什麼 dense input 容易 index？
+3. 在 sparse-input-only traversal 中，sparse sliding window 限制了什麼？
+4. 為什麼 SCNN 需要 scatter accumulator？
+5. Rank swizzling 在 IS-OS dataflow 中完成什麼事？
+6. 為什麼 pruning 可能降低 theoretical MACs，卻無法帶來同比例 hardware speedup？
 
 ### 練習
 
-1. 從 dense 1-D convolution loop 出發，分別改寫成 sparse weights、sparse inputs、both sparse 版本。
-2. 對一小組非零 inputs 與 weights，列舉 SCNN 的 Cartesian products 及其 output coordinates。
-3. 畫出 ISOSceles 的兩個 passes，標出 `T` 何時被寫入、swizzle、讀出。
-
-### 常見誤區
-
-- 以為「both sparse」只是把兩個 single-sparse trick 各自套上去。它需要 coordinate matching 或 scatter。
-- 把 peak speedup 當成 average speedup。Sparsity 會隨 layer 與 network 變動。
-- 忽略把 partial sums route 到不規則 output positions 的成本。
+1. 給定 input coordinates $\{1, 4, 5\}$ 與 filter coordinates $\{0, 2, 3\}$，列出 outputs $q \in [0, 4)$ 的所有 legal products。
+2. 將 dense 1-D convolution loop 改寫成 sparse-weight-only、sparse-input-only 與 joint-sparse input-stationary loops。
+3. 假設 activation density 是 $0.4$、weight density 是 $0.25$。計算 independent-density estimate 的 nonzero product density，並列出這個估計忽略的兩個 hardware costs。
+4. 為四個同時產生的 SCNN products 設計一個小型 accumulator banking scheme。若兩個 products 指向同一 bank，會發生什麼？
+5. Paper-reading bridge：閱讀 SCNN Section III-B，解釋為什麼 Cartesian product 必須搭配 coordinate computation。
 
 ---
 
 ## 關鍵詞彙（Key Terms）
 
-| 詞彙 | 說明 |
+| 詞彙 | 意義 |
 |---|---|
-| **閘控（Gating）** | 當運算元為零時切斷乘法器／記憶體電源；省能源，不省時間。 |
-| **跳過（Skipping）** | 從排程中完全刪除零運算元的週期；能源和時間均省。 |
-| **協調遍歷（Concordant traversal）** | 依座標順序迭代壓縮纖維，每個非零元素恰好以線性時間訪問一次。 |
-| **不協調遍歷（Discordant traversal）** | 以不符合張量儲存秩順序的方式存取；需要隨機查表或重排。 |
-| **纖維（Fiber）** | 多維張量的 1-D 切片，表示為（座標, 酬載）配對的列表。 |
-| **纖維切分（splitEqual）** | 按位置把纖維切成均等區塊，用於建立空間平行性。 |
-| **纖維投影（project）** | 把纖維的座標偏移一個常數，用於對齊兩條纖維以進行交集。 |
-| **纖維交集（&）** | 找出同時存在於兩條纖維中的（座標, 酬載）配對；只產生聯合非零條目。 |
-| **輸出駐留（Output-stationary, OS）** | 資料流：每個輸出累加器固定不動，輸入與權重流入。 |
-| **權重駐留（Weight-stationary, WS）** | 資料流：每個濾波器權重固定不動，輸入與輸出流動。 |
-| **輸入駐留（Input-stationary, IS）** | 資料流：每個輸入激活值固定不動，濾波器權重與輸出循環。 |
-| **卡式積乘法（Cartesian product multiplication）** | K 個非零輸入與 K' 個非零權重的全對全相乘，同時產生 K×K' 個部分乘積。 |
-| **散射網路（Scatter network）** | 把卡式積乘法器產生的每個部分乘積路由到正確輸出累加器位址的硬體網路。 |
-| **展平（Flattening）** | 用單一展平索引 `(hw)` 替換 2-D 空間索引 `(h,w)`，把 2-D 卷積映射為 1-D 內積。 |
-| **IS-OS 資料流** | 兩階段計算：IS 階段產生中間張量 T；OS 階段把 T 化約為輸出。 |
-| **張量秩重排（swizzleRanks）** | 對張量的秩軸重新排序，把不協調遍歷轉換為協調遍歷。 |
-| **Eyeriss** | 權重駐留加速器（ISSCC 2016），帶輸入激活值閘控；省約 45% PE 功耗。 |
-| **Cambricon-X** | 權重駐留稀疏加速器（MICRO 2016），透過間接激活值查表利用稀疏權重。 |
-| **Cnvlutin** | 輸出駐留稀疏加速器（ISCA 2016），透過每通道編碼利用稀疏激活值。 |
-| **SCNN** | 稀疏 CNN 加速器（ISCA 2017），透過卡式積＋散射網路利用聯合稀疏。 |
-| **ISOSceles** | IS-OS 稀疏加速器（HPCA 2023），透過兩階段管線加張量秩重排實現最高 7.5 倍加速。 |
+| **閘控（Gating）** | Operand 為 zero 時關閉硬體活動；省 dynamic energy，但保留 dense schedule。 |
+| **跳過（Skipping）** | 從動態 schedule 移除 zero-valued operations；可省 time 與 energy，但需要 compressed traversal。 |
+| **纖維（Fiber）** | Tensor 的一維切片，常表示為 coordinate-payload pairs。 |
+| **協調遍歷（Concordant traversal）** | 依 compressed fiber 的自然 coordinate order 讀取。 |
+| **不協調遍歷（Discordant traversal）** | 要求的存取順序不符合 stored sparse order。 |
+| **纖維投影（Fiber projection）** | 平移 coordinates，使兩個 fibers 能對齊並做 intersection。 |
+| **纖維交集（Fiber intersection）** | 只輸出兩個 sparse fibers 都存在的 coordinates。 |
+| **輸出駐留（Output-stationary）** | 讓 output accumulators 保持 local，inputs 與 weights 串流經過。 |
+| **權重駐留（Weight-stationary）** | 讓 weights 保持 local，以最大化 weight reuse。 |
+| **輸入駐留（Input-stationary）** | 讓 input activations 保持 local，weights 對多個 outputs 產生 contributions。 |
+| **Cartesian product** | 一組 nonzero activations 與一組 nonzero weights 的全對全乘法。 |
+| **Scatter accumulator** | 將 products route 到 runtime 計算出的 output coordinates 的累加硬體。 |
+| **IS-OS dataflow** | 兩階段 sparse dataflow：input-stationary 產生 intermediate tensor，接著 output-stationary reduction。 |
+| **Swizzling** | 重排 tensor ranks，使後續 traversal 變成 concordant。 |
+| **Joint density** | 預期 nonzero product density；在 independence 假設下常近似為 activation density 乘 weight density。 |
 
 ---
 
 ## 重點回顧（Takeaways）
 
-- **閘控省能源，跳過省時間。** 兩者在架構上有所不同，需要不同的硬體機制。多數高效能稀疏加速器兩者兼顧。
-- **單維稀疏設計是可掌握的。** 僅稀疏權重（Cambricon-X）和僅稀疏激活值（Cnvlutin）兩種架構各自相對直接：對一個壓縮張量做協調遍歷，對另一個做密集查表。
-- **聯合稀疏需要散射網路或兩階段管線。** SCNN 用卡式積乘法器加散射網路；ISOSceles 用 IS→OS 兩階段管線加纖維交集和張量秩重排。
-- **SCNN 的卡式積概念乾淨**，但為散射網路付出了面積和能耗代價。其收益與權重密度和激活值密度的**乘積**成正比。
-- **ISOSceles 的 IS-OS 拆分把不規整的散射轉化為結構化管線**，把部分結果存在小型中間張量 `T` 中，再對 `T` 的秩重排使第二階段協調。實測加速最高達 **7.5 倍**。
-- **纖維交集是實現聯合跳過的數學原語**，在輸出駐留和 IS-OS 資料流中均可使用。硬體代價取決於表示法（位元遮罩和未壓縮最廉價；座標列表需要排序或合併邏輯）。
-- **資料流選擇與稀疏性利用相互耦合。** 從輸出駐留切換到權重駐留會改變哪個張量更駐留、哪個資料必須從更大的緩衝區讀取——說明映射決策（TeAAL 的 Mapping 層）直接與格式層（Format 層）的稀疏選擇交互作用。
+- Sparse acceleration 是 scheduling 與 communication problem，不只是 compression problem。
+- Gating 有用但不降低 latency；skipping 會改變實際執行 schedule。
+- Single-sparse cases 較容易，因為另一個 operand 可以保持 dense 並直接 index。
+- Joint sparsity 引入 coordinate matching、legality checks 與 irregular accumulation。
+- SCNN 付出 scatter hardware 來直接利用兩個 compressed operands。
+- ISOSceles 付出 intermediate tensor 與 swizzled traversal，使第二階段更結構化。
+- Quantitative sparse claims 必須說明 source 與 scope：layer density、architecture baseline、metadata cost、measured vs. theoretical speedup。
 
 ---
 
-## 與後續講次的連結（Connections）
+## 連結（Connections）
 
-- **本講結束了稀疏架構系列（L07–L10）。** L07 引入稀疏性動機與格式；L08 引入纖維表示、協調／不協調遍歷與閘控；L09 涵蓋單維稀疏的跳過；L10（本講）涵蓋聯合稀疏與兩個案例研究加速器（SCNN 和 ISOSceles）。
-- **L11 — 進階技術：** 下一講轉向新穎元件技術（RRAM、光學、超導），這些技術可能在物理層面實現不同的稀疏性利用策略。
-- **L12 — 降低精度：** 量化（quantization）與低位元算術和稀疏性交互——量化網路中的零值條目可能來自不同原因，且兩種技術可以疊加組合。
-- **TeAAL 金字塔的再現：** SCNN 和 ISOSceles 的案例研究展示了金字塔所有四層在真實設計中的作用：**格式（Format）**（壓縮纖維）、**映射（Mapping）**（IS、OS 還是 IS-OS 資料流）、**架構（Architecture）**（卡式積乘法器 vs. IS-OS 管線）、**綁定（Binding）**（散射網路路由 vs. 秩重排張量索引）。
+本講結束從 L07 開始的 sparse-architecture arc，也為 L11 做鋪墊：資料應該在哪裡移動？Advanced memory technologies 可以降低某些 movement costs，但不會讓 sparse coordinate management 消失。TeAAL 的 separation of concerns 仍然有用：format 決定儲存什麼，mapping 決定 traversal，architecture 決定可用硬體，binding 決定哪個硬體資源執行哪個 operation。
 
 ---
 
-## 附錄 — 投影片對照表（Slide-to-Section Map）
+## 附錄 — 投影片對照表
 
-| PDF 投影片標號 | 章節 |
-|---|---|
-| L06-1 | 標題——稀疏架構第三部，2026 年 3 月 9 日 |
-| L06-2 … L06-4 | 第一章 — CONV 層回顧；1-D 輸出駐留卷積迴圈巢 |
-| L06-5 … L06-6 | 第一章 — 閘控 vs. 跳過：能源節省 vs. 時間節省 |
-| L06-7 | 第一章 — Eyeriss 閘控：PE 功耗降低 45% |
-| L06-8 … L06-9 | 第二章 — 權重駐留資料流；密集 vs. 壓縮表示 |
-| L06-10 … L06-14 | 第二章 — 輸出駐留稀疏權重資料流與資料路徑圖 |
-| L06-15 … L06-16 | 第二章 — 權重駐留稀疏權重資料流與資料路徑圖 |
-| L06-17 … L06-21 | 第二章 — 位置空間中的纖維切分；擴展到多維 |
-| L06-22 … L06-24 | 第二章 — 平行權重駐留稀疏權重迴圈巢 |
-| L06-23 | 第二章 — Cambricon-X：權重元資料驅動的間接激活值查表 |
-| L06-25 | 第三章 — 轉折：利用稀疏輸入 |
-| L06-26 … L06-27 | 第三章 — 權重駐留稀疏輸入資料流與資料路徑 |
-| L06-28 … L06-34 | 第三章 — 輸出駐留稀疏輸入資料流；稀疏滑動視窗 |
-| L06-35 | 第三章 — 輸出駐留稀疏輸入資料路徑圖 |
-| L06-36 … L06-38 | 第三章 — Cnvlutin：每通道編碼器、迴圈巢、加速比 |
-| L06-39 … L06-41 | 第四章 — 輸入駐留稀疏權重＋輸入；資料路徑圖 |
-| L06-42 … L06-43 | 第四章 — 聯合稀疏纖維切分；平行 IS 迴圈巢 |
-| L06-44 | 第四章 — 卡式積乘法可視化 |
-| L06-45 … L06-46 | 第四章 — SCNN 架構概覽與展平 |
-| L06-47 … L06-48 | 第四章 — SCNN 分塊迴圈巢（單通道；展平後） |
-| L06-49 | 第四章 — SCNN PE 微架構：稀疏壓縮前端＋密集散射後端 |
-| L06-50 … L06-51 | 第四章 — SCNN 延遲與能耗隨聯合密度的變化 |
-| L06-52 | 第五章 — 權重駐留聯合稀疏：迴圈翻轉與緩衝區代價 |
-| L06-53 … L06-56 | 第五章 — 輸出駐留聯合稀疏：纖維投影＋交集 |
-| L06-57 … L06-62 | 第五章 — IS-OS 資料流數學推導：兩階段推導與秩重排 |
-| L06-63 … L06-65 | 第五章 — ISOSceles IS-OS 管線圖（IS 前端 → T → OS 後端） |
-| L06-66 | 第五章 — ISOSceles 加速比：最高 7.5 倍，平均 1.7 倍 |
+| Slide label | 章節 | Notes |
+|---|---|---|
+| `L06-1` | Title and framing | PDF label 與 repository lecture number 不同。 |
+| `L06-2`-`L06-7` | Gating vs. skipping | 包含 Eyeriss 45% PE power slide-derived claim。 |
+| `L06-8`-`L06-25` | Sparse weights only | Output-stationary、weight-stationary、fiber splitting、Cambricon-X。 |
+| `L06-26`-`L06-38` | Sparse inputs only | Sparse sliding window 與 Cnvlutin。 |
+| `L06-39`-`L06-51` | SCNN and joint sparsity | 加入 SCNN paper bridge。 |
+| `L06-52`-`L06-66` | IS-OS and ISOSceles | Slide-derived projection、intersection、swizzling 與 reported speedup。 |
+| Background | State of pruning bridge | 補充 sparse weights 從何而來，以及 speedup metrics 為何要小心。 |
+
+---
+
+## Source Notes
+
+- Lecture ordering 與 loop-nest examples follow Lecture 10 slides `L06-1` through `L06-66`。
+- Eyeriss gating 45% PE power reduction stated on Lecture 10 slide `L06-7`。
+- Cambricon-X 與 Cnvlutin 是 Lecture 10 slides `L06-23` 與 `L06-36` through `L06-38` 的 slide-stated architecture examples；它們的 original PDFs 不在本 worker 指定的 local paper list 中。
+- SCNN details and numerical results derived from `papers/L17_SCNN_Parashar_ISCA2017.pdf`，尤其 abstract、Sections III-IV、Section VI 與 Tables III-IV。
+- Pruning context derived from `papers/L16_StateOfPruning_Blalock_MLSys2020.pdf`，尤其 Sections 2-6。
+- ISOSceles details and speedup numbers are slide-derived from Lecture 10 slides `L06-53` through `L06-66`；original ISOSceles PDF 不在指定 local paper inputs 中。
+- Worked examples 是本章為教學目的建立的 original examples。
+
+## Uncertainty Notes
+
+- Live lecture 可能對 Cambricon-X、Cnvlutin 或 ISOSceles 的 implementation details 有不同強調；本章只能從 slides 重建。
+- Independent-density equation $d_i d_f$ 是 teaching model，不是保證。實際 activation 與 weight sparsity 可能依 layer、channel、data distribution 相關。
+- Repository 既有 `assets/L10/` 可能包含 copyright-sensitive slide captures。本章不再 embed 它們，但 Worker C 未刪除 owned walkthrough files 以外的 assets。

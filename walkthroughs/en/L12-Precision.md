@@ -14,6 +14,43 @@ Every bit you save in a neural network operand saves **energy twice over** — o
 
 ---
 
+## What Problem This Lecture Solves
+
+Earlier lectures treated a DNN layer mostly as a loop nest: choose a dataflow, place tensors in the memory hierarchy, and try to reduce data movement. Lecture 12 asks a different question: **what if the values themselves do not need 32 bits?**
+
+The naive approach is to keep every weight, activation, gradient, and partial sum in FP32 because FP32 is convenient, expressive, and familiar from software training. The hardware problem is that FP32 is wasteful for many inference tensors and sometimes for training tensors too. A 32-bit value consumes four times the storage of an 8-bit value, creates wider memory transfers, and requires a much larger multiplier. The lecture's goal is to teach when those extra bits are useful numerical information and when they are just cost.
+
+The central hardware design question is:
+
+> For each tensor and each phase of the workload, what is the narrowest representation that preserves the needed model behavior while reducing arithmetic, storage, and data-movement cost?
+
+This is why reduced precision is a co-design topic. A hardware designer cannot choose INT4, FP8, or bfloat16 by looking only at the multiplier. The choice interacts with training recipe, activation statistics, accumulator growth, layer sensitivity, scale-factor granularity, and the memory hierarchy.
+
+## Why This Lecture Matters
+
+Precision is one of the few optimizations that changes both sides of the accelerator cost equation:
+
+- It reduces **compute cost** because narrower multipliers and adders need less switching capacitance and less area.
+- It reduces **memory cost** because fewer bits are read, written, buffered, and routed.
+- It increases **effective on-chip capacity** because a fixed SRAM can hold more values.
+- It can improve **throughput density** if a MAC can be spatially or temporally reused for multiple low-precision operations.
+- It can hurt **accuracy or convergence** if quantization noise, clipping, overflow, underflow, or accumulator truncation is mishandled.
+
+That last point is the boundary between reduced precision and earlier mapping/dataflow lectures. A poor dataflow may waste energy but should compute the same mathematical result. A poor precision choice may compute a different model.
+
+## Prerequisites and Mental Model
+
+Before reading the main narrative, keep four ideas in view:
+
+1. **A number format is a budget.** A bit can buy sign, range, or resolution. You rarely get all three.
+2. **Quantization is a lossy encoding unless the original values already lie on the quantization grid.** The engineering question is whether the loss matters for the model.
+3. **A MAC has internal values, not just inputs and outputs.** Multiplying two 8-bit operands can produce a 16-bit product, and summing many products needs extra accumulator bits.
+4. **Scale granularity is part of the format.** "INT8" is incomplete unless you say whether the scale is per tensor, per layer, per channel, per block, or per value.
+
+The most useful mental model is a ruler. Uniform quantization lays equally spaced tick marks across a range. Floating-point moves the ruler by storing a per-value exponent. Dynamic fixed-point and MX formats share one ruler position across a group of values. Learned and log-domain quantization bend the ruler so that dense regions of the distribution receive more tick marks.
+
+---
+
 ## Learning Objectives
 
 After this lecture you should be able to:
@@ -42,8 +79,6 @@ Reduced precision belongs to the category of **"reduce size of operands"**: shri
 
 The most important table in this chapter (Horowitz, ISSCC 2014) shows the **energy cost (pJ) and silicon area (µm²)** for common arithmetic and memory operations:
 
-![Energy and area cost vs. operation precision — Horowitz ISSCC 2014](../../assets/L12/L12-p03-energy-area-cost.png)
-
 Reading the table:
 
 | Operation | Energy (pJ) | Area (µm²) |
@@ -69,9 +104,9 @@ Three observations stand out:
 
 The MAC (multiply-accumulate) has three operands with different precision requirements: input activations (n_i bits), weights (n_f bits), and the partial sum accumulator. Because the accumulator sums up to RSC (receptive field spatial cardinality) partial products, it needs **⌈log₂(RSC)⌉ additional bits** to avoid overflow without loss of precision.
 
-![Bit-width growth inside a MAC — partial sum needs extra bits](../../assets/L12/L12-p07-mac-bit-widths.png)
-
 For real networks: AlexNet (RSC up to 9,216) needs 14 extra bits; VGG-16 (RSC up to 25,088) needs 15 extra bits. This is why accumulators are often kept at 32 bits even when inputs are 8 bits — the accumulator is the internal "headroom" for the operation.
+
+Small example: suppose an activation and a weight are both signed 8-bit values. A single product may need about 16 bits. If one output accumulates \(K = 9\) such products, a conservative lossless accumulator needs about \(16 + \lceil \log_2 9 \rceil = 20\) bits. If \(K = 1024\), it needs about \(16 + 10 = 26\) bits. This is the reason "INT8 inference" often means **8-bit inputs and weights, but 32-bit accumulation**. The stored operands are narrow; the internal running sum is wider to preserve correctness.
 
 > **Why it matters:** Reducing operand bit-width from 32 to 8 cuts integer multiplier energy by ~15× and area by ~12×, and it also reduces memory traffic — both reads and writes. These are the two biggest costs in a DNN accelerator. Every technique in this lecture is a different strategy for achieving those savings while preserving accuracy.
 
@@ -84,8 +119,6 @@ For real networks: AlexNet (RSC up to 9,216) needs 14 extra bits; VGG-16 (RSC up
 ### What quantization is
 
 **Quantization** maps a real-valued distribution of numbers to a finite set of discrete **quantization levels** {q₀, q₁, …, q_{L-1}}, separated by **decision boundaries** {d₁, d₂, …, d_{L-1}}. The goal is to minimize the **quantization error** (the difference between original and reconstructed values) subject to the constraint of using only L levels.
-
-![Quantization: mapping a distribution to L quantization levels with decision boundaries](../../assets/L12/L12-p10-quantization-levels.png)
 
 The number of bits required is log₂(L). "Reduced precision" means reducing L (and hence the bit count), trading finer representation for smaller storage and compute. The optimal placement of levels and boundaries depends on the **probability density function** of the data — an insight that motivates non-uniform quantization.
 
@@ -103,6 +136,8 @@ Two modes of mapping the real-valued range to quantization levels:
 
 Clipping sacrifices a small amount of dynamic range to buy higher resolution for the bulk of the distribution.
 
+Worked example: take symmetric 4-bit signed quantization over \([-1, 1]\). If we reserve integer codes \(-7, \ldots, 7\), the scale is \(s = 1/7\). A real value \(x = 0.37\) becomes \(q = \mathrm{round}(x/s) = \mathrm{round}(2.59) = 3\), and reconstructs to \(\hat{x} = q s \approx 0.429\). The quantization error is \(\hat{x} - x \approx 0.059\). If the tensor contains a rare outlier \(x = 4.0\), expanding the range to cover it would make the scale \(4/7\), so values near zero would be much coarser. Clipping the outlier may improve the average error for the dense part of the distribution.
+
 > **Why it matters:** The accuracy of quantization depends not just on the number of bits but on *how* those bits are allocated across the value range. Poor range selection wastes levels on rarely-occurring extreme values.
 
 ---
@@ -114,8 +149,6 @@ Clipping sacrifices a small amount of dynamic range to buy higher resolution for
 ### Numerical format anatomy
 
 Every numerical representation has three components: a **sign (S)**, a **mantissa/significand (M)** encoding the number of unique values within a scale, and (for floating-point) an **exponent (E)** encoding the scale. Total bits = n_S + n_E + n_M.
-
-![Numerical format comparison: FP32, FP16, bfloat16, Int32, Int16, Int8](../../assets/L12/L12-p16-numerical-formats.png)
 
 | Format | S | E | M | Range |
 |---|---|---|---|---|
@@ -145,11 +178,11 @@ Fixed-point hardware is simpler (no exponent alignment logic) and cheaper. The t
 
 This is strictly between fixed-point (one global scale) and floating-point (one scale per value). The scale can differ across layers, data types (weights vs. activations), and channels — but not per-value. The result is high accuracy with modest storage overhead.
 
+Small example: a channel's weights might be stored as 8-bit integers with shared scale \(2^{-5}\). The stored code \(q = -13\) reconstructs to \(-13 \cdot 2^{-5} = -0.40625\). Another channel may use scale \(2^{-7}\), giving finer resolution but narrower range. The arithmetic unit can still operate on integers; the scale is accounted for when aligning products, accumulating, or dequantizing outputs.
+
 ### The mantissa–exponent tradeoff
 
-The slide directly comparing fp16 and bfloat16 makes the tradeoff concrete:
-
-![Mantissa vs. exponent bit allocation: fp16 vs. bfloat16](../../assets/L12/L12-p31-mantissa-exponent-tradeoff.png)
+The lecture source directly comparing fp16 and bfloat16 makes the tradeoff concrete:
 
 - **fp16** (S=1, E=5, M=10): range ~5.9×10⁻⁸ to ~6.5×10⁴ — fine precision, limited range.
 - **bfloat16** (S=1, E=8, M=7): range ~1×10⁻³⁸ to ~3×10³⁸ — wide range, coarser precision.
@@ -177,7 +210,7 @@ Uniform quantization spaces levels equally. But DNN weight distributions are oft
 
 ### Log-domain quantization
 
-**Logarithmic quantization** maps the mantissa bits to a logarithmic scale. The key hardware benefit: a **multiplication in the log domain becomes an addition** (and an addition becomes a bitshift and comparison). The slide shows that with both weights and activations in log domain, multiply-accumulate becomes shift-and-add — a fundamentally cheaper hardware operation.
+**Logarithmic quantization** maps the mantissa bits to a logarithmic scale. The key hardware benefit: a **multiplication in the log domain becomes an addition** (and an addition becomes a bitshift and comparison). In the lecture source, when both weights and activations are represented in the log domain, multiply-accumulate becomes shift-and-add — a fundamentally cheaper hardware operation.
 
 The LogNet (Lee, ICASSP 2017; Miyashita, arXiv 2016) demonstrated:
 - 5-bit weights (CONV), 4-bit weights (FC), 4-bit activations on AlexNet.
@@ -193,8 +226,6 @@ The LogNet (Lee, ICASSP 2017; Miyashita, arXiv 2016) demonstrated:
 Hardware implication: the weight memory reads a narrow index; a small dequantization table maps the index to the full-precision weight value before the MAC. This reduces weight **storage** but does not reduce the precision of the MAC itself — the multiplier still operates at full precision.
 
 The precision taxonomy that emerges:
-
-![Full precision taxonomy: uniform, non-uniform, shared-exponent formats](../../assets/L12/L12-p51-precision-taxonomy.png)
 
 - **Uniform**: direct integer, fixed-point.
 - **Non-uniform constrained**: log-domain (a function of the binary value).
@@ -212,9 +243,7 @@ The precision taxonomy that emerges:
 
 ### Accuracy impact of dynamic fixed-point
 
-The slides show measured top-1 accuracy of CaffeNet on ImageNet as the bit-width is reduced from 16 bits to as few as 2 bits, with and without fine-tuning:
-
-![Impact on accuracy: dynamic fixed-point quantization of CaffeNet on ImageNet](../../assets/L12/L12-p35-dynamic-fixed-point-accuracy.png)
+The lecture source reports measured top-1 accuracy of CaffeNet on ImageNet as the bit-width is reduced from 16 bits to as few as 2 bits, with and without fine-tuning:
 
 Key findings:
 - **8-bit dynamic fixed-point without fine-tuning**: 0.4% accuracy loss vs. 32-bit float.
@@ -224,8 +253,6 @@ Key findings:
 ### The comprehensive accuracy summary
 
 The lecture's summary table (slide 69) is the single most useful quantitative reference:
-
-![Summary table: accuracy loss for various reduced-precision methods on AlexNet](../../assets/L12/L12-p69-summary-table.png)
 
 | Category | Method | Weights (bits) | Activations (bits) | Accuracy loss (%) |
 |---|---|---|---|---|
@@ -254,7 +281,7 @@ For inference, 8-bit integer is already industry-standard. Research has pushed t
 
 ### Varying precision across layers
 
-Not every layer needs the same precision. The slides show that varying precision across layers (e.g., using 4-bit for some layers, 8-bit for others) can achieve a better accuracy–efficiency tradeoff than applying a uniform low bit-width everywhere. Early and late layers (first and last) are consistently kept at higher precision across virtually every method in the summary table.
+Not every layer needs the same precision. The lecture source reports that varying precision across layers (e.g., using 4-bit for some layers, 8-bit for others) can achieve a better accuracy–efficiency tradeoff than applying a uniform low bit-width everywhere. Early and late layers (first and last) are consistently kept at higher precision across virtually every method in the summary table.
 
 > **Why it matters:** 8-bit integer for inference is mature and industry-standard. The frontier is **4-bit and below**, where quantization-aware training, per-channel scaling, and careful format design are necessary to preserve accuracy. The summary table is the empirical scorecard for that frontier.
 
@@ -308,6 +335,196 @@ The extreme case of reduced precision:
 > **Why it matters:** The hardware design space mirrors the numerical format design space: spatial reconfigurability gives throughput, temporal bit-serial gives proportional speedup, and the ability to gate unused logic gates gives energy reduction. The challenge is that adding flexibility always adds some overhead, so the net benefit depends on the actual precision distribution of the workload.
 
 ---
+
+## Worked Examples
+
+### Example 1: Accumulator Headroom
+
+Suppose a convolution output sums \(R \times S \times C = 3 \times 3 \times 64 = 576\) products. If each product is kept in \(16\) bits, a lossless accumulator needs an additional \(\lceil \log_2 576 \rceil = 10\) bits, for about \(26\) bits total. A 16-bit accumulator would not be safe for the worst case even though the input operands are only 8 bits.
+
+Hardware implication: the PE datapath may use an 8-bit multiplier but a wider accumulator register file. This increases PE storage and routing width, so accumulator precision is a first-class hardware parameter, not a footnote.
+
+### Example 2: Per-Tensor vs. Per-Channel Scale
+
+Imagine two output channels. Channel A has weights mostly in \([-0.25, 0.25]\); channel B has weights in \([-2, 2]\). A single per-tensor INT8 scale must cover \([-2, 2]\), so the quantization step is roughly \(2/127\). Channel A then uses only a small part of the code range. Per-channel scaling lets channel A use a much smaller step, roughly \(0.25/127\), improving resolution without changing the stored bit-width.
+
+Hardware implication: per-channel scale improves accuracy but adds scale storage and usually extra multiply/shift logic at channel boundaries. It is a classic model-hardware tradeoff: better numerical fit in exchange for more metadata and control.
+
+### Example 3: Spatial vs. Temporal Precision Scaling
+
+A spatial precision-scalable MAC may split an 8-bit by 8-bit multiplier into several lower-bit multipliers and complete multiple 4-bit operations in one cycle. A bit-serial MAC instead consumes one or a few bit planes per cycle; reducing precision from 8 bits to 4 bits reduces the number of cycles. Both exploit low precision, but they stress different parts of the design: spatial scaling needs more output/input bandwidth when it produces more results per cycle, while temporal scaling trades latency and control for smaller arithmetic.
+
+---
+
+## Key Equations and How to Read Them
+
+- Number of quantization levels: \(L = 2^b\), where \(b\) is the number of stored bits. This equation measures representation capacity, not accuracy. Two 8-bit formats can have the same \(L\) but very different ranges and error distributions.
+- Uniform affine quantization: \(q = \mathrm{clip}(\mathrm{round}(x/s) + z)\), with reconstruction \(\hat{x} = s(q - z)\). Here \(s\) is the scale and \(z\) is the zero-point. Symmetric quantization often uses \(z = 0\); asymmetric quantization uses \(z\) to represent shifted distributions more efficiently.
+- Accumulator growth: \(b_{\mathrm{acc}} \ge b_{\mathrm{product}} + \lceil \log_2 K \rceil\), where \(K\) is the number of products summed. This is a worst-case correctness bound; real designs may use saturation, rounding, or statistical assumptions, but those choices must be explicit.
+- Floating-point bit budget: \(b = 1 + E + M\). The sign bit stores polarity, \(E\) controls dynamic range, and \(M\) controls local resolution. bfloat16 and FP16 both use 16 bits, but spend the exponent/mantissa budget differently.
+
+---
+
+## Hardware Implications
+
+- **Energy:** Narrower arithmetic reduces switching activity, and narrower values reduce SRAM/DRAM bitline activity. The Horowitz numbers in L12-3 are slide-stated anchors for this intuition.
+- **Area:** A narrower multiplier can be much smaller; this can be spent on more MACs, more local storage, or lower cost.
+- **Bandwidth:** INT8 halves FP16 traffic and quarters FP32 traffic before compression. This changes whether a design is compute-bound or memory-bound.
+- **Buffer capacity:** A 128 KiB SRAM holds four times as many INT8 values as FP32 values. Precision therefore changes mapping feasibility, not just arithmetic cost.
+- **Accumulator design:** Low-precision inputs do not imply low-precision partial sums. Accumulator width affects PE register files and interconnect width.
+- **Programmability:** Variable precision requires metadata: scale factors, zero-points, per-layer precision choices, and sometimes calibration statistics.
+- **Verification and correctness:** Saturation, rounding mode, NaN/Inf behavior, denormal handling, and overflow policy become observable hardware-software contracts.
+
+---
+
+## Common Misconceptions
+
+### Misconception: "INT8" fully specifies the computation.
+
+It does not. A complete INT8 specification must say the scale, zero-point, whether scaling is per tensor/channel/block, accumulator width, rounding mode, saturation policy, and where requantization occurs.
+
+### Misconception: Lower precision always increases speed.
+
+Only if the hardware can exploit it. A fixed 8-bit MAC running 4-bit operands may save some switching energy through gating, but it does not automatically produce twice as many operations per cycle. Throughput gains require spatial packing, temporal bit-serial shortening, or another precision-scalable mechanism.
+
+### Misconception: Non-uniform quantization is always better.
+
+Non-uniform levels can reduce quantization error, but the decoder, lookup table, shift logic, metadata, and irregularity may erase the savings. It is useful only when the accuracy improvement or storage reduction pays for the extra hardware.
+
+### Misconception: If weights are low precision, activations and accumulators can be low precision too.
+
+Weights, activations, gradients, and partial sums have different distributions and error sensitivity. Many successful systems use low-precision weights/activations with higher-precision accumulators or master weights.
+
+---
+
+## Paper Bridge
+
+### Paper Bridge: In-Datacenter Performance Analysis of a Tensor Processing Unit
+
+#### Bibliographic identity
+
+- Title: *In-Datacenter Performance Analysis of a Tensor Processing Unit*
+- Authors: Norman P. Jouppi et al.
+- Year / venue: ISCA 2017
+- Used in this lecture: L12's discussion of 8-bit integer inference hardware and industrial reduced-precision design.
+
+#### Problem addressed
+
+The TPU paper asks whether a domain-specific inference accelerator can deliver better latency, throughput, and energy efficiency than contemporary CPUs and GPUs for production datacenter neural-network workloads.
+
+#### Core idea
+
+The first-generation TPU uses a systolic matrix multiply unit with \(256 \times 256 = 65{,}536\) 8-bit MACs, 32-bit accumulators, and a large software-managed on-chip memory. Reduced precision is not an isolated arithmetic trick; it is what lets the chip pack many MACs and enough on-chip storage into a low-power inference accelerator.
+
+#### Relevance to this lecture
+
+The paper is the industrial example behind the lecture's claim that 8-bit integer inference is a mature hardware point. It also illustrates why accumulator precision remains wider than operand precision.
+
+#### Key claims used in this chapter
+
+- Abstract and Section 2 state that the TPU's matrix multiply unit contains 65,536 8-bit MACs, reaches 92 TOPS peak, and uses 28 MiB of software-managed on-chip memory.
+- Section 1 says quantization transforms floating-point NN values into narrow integers, often 8-bit, for inference; it also states that 8-bit integer multiply can be much lower energy and area than 16-bit floating-point multiply, citing prior circuit data.
+- Section 2 states that the matrix unit accumulates 16-bit products into 32-bit accumulators and that mixed 8/16-bit operation reduces throughput relative to pure 8-bit operation.
+- Section 4 uses a TPU-specific roofline model with operational intensity defined in integer operations per byte of weights read, showing that memory bandwidth remains a limiter even with reduced precision.
+
+#### What students should remember
+
+- "8-bit inference" in a real accelerator usually means narrow stored operands plus wider internal accumulation.
+- Reduced precision enabled the TPU to allocate die area to a large systolic array and on-chip buffers.
+- Precision and memory hierarchy are coupled: smaller operands help, but workload operational intensity still determines whether the accelerator is bandwidth-bound.
+
+#### Limitations and assumptions
+
+The first-generation TPU was designed for inference workloads around 2015 and did not target training. It also omitted sparse architectural support for time-to-deploy reasons, so it should not be treated as a universal DNN-accelerator template.
+
+#### Suggested insertion points
+
+Use this paper when reading Chapter 6's TPU discussion, Chapter 1's energy/area motivation, and the accumulator-headroom example.
+
+### Paper Bridge: Review and Benchmarking of Precision-Scalable MAC Architectures
+
+#### Bibliographic identity
+
+- Title: *Review and Benchmarking of Precision-Scalable Multiply-Accumulate Unit Architectures for Embedded Neural-Network Processing*
+- Authors: Vincent Camus, Linyan Mei, Christian Enz, and Marian Verhelst
+- Year / venue: IEEE JETCAS 2019
+- Used in this lecture: L12's precision-scalable MAC taxonomy.
+
+#### Problem addressed
+
+Many accelerators claim support for variable precision, but their MAC designs are implemented in different processes, with different assumptions and benchmarks. The paper tries to make the design space comparable.
+
+#### Core idea
+
+The paper classifies precision-scalable MACs by whether they exploit low precision spatially or temporally, and by how partial products are accumulated. It introduces the Sum Apart (SA) and Sum Together (ST) distinction, then benchmarks representative designs in a common 28 nm CMOS flow.
+
+#### Relevance to this lecture
+
+Lecture 12 explains that lower precision is valuable only when the hardware can exploit it. This paper provides the microarchitectural bridge from "the model can use fewer bits" to "the MAC array can gain throughput, energy, or area efficiency."
+
+#### Key claims used in this chapter
+
+- Section II introduces the SA/ST taxonomy and ties precision scalability to dataflow and PE-array behavior.
+- Section II-D and Table I organize precision-scalable MACs into spatial and temporal categories.
+- Section V analyzes bandwidth, throughput, area, and energy, showing that precision-scalable designs can introduce bandwidth and area overheads.
+- Section VII and Figure 30 show that the best MAC depends on the precision distribution of the workload, not simply on the lowest available bit-width.
+
+#### What students should remember
+
+- Spatial scaling can turn one full-precision MAC into multiple low-precision operations per cycle, but it may stress input/output bandwidth.
+- Temporal or bit-serial scaling reduces cycles when fewer bit planes are used, but it changes latency and control.
+- Flexibility has overhead. A precision-scalable MAC is worthwhile only if the workload spends enough time in the reduced-precision modes it accelerates.
+
+#### Limitations and assumptions
+
+The paper focuses on MAC-unit architectures and circuit-level benchmarking. A full accelerator still needs memory hierarchy, dataflow mapping, compiler support, and model-level precision selection.
+
+#### Suggested insertion points
+
+Use this paper when studying Chapter 6's spatial and temporal precision-scalable MAC discussion and Exercise 3.
+
+### Paper Bridge: Eyeriss and Precision as a Data-Movement Co-Design Variable
+
+#### Bibliographic identity
+
+- Title: *Eyeriss: A Spatial Architecture for Energy-Efficient Dataflow for Convolutional Neural Networks*
+- Authors: Yu-Hsin Chen, Joel Emer, and Vivienne Sze
+- Year / venue: ISCA 2016
+- Related local source: `papers/L12_Eyeriss_Chen_ISCA2016.pdf`; the JSSC follow-up is also available locally.
+- Used in this lecture: as context for how precision interacts with dataflow and memory hierarchy.
+
+#### Problem addressed
+
+Eyeriss asks how a spatial CNN accelerator should minimize data movement across DRAM, global buffer, inter-PE communication, and RF storage.
+
+#### Core idea
+
+The row-stationary dataflow tries to exploit reuse for weights, activations, and partial sums simultaneously, under equal hardware-resource constraints. Although Eyeriss is mainly a dataflow paper, it is relevant to precision because operand width changes every access count's byte cost and changes how much data fits in each storage level.
+
+#### Relevance to this lecture
+
+Reduced precision and dataflow are not separable. If values are narrower, the same buffer can hold more live data; if weights are much narrower than activations, a dataflow that previously prioritized weight reuse may no longer be optimal.
+
+#### Key claims used in this chapter
+
+- Abstract and Section I state that data movement can dominate CNN accelerator energy and that row-stationary reduces movement across the hierarchy.
+- Section II describes the spatial-architecture memory hierarchy: DRAM, global buffer, inter-PE communication, and RF.
+- Section VII reports that row-stationary is more energy efficient than compared dataflows under the paper's hardware constraints.
+- The JSSC Eyeriss paper states the fabricated chip uses 16-bit fixed-point precision, which is a useful historical anchor for pre-INT8 CNN accelerators.
+
+#### What students should remember
+
+- Precision changes the cost per access; dataflow changes the number of accesses. Hardware efficiency depends on both.
+- The right precision choice may change the best mapping choice because it changes the relative cost of weights, activations, and partial sums.
+- A chapter about precision still needs the memory-hierarchy intuition from earlier lectures.
+
+#### Limitations and assumptions
+
+Eyeriss is not primarily a quantization paper. It should be used here as a bridge between precision and data movement, not as evidence for a specific low-bit quantization method.
+
+#### Suggested insertion points
+
+Use this paper when connecting L12 to L05/L06 mapping and when reasoning about how reduced precision affects buffer capacity and dataflow selection.
 
 ## Standalone Study Guide
 
@@ -409,3 +626,18 @@ The extreme case of reduced precision:
 | L12-59 … L12-68 | Ch.6 — Binary and Ternary Nets |
 | L12-69 | Ch.5 — Summary Table |
 | L12-75 … L12-76 | Summary and Recommended Reading |
+
+## Source Notes
+
+- The lecture ordering, precision taxonomy, accuracy summary table, MX discussion, binary/ternary examples, and industry-hardware survey follow `Lecture/L12 - Precision_r1.pdf`.
+- The operation energy and area table is slide-stated in L12-3 and attributed there to Horowitz, ISSCC 2014.
+- The TPU discussion is based on Jouppi et al., *In-Datacenter Performance Analysis of a Tensor Processing Unit*, ISCA 2017, especially the Abstract, Sections 1-4, Figures 1-5, and Tables 1-3.
+- The precision-scalable MAC discussion is based on Camus et al., *Review and Benchmarking of Precision-Scalable Multiply-Accumulate Unit Architectures for Embedded Neural-Network Processing*, JETCAS 2019, especially Sections II, V, and VII plus Table I.
+- The Eyeriss bridge uses Chen, Emer, and Sze, *Eyeriss: A Spatial Architecture for Energy-Efficient Dataflow for Convolutional Neural Networks*, ISCA 2016, and the local JSSC follow-up for the fabricated-chip precision context.
+- The small quantization, accumulator-headroom, and per-channel-scaling examples are original teaching examples constructed for this walkthrough.
+
+## Uncertainty Notes
+
+- The live lecture may have emphasized a subset of the many industry formats differently; this chapter groups them pedagogically around range, resolution, scaling granularity, and hardware support.
+- Several accuracy numbers in the summary table are slide-stated literature results. This revision did not independently re-read every original binary/ternary/log-quantization paper behind that table.
+- The chapter discusses modern formats such as MX and NVFP4 using the lecture slides as immediate source anchors. Treat product-specific deployment details as time-sensitive if using this chapter for hardware selection.

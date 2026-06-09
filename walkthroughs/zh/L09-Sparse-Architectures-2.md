@@ -1,406 +1,688 @@
 # L09 — 稀疏架構，第二部分（Sparse Architectures, Part 2）
 
-> **課程：** 6.5930/1 — 深度學習硬體架構（Hardware Architectures for Deep Learning）
-> **講師：** Joel Emer 與 Vivienne Sze（MIT EECS）
-> **講授日期：** 2026 年 3 月 4 日 · **投影片：** 138 頁 · **來源：** [`Lecture/L09-Sparse_Architectures-2.pdf`](../../Lecture/L09-Sparse_Architectures-2.pdf)
->
-> *本文是以「概念」為單位重建講課脈絡的導讀（walkthrough），依主題而非逐頁編排。本講投影片包含大量動畫漸進建構，每一節都標注其綜合的投影片範圍，並展示各張圖的最完整版本，方便對照原始投影片閱讀。*
+> **課程：** 6.5930/1 — Hardware Architectures for Deep Learning
+> **授課教師：** Joel Emer and Vivienne Sze
+> **日期：** 2026-03-04
+> **主要來源：** [`Lecture/L09-Sparse_Architectures-2.pdf`](../../Lecture/L09-Sparse_Architectures-2.pdf)
+
+本章根據公開投影片與本地 paper PDF 重建講解。原投影片大量使用動畫式 build slides；本 walkthrough 將重複 build steps 摺疊成自含敘事。
 
 ---
 
-## 一句話總結（TL;DR）
+## TL;DR
 
-稀疏性（sparsity）在真實 DNN 工作負載中無處不在，但要把這份潛在的加速與節能真正實現，需要兩件事同時成立：一個**壓縮張量表示法（compressed tensor representation）**，讓零值不佔用儲存空間；以及**能高效遍歷與求交（traverse and intersect）這些表示法的硬體**。本講建立起整套正式詞彙——纖維樹（fibertree）、纖維表示法（uncompressed、coordinate/payload list、CSR/CSC）、協調與非協調遍歷（concordant vs. discordant traversal）、座標投影（coordinate projection）與纖維求交（fiber intersection）——然後把這套詞彙應用到一系列從簡到難的稀疏摺積（sparse-CONV）迴圈巢（loop nest），最終介紹三個真實加速器：**Cambricon-X**、**SCNN** 與 **ISOSceles**。
+Lecture 08 建立 sparse hardware 詞彙：gating、skipping、format、metadata、structured sparsity。Lecture 09 把這套詞彙變成設計 sparse convolution accelerator 的工作方法。
 
----
+核心概念是**纖維樹（fibertree）抽象**。Tensor 被表示為 ranks、fibers、coordinates、payloads。一旦用這個角度看 sparse tensors，sparse acceleration 就變成：哪個 fiber operation 便宜？
+
+- `getNext()` 在**協調遍歷（concordant traversal）**時便宜，也就是 loop order 與 storage order 對齊。
+- `getPayload(coordinate)` 在 compressed formats 中可能昂貴，因為它是 random access。
+- **投影（projection）**在 tensors 之間轉換 coordinate，例如 convolution 中的 \(w=q+s\)。
+- **求交（intersection）**只保留兩個 sparse operands 都存在的 coordinates。
+
+接著本講把這些 primitives 用到 sparse convolution：sparse weights、sparse inputs，以及兩者同時稀疏。最後以 SCNN 與 ISOSceles 展示：相同數學 sparsity 可以導向非常不同的硬體資料流。
+
+## 本講解決什麼問題
+
+Lecture 08 說 skipping 需要知道 nonzeros 在哪裡。Lecture 09 接著問：tensor 壓縮之後，硬體要如何遍歷它，並仍然正確計算 DNN operation？
+
+問題不只是「儲存 sparse tensors」。真正問題是：
+
+1. 用能暴露 coordinates 的方式表示 sparse tensors。
+2. 讓 loop order 與 representation order 對齊。
+3. 用 coordinate projection 連接 convolution operands。
+4. 當多個 operands 都 sparse 時使用 intersection。
+5. 選擇能平衡 reuse、skipping、routing、utilization 的 dataflow。
+
+這是從 sparse format design 走向 sparse accelerator microarchitecture 的橋。
+
+## 為什麼本講重要
+
+在 dense convolution 中，改變 loop order 主要改變 reuse。在 sparse convolution 中，改變 loop order 可能決定 inner loop 是便宜的 iterator，還是昂貴的 random metadata lookup。這個限制更尖銳。
+
+例如 coordinate/payload list 很適合「拜訪下一個 stored nonzero」。但若 loop 問「coordinate 137 是否存在？」它就沒那麼方便。這就是 sparse architecture design 需要 formal traversal vocabulary 的原因。
+
+硬體意涵包括：
+
+- **Bandwidth：** 只有 concordant traversal 時，compressed formats 才能少讀 values。
+- **Latency：** 只有能快速產生下一個 useful coordinate，skipping 才成立。
+- **Area：** coordinate generators、position generators、intersection units、scatter networks 變成一等硬體 blocks。
+- **Utilization：** sparse work 不規則；position split 可平衡工作，但可能破壞幾何規則性。
+- **Correctness：** \(w=q+s\)、\(q=w-s\) 等 projection 必須把 products 路由到正確 output coordinate。
+
+## 先備知識與心智模型
+
+你應記得：
+
+- Lecture 08 的 gating、skipping、format 區分。
+- 1-D convolution：\(O[q] = \sum_s I[q+s]F[s]\)。
+- 早先 Einsum 講次中的 tensor ranks 與 coordinates。
+- Dataflow：哪個 loop stationary、哪個 loop streaming、哪個 loop parallelized。
+
+心智模型：
+
+> Sparse convolution 是 dense convolution 加上顯式 coordinate bookkeeping。
+
+MAC 本身仍然簡單。困難在於產生正確的 nonzero payload pairs，並把每個 product 送到正確 partial sum。
 
 ## 學習目標（Learning Objectives）
 
 讀完本講後，你應該能夠：
 
-- 定義**纖維樹（fibertree）抽象**，並說明秩（rank）、纖維（fiber）、座標（coordinate）與承載值（payload）如何表示任意張量（稠密或稀疏）。
-- 列舉主要的**纖維表示法**（uncompressed array、coordinate/payload list、bitmask、CSR、CSC、COO），以及各自的 `getPayload()` 與 `getNext()` 時間複雜度。
-- 區分**協調遍歷（concordant traversal）**（按儲存順序的步進）與**非協調遍歷（discordant traversal）**（隨機存取），並解釋為何非協調遍歷代價高昂。
-- 撰寫**輸出駐留（output-stationary）、權重駐留（weight-stationary）、輸入駐留（input-stationary）** 摺積的迴圈巢，分別利用權重稀疏性、輸入稀疏性，以及兩者同時利用。
-- 解釋**座標投影（coordinate projection）**與**纖維求交（fiber intersection）**這兩個組合稀疏運算元的關鍵原語（primitive）。
-- 描述 **Cambricon-X**、**SCNN**、**ISOSceles** 的硬體資料流與微架構，說明各自利用的稀疏性及所達到的 PE 利用率增益。
+- 定義 rank、coordinate、point、fiber、payload、fibertree。
+- 解釋 coordinate 與 position 的差異。
+- 比較 uncompressed arrays、coordinate/payload lists、bitmasks、RLE、hash tables、CSR、CSC、COO。
+- 解釋 `getPayload()` 與 `getNext()`，以及它們的成本為何依 representation 而變。
+- 區分 concordant、partially discordant、discordant traversal。
+- 在 1-D convolution 中使用 \(w=q+s\)、\(q=w-s\)、\(s=w-q\) 作 coordinate projections。
+- 寫出 sparse weights、sparse inputs、two-sparse convolution 的 loop nests。
+- 解釋 Cnvlutin 如何利用 activation sparsity。
+- 解釋 SCNN 如何使用 input-stationary Cartesian-product sparse multiplication，以及為何需要 scatter。
+- 解釋 ISOSceles 用 IS-OS pipeline 與 rank swizzling 想解決什麼。
 
----
+## 教科書式主敘事
 
-## 第一章 — 稀疏動機與纖維樹抽象
+### 1. Sparse tensors 需要與表示法無關的抽象
 
-> *投影片：L09-1 … L09-17*
+本講從基本 tensor 詞彙開始：
 
-### 稀疏性無所不在
+- **Rank** 是 tensor dimension。
+- **Coordinate** 是某 rank 上的 index。
+- **Point** 是一組 coordinates，每個 rank 一個。
+- **Payload** 可以是 scalar value，也可以是指向下一層 fiber 的 pointer/reference。
+- **Fiber** 是某 rank 上一組有序 coordinate/payload pairs。
+- **Fibertree** 是一棵 tree，levels 是 ranks，edges 帶 fibers。
 
-真實的 DNN 張量遠非稠密。開場投影片（引自 ExTensor，MICRO 2019）展示了廣泛的問題領域——自然語言處理、圖分析、推薦系統、科學模擬、影像分類——它們都以**稀疏張量（sparse tensor）**作為主要輸入或中間狀態。
+Dense \(3 \times 3\) matrix 中，每個 row/column coordinate 都存在。Sparse matrix 中，全零 subtrees 可被省略。像 \((2,1)\) 這種 point，會先在 H-rank fiber 找 coordinate 2，再到其 W-rank child fiber 找 coordinate 1。
 
-![稀疏張量出現在眾多問題領域](../../assets/L09/L09-p02-sparse-motivation.png)
+這個抽象重要，因為它把 semantics 與 layout 分離。Tensor 有數學 coordinates；implementation 決定如何儲存 coordinates 與 payloads。
 
-另一張投影片（引自 SCNN，ISCA 2017）深入探討 AlexNet：所有摺積層的**輸入激活密度（input-activation density，非零值的比例）**在 ReLU 後都遠低於 1.0，**權重密度（weight density）**也在整個網路中下降。關鍵是：工作量（乘加次數）正比於兩個密度的乘積——因此若同時利用權重與激活值的稀疏性，理論上可把工作量降至 `d_W × d_I × 稠密工作量`。硬體挑戰在於如何在實際中實現這個潛力。
+### 2. Coordinate 不是 position
 
-本講將處理稀疏性的工具組織成三個正交手段：
+**Coordinate** 是數學 index。**Position** 是 storage 中的 physical offset。
 
-![三個稀疏性槓桿：閘控（Gating）、格式（Format）與跳過（Skipping）](../../assets/L09/L09-p05-sparsity-aspects.png)
+Uncompressed vector 中 coordinate 等於 position。Compressed coordinate/payload list 中兩者不同：
 
-- **閘控（Gating）：** 執行與稠密情形相同的迴圈排程，但一旦偵測到零運算元，就抑制讀取、乘法與寫入。*省能耗，不省時間。*
-- **格式（Format）：** 壓縮張量表示法，使零值不佔用儲存空間，降低記憶體佔用量與串流所需的頻寬。*省儲存空間與頻寬。*
-- **跳過（Skipping）：** 重構迴圈遍歷本身，只對非零座標進行迭代，完全消除浪費的時脈週期。*同時省時間與能耗。*
+```text
+Dense vector coordinates:   0  1  2  3  4  5
+Dense values:               0  0  c  d  0  f
 
-本講的重點落在**格式**與**跳過**，因為它們能帶來最顯著的加速。
+Compressed positions:       0  1  2
+Stored coordinates:         2  3  5
+Stored payloads:            c  d  f
+```
 
-### 纖維樹抽象
+Coordinate 5 存在 position 2。當 loop variable \(s\) 是數學 coordinate，而 hardware pointer 是 storage position 時，這個差異非常重要。
 
-為了以統一的方式對任何張量表示法進行推理，本課程引入了**纖維樹（fibertree）**抽象。一個具有 *n* 個秩（rank）的張量被表示為一棵有 *n* 層的樹：
+### 3. Fiber operations：`getPayload` 與 `getNext`
 
-- 每個**秩（rank）**對應樹的一層。
-- 每個節點持有一個**座標（coordinate）**與一個**承載值（payload）**。對非葉層節點，承載值是指向子纖維（child fiber）的引用；對葉層節點，承載值是數值。
-- **纖維（fiber）**是一個節點之所有子節點的有序（座標，承載值）元組列表。
+本講使用兩個 operations：
 
-![纖維樹抽象：秩、座標、纖維與承載值](../../assets/L09/L09-p10-fibertree-abstraction.png)
+- `getPayload(coordinate)`：回傳指定 coordinate 的 payload，若存在。
+- `getNext()`：依 traversal order 回傳下一組 coordinate/payload pair。
 
-在稠密情形下（所有元素非零），每一層都出現每個合法座標。在稀疏情形下，只有非零座標出現——完全為零的行（或更高秩的切片）直接消失，使樹縮小。
+成本依 representation 而變：
 
-驅動所有張量遍歷的兩個操作：
-
-- **`getPayload(coordinate)`** — 對纖維中指定座標的承載值進行隨機存取。
-- **`getNext()`** — 依遍歷順序（協調遍歷）前進到下一個座標的循序迭代器。
-
-這兩個操作的效率高度依賴所選的纖維表示法，下一章介紹。
-
-> **為什麼重要：** 纖維樹抽象把「張量表示什麼」與「如何儲存」分離開來。任何正確實作 `getPayload` 與 `getNext` 的硬體，都能利用稀疏性，而不受特定儲存格式的影響——這在稀疏格式層與運算層之間建立了乾淨的架構介面。
-
----
-
-## 第二章 — 張量表示法與遍歷效率
-
-> *投影片：L09-18 … L09-51*
-
-### 纖維表示法的選擇
-
-纖維可以以多種方式儲存，各有不同的空間與存取時間權衡：
-
-| 表示法 | 描述 | `getPayload` 代價 | `getNext`（協調遍歷）代價 |
+| Representation | `getPayload(c)` | Concordant `getNext()` | 硬體直覺 |
 |---|---|---|---|
-| **未壓縮（U，Uncompressed）** | 稠密陣列；位置 = 座標 | O(1) | O(1) |
-| **遊程長度編碼（R，Run-length）** | （零連長度，非零承載值）對 | O(n) 線性掃描 | O(1) |
-| **座標／承載值列表（C，Coordinate/Payload List）** | 有序的（座標，值）對列表 | O(log n) 二分搜尋 | O(1) |
-| **雜湊表（Hf/Hr，Hash Table）** | 座標映射到承載值的雜湊 | O(1) 平攤 | O(n)（局部性差） |
-| **座標位元遮罩（Coordinate Bitmask）** | 每個座標一個位元，1 = 非零 | O(popcount) | O(1) |
+| Uncompressed array | \(O(1)\) | \(O(1)\) | Address = coordinate |
+| Coordinate/payload list | \(O(\log n)\) binary search，或 scan | \(O(1)\) | pointer increment 便宜；random lookup 不便宜 |
+| RLE | \(O(n)\) scan/accumulate | \(O(1)\) | streaming 好，random access 差 |
+| Hash table | 平均 \(O(1)\) | Ordered traversal locality 差 | 需要 hashing 與額外 references |
+| Bitmask | 測 bit；payload lookup 可能需 popcount | 常很便宜 | 適合 presence checks |
 
-對於**協調遍歷**（按儲存順序迭代），座標／承載值列表的效率與未壓縮陣列相同。對於**非協調遍歷**（任意座標的隨機存取），只有未壓縮陣列和雜湊表能提供 O(1) 查詢。位元遮罩格式也允許在不壓縮的情況下快速做零值檢查，正如 Eyeriss 閘控中所使用的那樣。
+這張表解釋了本講反覆提醒的一點：compressed storage 不自動等於 efficient sparse computation。它只對支援的 traversal patterns 有效率。
 
-### 壓縮稀疏行（CSR）——一個具體實作
+### 4. Concordant 與 discordant traversal
 
-最廣泛使用的二維格式是 **CSR（Compressed Sparse Row，壓縮稀疏行）**，以纖維樹記法寫作 `Tensor<U,C>(H,W)`：
+若 loop 拜訪 coordinates 的順序與 representation 儲存順序一致，就是 **concordant traversal**。對 CSR 做 row-major scan 是 concordant。對 CSR 做 column-major scan 是 discordant，因為每個 column lookup 會跨 row fibers 跳動。
 
-- **H 秩為未壓縮（U）：** 行索引等於其位置，因此無需座標後設資料（metadata）。一個長度為 H+1 的**段陣列（segment array）**儲存每行纖維在承載值陣列中的起始位置和長度。
-- **W 秩為壓縮（C）：** 只儲存非零的列座標，存於**座標陣列（coordinate array）**。對應的值存於同一位置的**值陣列（value array）**。
+CSR 與 CSC 有相同 nonzeros 和類似 storage cost，但自然 traversal orders 相反：
 
-![CSR：Tensor<U,C>(H,W) — 段陣列、座標陣列、值陣列](../../assets/L09/L09-p31-csr-representation.png)
+- CSR，記作 `Tensor<U,C>(H,W)`，H rank uncompressed、W fibers compressed；自然 row-major。
+- CSC，記作 `Tensor<U,C>(W,H)`，rank order 交換；自然 column-major。
 
-交換秩的順序則得到 **CSC（Compressed Sparse Column，壓縮稀疏列）**：`Tensor<U,C>(W,H)`。兩種格式對相同資料的記憶體佔用完全相同，但**協調遍歷方向不同**——CSR 適合行主序（row-major）掃描，CSC 適合列主序（column-major）掃描。強制以與儲存順序相反的方向遍歷，就是**非協調遍歷（discordant traversal）**，每個元素可能需要 O(log n) 的隨機存取。
+硬體意義：
 
-合併兩個秩為一個平坦座標，得到 **COO（Coordinate List）**：`Tensor<C2>(H,W)`，直接儲存 (H,W) 座標元組。更多合併選項與記法（`U2`、`R2`、`H2`）允許其他權衡。
+- Concordant traversal 可用 counters、pointers、sequential SRAM reads 實作。
+- Discordant traversal 可能需要 binary search、hash lookup、decompression 或 format conversion。
 
-### 秩的合併、分裂，以及稀疏樣式規格
+這是 Lecture 09 回到 mapping 的第一個大橋：loop order 必須與 format 一起選。
 
-第 52–71 張投影片做了一個重要轉換：稀疏性不再只是「某些座標消失」，而是變成纖維樹中**作用在秩上的形式規格**。因此，同一套記法可以描述非結構化剪枝、通道剪枝、子核心稀疏性、Nvidia 式 2:4 稀疏性，以及階層化結構稀疏性。
+### 5. CSR 作為具體 fibertree implementation
 
-**合併秩（merging ranks）**會把兩個以上的張量秩合成一個儲存秩。例如 `Tensor<C2>(H,W)` 以一條平坦列表儲存 `(h,w)` 座標元組；`Tensor<U2>(H,W)` 則是一個平坦稠密陣列，原本的座標可用除法與取模還原。當硬體希望把多維物件當成一條線性纖維遍歷時，合併秩很有用。
+假設 sparse matrix nonzeros：
 
-**分裂纖維（splitting fibers）**則反過來，把單一秩分成多個秩。這裡有兩個不同選擇：
-
-- **座標空間分裂（coordinate-space splitting）：** 依座標範圍切開，例如 `0–7`、`8–15`。它保留幾何局部性，分塊意義清楚，但不同稀疏分塊的非零數量可能差很多。
-- **位置空間分裂（position-space splitting）：** 依儲存位置切開，也就是依非零數量切。它能讓各 PE 分到近似相同的工作量，但座標範圍會變得不規則。
-
-投影片中的規格範例把剪枝樣式寫成秩順序上的轉換：
-
-- **通道式稀疏性：** 保留 `C` 秩，並對通道纖維套用非結構化規則，形成類似 `C unstructured -> R -> S` 的樣式。
-- **子核心稀疏性：** 將空間濾波器秩 `R` 與 `S` 展平成 `RS`，再在這個展平秩內套用「4 個中保留 2 個」這類結構化規則。
-- **完全非結構化稀疏性：** 將 `C`、`R`、`S` 全部展平成單一 `CRS` 秩，再對整個濾波器體積套用非結構化規則。
-- **2:4 稀疏性：** 重新排序並切分通道秩，形成外層 `C1` 與內層 `C0`，再在最內層套用 2-of-4 規則，讓硬體能以低成本解碼。
-- **階層化結構稀疏性（HSS）：** 將一個秩切成多個巢狀秩，並在不同層級套用不同 `G:H` 規則，例如外層 3:4、內層 2:4。
-
-> **為什麼重要：** 這些秩轉換是模型剪枝規則與硬體格式設計之間的橋樑。剪枝方法是否硬體友善，取決於它的秩順序、展平方式與切分點是否讓剩餘非零座標容易編碼、遍歷並分派到 PE。
-
-### 協調遍歷的硬體
-
-下圖展示二維協調遍歷（例如以行主序掃描 CSR 張量）的硬體結構。兩個位置產生器（Pgen，Position Generator）與座標／承載值提取器構成流水線（pipeline）：H 秩階段產生纖維邊界，W 秩階段在每條纖維內依序掃描座標。
-
-![二維稀疏張量協調遍歷的硬體](../../assets/L09/L09-p48-2d-concordant-traversal.png)
-
-硬體中每個秩都直接實作 `getNext()` 迭代器。對未壓縮秩，位置產生器就是一個計數器；對座標／承載值列表秩，則是一個沿著儲存列表前進的指標。每個秩的輸出都是（座標，承載值）對——一個乾淨、與表示法無關的介面。
-
-> **為什麼重要：** 在座標／承載值列表上的協調遍歷，與未壓縮陣列的 O(1) 每元素代價相同，同時只讀取非零元素。這正是從稀疏性獲得**時間節省**的關鍵。非協調遍歷會破壞這個優勢，這也是迴圈巢的設計——哪個運算元被迭代、哪個被查詢——如此關鍵的原因。
-
----
-
-## 第三章 — 在摺積中利用稀疏權重
-
-> *投影片：L09-72 … L09-96*
-
-### 摺積迴圈巢與座標算術
-
-一維摺積 `O[q] += I[w] * F[s]`（在索引約束 `w = q + s` 下）是本講這一部分的貫穿範例。稠密實作對所有 (q, s) 對進行迭代；兩個內部索引始終同時是座標與位置（未壓縮張量）。
-
-當過濾器（filter）稀疏（許多零權重）時，自然的做法是把 F 壓縮為座標／承載值列表並協調遍歷。**哪個迴圈在外面**決定了資料流：
-
-**輸出駐留（output-stationary）搭配稀疏權重：**
+```text
+row 0: (col 0 -> a), (col 2 -> c)
+row 1: empty
+row 2: (col 0 -> g), (col 1 -> h)
 ```
+
+CSR 儲存：
+
+```text
+segment array:    [0, 2, 2, 4]
+coordinate array: [0, 2, 0, 1]
+value array:      [a, c, g, h]
+```
+
+Segment array 告訴你每個 row 的 W fiber 起訖。Row 1 的 start/end 都是 2，所以是 empty。這就是 fibertree 的具體 implementation：H rank uncompressed，每個 W-rank fiber compressed。
+
+### 6. Rank transformations：merge、split、swizzle
+
+Sparse accelerators 常做 rank transformations：
+
+- **Merge/flatten：** 合併 ranks，例如把 \((H,W)\) 變成單一 coordinate tuple。COO 是這個想法的 coordinate-list 版本。
+- **Coordinate-space split：** 依固定 coordinate ranges 切 rank。保留幾何意義，但 nonzero counts 可能不均。
+- **Position-space split：** 依 stored nonzero count 切 rank。平衡工作，但 coordinate ranges 變不規則。
+- **Swizzle：** 重新排列 ranks，例如把 tensor rank order 從 \([H,R,Q]\) 改成 \([Q,R,H]\)。
+
+這些 transformations 不改變 DNN operation 的數學意義。它們是 layout 與 scheduling choices，讓 sparse dataflow 更容易實作。
+
+### 7. Convolution 作為 coordinate projection
+
+本講的 1-D convolution 是：
+
+\[
+O[q] = \sum_s I[q+s]F[s].
+\]
+
+關係式 \(w=q+s\) 是**座標投影（coordinate projection）**：給定 output coordinate \(q\) 與 filter coordinate \(s\)，它告訴硬體需要哪個 input coordinate \(w\)。
+
+Projection 有三種常見形式：
+
+- Output-stationary view：\(w=q+s\)。
+- Weight-stationary input view：\(q=w-s\)。
+- Output-stationary sparse-input view：\(s=w-q\)。
+
+算術很小，但不能省。沒有 coordinate generator，硬體無法把 product 路由到正確 partial sum。
+
+### 8. 利用 sparse weights
+
+若 weights sparse，而 inputs dense 或可 cheap random access，自然 schedule 是 concordantly iterate compressed filter：
+
+```text
 for q in [0, Q):
-    for (s, f_val) in f:        # 協調遍歷壓縮過濾器
-        w = q + s               # 座標投影
-        o[q] += i[w] * f_val   # 以計算出的座標查詢輸入
+    for (s, f_val) in f:
+        w = q + s
+        o[q] += i[w] * f_val
 ```
-此遍歷對 F 是協調的。計算出的 `w = q+s` 就是一次**座標投影（coordinate projection）**——所需輸入激活值的座標由輸出座標與權重座標推導而來。輸入激活值 `i` 保持未壓縮，使 `i[w]` 為 O(1)。
 
-![輸出駐留搭配稀疏權重：壓縮過濾器遍歷 vs. 稠密](../../assets/L09/L09-p83-output-stationary-sparse-weights.png)
+這是 output-stationary：\(o[q]\) 是 accumulation target，filter nonzeros streaming。Filter traversal 用 `getNext()`，所以便宜。Input \(i[w]\) 最好 uncompressed，或至少 cheap to index。
 
-投影片對比了壓縮過濾器排程（右）與未壓縮排程（左）：若 5 個權重中有 2 個非零，壓縮版本的內迴圈只執行 2 次而非 5 次——這是一個直接正比於權重密度的加速。
+Weight-stationary 版本反轉 outer loops：
 
-**權重駐留（weight-stationary）搭配稀疏權重：** 迴圈順序反轉（`for (s,f_val) in f: for q in [0,Q):`），讓每個權重駐留，同時掃過所有輸出。投影 `w = q+s` 依然適用。兩種資料流達到相同的工作量縮減；差異在於哪個緩衝區持有駐留資料。
-
-### 硬體微架構
-
-輸出駐留稀疏權重排程的硬體有三條資料流：
-
-1. **過濾器纖維** — 一個 Pgen + 座標／承載值階段，依序輸出非零的 (s, f_val) 對。
-2. **輸入激活陣列** — 以計算出的 `w = q + s` 索引的未壓縮陣列。
-3. **部分和（partial sum）陣列** — 以 `q` 索引；用 MAC 單元累積結果。
-
-一個座標產生器（Cgen，Coordinate Generator）從遍歷狀態計算 `w` 與 `q`。**Cambricon-X** 加速器（Zhang 等，Micro 2016）正是使用這個結構：每個權重旁儲存的後設資料（metadata）標識需要哪些輸入激活值，PE 以計算出的位址載入這些激活值，而非串流稠密的滑動視窗。
-
-> **為什麼重要：** 稀疏權重遍歷是跳過（skipping）的最簡單形式。若權重 50% 稀疏，內迴圈執行次數減半，過濾器讀取與輸出讀寫的時間和能耗均減半。關鍵硬體需求是快速的座標投影單元，以及能以計算座標隨機存取的未壓縮輸入緩衝區。
-
----
-
-## 第四章 — 利用稀疏輸入，以及兩者同時利用
-
-> *投影片：L09-97 … L09-128*
-
-### 稀疏輸入：滑動視窗問題
-
-當輸入激活值稀疏（ReLU 後許多零）但權重稠密時，對偶方法是把 `i` 壓縮為座標／承載值列表，並協調遍歷非零輸入。對於權重駐留資料流：
-
+```text
+for (s, f_val) in f:
+    for q in [0, Q):
+        w = q + s
+        o[q] += i[w] * f_val
 ```
+
+兩者都利用 weight sparsity。差異是 reuse：一個讓 output stationary，另一個讓 weight stationary。
+
+硬體 blocks：
+
+- compressed filter fiber 的 position generator。
+- 計算 \(w=q+s\) 的 coordinate generator。
+- random-access input buffer。
+- 以 \(q\) index 的 partial-sum buffer。
+
+Cambricon-X 在投影片中作為 weight-sparsity style accelerator：weights metadata 引導 activation access。
+
+### 9. 利用 sparse inputs
+
+若 inputs sparse，而 weights dense 或可 cheap random access，則 iterate nonzero inputs。Weight-stationary sparse inputs：
+
+```text
 for s in [0, S):
-    for (w, i_val) in i if s <= w < Q+s:  # 窗口式協調遍歷
-        q = w – s
+    for (w, i_val) in i if s <= w < Q+s:
+        q = w - s
         o[q] += i_val * f[s]
 ```
 
-`if s <= w < Q+s` 的約束是一個**稀疏滑動視窗（sparse sliding window）**：對每個權重位置 `s`，只有落在合法摺積視窗內的輸入座標 `w` 才對任何輸出有貢獻。隨著投影片動畫中 `q` 增大，活躍視窗滑過輸入纖維，撿取非零值並投影到對應的輸出座標。**CNVLUTIN** 加速器正是利用這個結構：壓縮零激活值，對每個非零輸入查詢對應的權重並累積到對應輸出。
+條件 \(s \le w < Q+s\) 是 sparse sliding window。每個 weight \(s\) 只與能產生合法 output coordinate \(q\) 的 input coordinates \(w\) 互動。
 
-輸出駐留搭配稀疏輸入：
-```
+Output-stationary sparse inputs：
+
+```text
 for q in [0, Q):
     for (w, i_val) in i if q <= w < q+S:
-        s = w – q
-        o[q] += i_val * f[s]   # 以計算出的 s 查詢權重
+        s = w - q
+        o[q] += i_val * f[s]
 ```
-每個輸出 `q` 迭代其視窗內的（稀疏）輸入，並以推導出的 `s = w - q` 查詢權重（建議使用未壓縮過濾器以保持 O(1) 查詢）。
 
-### 雙稀疏：投影後求交
+這只拜訪 active window 中的 nonzero inputs，然後 lookup 對應 weight。Sparse input traversal 可以便宜；weight lookup 也必須便宜，因此這個 view 中 weights 常保持 uncompressed。
 
-當**權重與輸入都**稀疏時，最大的工作量縮減需要只對 `i[w] ≠ 0` 且 `f[s] ≠ 0` 的 (w, s) 對進行迭代。輸出駐留的公式化表述如下：
+Cnvlutin 是投影片引用且由 local PDF 確認的 activation-sparsity design。核心想法是從 input stream 移除 zero-valued neurons，並以 offsets 編碼 nonzero neurons，讓 lanes 跳過 zeros 時仍能 index 正確 weights。
 
-```
-for q in [0,Q):
+### 10. 同時利用 sparse weights 與 sparse inputs
+
+當兩個 operands 都 sparse，projection alone 不夠。你必須先把一個 operand 的 coordinates 投影到另一個 coordinate space，再求交。
+
+Output-stationary two-sparse convolution 可寫成：
+
+```text
+for q in [0, Q):
     for (s, (f_val, i_val)) in f.project(+q) & i:
         o[q] += i_val * f_val
 ```
 
-這裡串聯使用了兩個原語：
+仔細讀：
 
-1. **座標投影（`f.project(+q)`）：** 把每個非零權重的座標偏移 `+q`，計算出各個 `s` 所需的 `w`。這在 `w` 座標空間中產生一條新的（虛擬）纖維。
-2. **纖維求交（`&`）：** 只保留同時出現在投影過濾器纖維與輸入激活值纖維中的座標。
+1. `f.project(+q)` 把每個 filter coordinate \(s\) 轉成 input coordinate \(w=s+q\)。
+2. `& i` 將 projected filter fiber 與 input fiber 求交。
+3. 只有兩個 operands 都存在的 coordinates 才產生 multiply。
 
-![纖維求交：只保留兩個纖維中共有的座標](../../assets/L09/L09-p127-fiber-intersection.png)
+例子：
 
-投影片展示：對座標集合 {2,4,7,8} 與 {1,2,5,8} 做求交，結果為 {2,8}——只有公共座標才執行乘加。對稠密核（一個纖維包含所有 8 個座標），求交退化為簡單查詢；對稀疏核加稀疏激活值，則達到密度乘積的工作量縮減。
-
-座標位元遮罩與未壓縮表示法讓求交特別快（按位元 AND），代價是要為所有座標（包括零值）儲存後設資料。座標／承載值列表則需要類似歸併排序的一遍掃描。
-
-輸出駐留雙稀疏排程的硬體，把投影後的過濾器纖維與輸入纖維同時送入一個共享的**求交單元（Intersection unit）**，該單元輸出匹配的 (s, f_val, i_val) 三元組給 MAC 單元。
-
-> **為什麼重要：** 纖維求交是實現**乘法式（multiplicative）**工作量縮減的關鍵原語——若權重密度為 `d_W`、輸入密度為 `d_I`，工作量正比於 `d_W × d_I`。沒有求交，最好也只能利用一個運算元的稀疏性，工作量正比於較稠密的那個。要實現完整的雙稀疏縮減，需要顯式的座標匹配硬體。
-
----
-
-## 第五章 — SCNN：笛卡兒積稀疏加速
-
-> *投影片：L09-112 … L09-124*
-
-### SCNN 的輸入駐留資料流
-
-**SCNN**（Sparse CNN，Parashar 等，ISCA 2017）採用**輸入駐留（input-stationary）**資料流，將內迴圈置於權重之上：
-
+```text
+filter nonzeros s:        0, 2, 5, 6
+for q = 2, projected w:   2, 4, 7, 8
+input nonzeros w:         1, 2, 5, 8
+intersection:             2, 8
 ```
+
+只有 projected coordinates 2 與 8 有 matching input activations。硬體輸出兩個 products，而不是四個。
+
+### 11. SCNN：Cartesian-product sparse convolution
+
+SCNN 使用 input-stationary Cartesian-product dataflow。簡化 1-D view：
+
+```text
 for (w, i_val) in i:
     for (s, f_val) in f if w-Q <= s < w:
-        q = w – s
+        q = w - s
         o[q] += i_val * f_val
 ```
 
-對每個非零輸入 `i[w]`，SCNN 迭代所有能與之互動的非零權重 `f[s]`（落在合法視窗內的那些）。這同時利用了輸入與權重的稀疏性——外迴圈跳過零輸入，內迴圈跳過零權重。
+SCNN 依 position 將 input activations 與 weights 分塊，並讓 nonzero groups 彼此相乘。若一個 tile 提供 \(I\) 個 nonzero activations 與 \(F\) 個 nonzero weights，PE 可形成最多 \(I \times F\) 個 products。
 
-### 全對全乘法與散射網路
+麻煩在 output routing。Product 的 output coordinate 由 \(q=w-s\) 算出，所以同一個 Cartesian product tile 產生的 products 會 scatter 到不同 output locations。SCNN 因此需要 scatter network 與 dense accumulation backend。
 
-為了最大化 PE 利用率，SCNN 對輸入纖維與權重纖維都按位置（position space）分塊，然後對每個分塊內的非零元素做**笛卡兒積（Cartesian product，全對全）**乘法：
+這是漂亮的 sparse-design tradeoff：
 
-![SCNN：非零輸入與非零權重的笛卡兒積](../../assets/L09/L09-p117-scnn-cartesian-product.png)
+- Compressed frontend 讓 zeros 不進 multipliers。
+- All-to-all multiplier array 暴露許多 useful products。
+- Scatter/accumulator backend 支付 irregular output coordinates 的代價。
 
-若一個分塊有 4 個非零輸入 {i₁, i₂, i₃, i₄} 和 4 個非零權重 {w₁, w₂, w₃, w₄}，PE 一次就產生 16 個部分積，使用 4×4 乘法器陣列。每個部分積的座標由 `q = w – s` 決定它屬於哪個輸出累加器；積再由**散射網路（scatter network）**路由到正確的輸出部分和緩衝區。
+### 12. ISOSceles 與 IS-OS pipeline
 
-SCNN PE 微架構反映了這一點：一個稠密打包的前端儲存壓縮後的權重與激活值（附帶後設資料），送入全對全乘法器陣列，散射網路再把積路由到輸出駐留後端的累加器組。
+投影片最後介紹 ISOSceles，一種 IS-OS dataflow。概念是透過 intermediate tensor \(T\) 拆開 convolution：
 
-SCNN 的量測結果顯示：在真實 CNN 稀疏性等級下，**延遲大致隨聯合密度（joint density，兩個密度的乘積）線性縮放**，且**每個非零乘法的能耗**相比稠密基準顯著下降——確認笛卡兒積加散射網路的方法能有效地把聯合稀疏性轉化為相應的節省。
+\[
+T[\cdot] = I[\cdot]F[\cdot],
+\qquad
+O[\cdot] = \text{reduce}(T[\cdot]).
+\]
 
-> **為什麼重要：** SCNN 展示了帶笛卡兒積乘法的輸入駐留資料流在硬體中實現完整雙稀疏工作量縮減的可行性。散射網路是這種普適性的硬體代價——部分積落在散亂的輸出位址，需要彈性的路由網路，而非簡單的原地累加結構。
+投影片的精確 notation 使用 \(h=p+r\)、\(q=w-s\) 等 substitutions。概念重點是：
 
----
+1. Input-stationary frontend 處理 sparse input wavefronts，產生 partial results 到 \(T\)。
+2. Output-stationary backend 讀 \(T\)，累加 final outputs。
+3. Intermediate \(T\) 以一種 rank order 寫入、以另一種 rank order 讀出，因此 ISOSceles 使用 rank swizzling 讓 backend traversal 變 concordant。
 
-## 第六章 — ISOSceles：IS-OS 流水線資料流
+這與 CSR vs. CSC 是同一課題，只是現在發生在 pipeline 內：如果 tensor 以一種順序產生、另一種順序消費，rank transformation 可能比重複 discordant lookups 更便宜。
 
-> *投影片：L09-129 … L09-138*
+本章中的 ISOSceles quantitative results 皆為 slide-derived，因為 Worker B input 未提供 local ISOSceles PDF。
 
-### IS-OS 兩步驟計算
+## Worked Examples
 
-**ISOSceles**（Yang 等，HPCA 2023）引入了一種 **IS-OS（Input-Stationary / Output-Stationary，輸入駐留 / 輸出駐留）流水線（pipelined）資料流**，設計目標是結合兩種資料流的優點，同時規避各自的缺點。關鍵觀察是，摺積的 Einsum：
+### 範例 1：CSR lookup vs. traversal
 
+使用：
+
+```text
+segment array:    [0, 2, 2, 4]
+coordinate array: [0, 2, 0, 1]
+value array:      [a, c, g, h]
 ```
-O[n,p,q,m] = I[n,h,w,c] × F[m,c,r,s]   (h=p+r, w=q+s)
-```
 
-可以引入一個中間張量 T，拆分為兩個步驟：
+Concordant row traversal：
 
-**步驟一（IS 前端）：**
-```
-T[h,w,r,s] = I[h,w,c] × F[m,c,r,s]
-```
-此步驟以輸入駐留的方式迭代非零輸入 `(h,w)`，與非零過濾器 `(c,r,s)` 求交，並累積到以 `(h, w-s, r)` 索引的 T。`w-s` 投影把每個（輸入，權重）對映射到 T 中正確的位置。
+- Row 0 使用 positions 0 到 1：\((0,a),(2,c)\)。
+- Row 1 使用 positions 2 到 1：empty。
+- Row 2 使用 positions 2 到 3：\((0,g),(1,h)\)。
 
-**步驟二（OS 後端）：**
-```
-O[p,q] = T[h,w,r,s]   (h=p+r, q=w-s)
-```
-此步驟以輸出駐留的方式讀取 T，把部分結果累積到最終輸出。
+這很便宜，因為每個 W fiber sequential read。若問「每個 row 的 column 1 是什麼？」在 CSR 中就不便宜，因為每個 row 的 compressed coordinate list 可能都要 search。
 
-難點在於：T 以 IS 順序寫入（以輸入座標 `h,w` 索引），但以 OS 順序讀取（以輸出座標 `p,q` 索引）。這是對 T 的**非協調遍歷**。ISOSceles 透過在兩個步驟之間對 T 的儲存佈局做**秩交換（rank swizzle，rank reordering）**來解決這個問題——把儲存的張量從 `(H,R,Q)` 重新索引為 `(Q,R,H)`——使 OS 後端可以協調遍歷 T。
+### 範例 2：Sparse-weight convolution
 
-### 流水線微架構
+令 \(f\) 有 nonzeros \((s=0,f_0=8)\) 與 \((s=2,f_2=6)\)，且 \(Q=3\)。Output-stationary sparse-weight traversal：
 
-![ISOSceles IS-OS 流水線：IS 前端 → 小型 T 緩衝區 → OS 後端](../../assets/L09/L09-p136-isosceles-pipeline.png)
+- \(q=0\)：使用 \(w=0\) 與 \(w=2\)。
+- \(q=1\)：使用 \(w=1\) 與 \(w=3\)。
+- \(q=2\)：使用 \(w=2\) 與 \(w=4\)。
 
-ISOSceles 流水線有三個階段：
+若 dense traversal 且 \(S=3\)，會有 9 個 filter positions。Sparse traversal 只有 6 個，因為三個 filter coordinates 中只有兩個存在。
 
-1. **IS 前端** — 處理一個輸入波前（input wavefront），計算當前批次非零輸入的所有部分積，並把結果寫入小型中間張量 T。
-2. **小型 T 緩衝區** — 持有兩個流水線階段之間秩交換後的中間結果。保持 T 足夠小是關鍵；ISOSceles 對計算進行分塊，使 T 能放入本地緩衝區。
-3. **OS 後端** — 協調遍歷 T，把結果累積到輸出波前（output wavefront）。
+### 範例 3：Projection plus intersection
 
-流水線在稀疏 CNN 基準測試上量測到**7.5 倍的延遲加速**，以及 **1.7 倍的能耗改善**。這些結果出現在最後一張投影片：
+令 \(q=1\)，filter nonzeros \(s=\{0,3,4\}\)，input nonzeros \(w=\{1,2,5\}\)。
 
-![ISOSceles 加速結果：7.5 倍延遲、1.7 倍能耗改善](../../assets/L09/L09-p138-isosceles-speedup.png)
+Filter 加上 \(+q\) 後投影為 \(w=\{1,4,5\}\)。與 input 求交得到 \(\{1,5\}\)。只有 \(s=0\) 與 \(s=4\) 產生 products。\(s=3\) 是真實 nonzero weight，但對此 output coordinate 它需要 \(w=4\)，而 input 在那裡是 zero。
 
-IS 前端利用輸入稀疏性（跳過零激活值）；OS 後端利用輸出稀疏性（跳過零部分和）；步驟一中的求交在兩個運算元都稀疏時進一步縮減工作量。秩交換的開銷是對 T 一次性的重新索引，相較於節省的總計算量而言微乎其微。
+## 關鍵方程式與讀法
 
-> **為什麼重要：** ISOSceles 展示了單一加速器可以透過精心設計的兩階段流水線同時利用輸入與權重稀疏性，實現比純 IS 或純 OS 更佳的 PE 利用率。秩交換是一個軟硬體協同設計（co-design）的技巧，把非協調存取模式轉換為協調存取——這是 TeAAL 金字塔中 Format 層與 Binding 層協同運作的具體範例。
+### 1-D convolution
 
----
+\[
+O[q] = \sum_s I[q+s]F[s].
+\]
+
+此式表示 output coordinate \(q\) 會累加 filter coordinate \(s\) 與 input coordinate \(w=q+s\) 的 products。
+
+### Projection equations
+
+\[
+w=q+s,\qquad q=w-s,\qquad s=w-q.
+\]
+
+這三個式子是同一個 convolution relation 解不同 coordinate。硬體中出現哪一個，取決於 dataflow。
+
+### 理想 two-sparse work
+
+\[
+N_\text{work}\approx d_I d_F N_\text{dense}.
+\]
+
+此近似假設 sparse positions 獨立。它解釋同時利用 input 與 weight sparsity 為何可呈乘法式收益。這是 teaching model，不是保證 workload statistic。
+
+## 硬體意涵（Hardware Implications）
+
+- **Fibertree hardware：** 每個 rank 可用 position generator 與 coordinate/payload extractor 實作。
+- **CSR/CSC：** rank order 決定哪種 traversal 便宜。若 consumer 需要不同順序，可能要 format conversion 或 rank swizzling。
+- **Sparse weights：** compressed filter traversal 便宜，但 input access 變成 projected random access。
+- **Sparse inputs：** input traversal 便宜，但 weight lookup 與 sliding-window restriction 變重要。
+- **Two-sparse：** intersection hardware 決定 accelerator 是否真的實現 product-of-densities work reduction。
+- **SCNN：** all-to-all multiplication 增加 useful work exposure，但 scatter routing 與 dense accumulators 消耗 area/energy。
+- **ISOSceles：** intermediate tensors 可結合 IS 與 OS 優點，但 rank swizzling 與 buffering 成為顯式成本。
+
+## 常見誤區（Common Misconceptions）
+
+### 誤區：Compressed tensor 一定遍歷更快。
+
+只有 concordant traversal 自然快。對 compressed metadata 做 random lookup 可能比 dense access 更慢。
+
+### 誤區：Coordinate 與 position 可以互換。
+
+只有 uncompressed ranks 中兩者相等。Compressed ranks 中，coordinate 是數學 index，position 是 storage offset。
+
+### 誤區：Projection 等於 intersection。
+
+Projection 改變 coordinate space。Intersection 移除兩個 operands 不共同存在的 coordinates。Two-sparse convolution 需要兩者。
+
+### 誤區：SCNN 的 Cartesian product 表示它做 dense multiplication。
+
+SCNN 是對 compressed nonzero groups 做 Cartesian products，不是對 dense tensors。它避開 zero operands，但仍要把 products scatter 到 irregular output coordinates。
+
+### 誤區：Rank swizzling 只是 software transpose。
+
+在 sparse hardware 中，rank swizzling 是設計選擇：用一次 reordering/buffering 換取後續重複 traversal 更便宜。
+
+## 與前後講次的連結（Connections）
+
+- **L04 Einsums：** convolution equations 是帶 index arithmetic 的 Einsums。
+- **L05-L06 mapping/dataflow：** stationarity 與 loop order 決定 tensor 是 streamed、looked up 還是 accumulated。
+- **L08 sparse architectures：** gating、skipping、metadata、format、intersection 是本講使用的詞彙。
+- **L10 sparse architectures part 3：** TeAAL 把這些選擇形式化為 mapped Einsum cascades、formats、bindings、architecture specifications。
+- **Lab 4/SparseLoop：** 只有 traversal 與 format 一起指定時，才可 modeling gating/skipping/sparse formats 的成本。
+
+## Paper Bridge: TeAAL
+
+### Bibliographic identity
+
+- **Title:** TeAAL: A Declarative Framework for Modeling Sparse Tensor Accelerators
+- **Authors:** N. Nayak et al.
+- **Year / venue:** MICRO 2023
+- **Local PDF:** `papers/TeAAL.pdf`
+
+### Problem addressed
+
+TeAAL 提供精確方法描述 sparse tensor accelerators；這些 accelerator 的行為取決於 mapped Einsums、fibertree formats、rank transformations 與真實 sparse inputs。
+
+### Core idea
+
+該 paper 使用 fibertrees 作為 tensor abstraction，mapped Einsums 作為 computation/mapping abstraction，並用 flattening、partitioning、swizzling 等 transformations 表達 sparse orchestration。
+
+### Relevance to this lecture
+
+Lecture 09 的 fibertree 詞彙、rank transformations、concordant traversal、IS-OS rank swizzling，正是 TeAAL 形式化的概念。
+
+### Key claims used in this chapter
+
+- TeAAL Section 2.1 定義 ranks、coordinates、points、fibers、payloads、fibertrees，並指出 sparse fibertrees 省略 empty payloads。
+- Section 2.2 說 Einsums 指定 computation，但不指定 iteration order。
+- Section 2.3 解釋 loop order、partitioning、work scheduling 等 mapping attributes，並把 sparse compression 連到 load imbalance 與 memory footprint variation。
+- Section 3.2 描述 rank flattening、partitioning、sorting/merging、rank swizzling 等 content-preserving transformations。
+
+### What students should remember
+
+1. Fibertrees 不只是圖，而是 sparse traversal 的 interface。
+2. Mapping 決定 `getNext()` 或 `getPayload()` 哪個會主導成本。
+3. Rank transformations 是讓 sparse traversal 可實作的架構工具。
+
+### Limitations and assumptions
+
+TeAAL 是 modeling accelerator 的框架；它本身不決定哪個 accelerator 最好。本章用它固定術語。
+
+## Paper Bridge: Cnvlutin
+
+### Bibliographic identity
+
+- **Title:** Cnvlutin: Ineffectual-Neuron-Free Deep Neural Network Computing
+- **Authors:** J. Albericio et al.
+- **Year / venue:** ISCA 2016
+- **Local PDF:** `papers/L18_Cnvlutin_Albericio_ISCA2016.pdf`
+
+### Problem addressed
+
+Cnvlutin 針對 convolutional layers 中的 zero-valued input neurons。Baseline wide-lane DNN accelerators 讓 neurons lockstep processing，所以 zero neuron 會浪費 multiplier slots 與 cycles。
+
+### Core idea
+
+Cnvlutin 用 Zero-Free Neuron Array format 儲存 nonzero input neurons 與 offsets。Offsets 讓每個 nonzero neuron 能找到正確 synapse/weight location，同時讓 lanes independently proceed，跳過 zero neurons 而不改變 DNN result。
+
+### Relevance to this lecture
+
+Cnvlutin 是 sparse-input traversal 的具體 paper bridge。它說明 skipping activation zeros 需要 format 與 dispatch mechanism，而不只是 if-statement。
+
+### Key claims used in this chapter
+
+- Abstract 把 zero-operand multiplications 定義為 intrinsically ineffectual，並提出 Cnvlutin 作為移除它們的 value-based acceleration。
+- Section III 描述 decoupling neuron lanes，以及使用 encoded input format 把 zero-valued neurons 從 critical path 移除。
+- Section IV-B 描述 Zero-Free Neuron Array format，包含以 bricks 分組的 nonzero value/offset pairs。
+- Section V 報告相對 paper baseline 的 speedup 與 energy improvements；本章不重用精確數值，只作 paper context。
+
+### What students should remember
+
+1. Activation sparsity 是 runtime data-dependent。
+2. Offsets 是 coordinate metadata，讓 compressed activations 仍能 address 正確 weights。
+3. Lane decoupling 是面對 irregular nonzero counts 的 utilization solution。
+
+### Limitations and assumptions
+
+Cnvlutin 聚焦 convolutional layers 的 activation sparsity，並基於 DaDianNao-like baseline。它不像 SCNN 一樣同時利用 pruned weight sparsity。
+
+## Paper Bridge: SCNN
+
+### Bibliographic identity
+
+- **Title:** SCNN: An Accelerator for Compressed-sparse Convolutional Neural Networks
+- **Authors:** A. Parashar et al.
+- **Year / venue:** ISCA 2017
+- **Local PDF:** `papers/L17_SCNN_Parashar_ISCA2017.pdf`
+
+### Problem addressed
+
+SCNN 針對 CNN inference 中 pruned weights 與 ReLU activations 的 combined sparsity，並嘗試讓 weights/activations 在 computation 中維持 compressed。
+
+### Core idea
+
+PT-IS-CP-sparse dataflow 是 planar-tiled、input-stationary、Cartesian-product based。它把 compressed nonzero weight/activation groups 送入 all-to-all multiplier array，由 metadata 計算 output coordinates，並把 products scatter 到 dense accumulators。
+
+### Relevance to this lecture
+
+SCNN 是 two-sparse convolution 的主要具體例子。它展示 projection 與 multiplication 可以高效，但 output accumulation 會變 irregular。
+
+### Key claims used in this chapter
+
+- Abstract 說 SCNN 利用 pruning 造成的 zero-valued weights 與 ReLU 造成的 zero-valued activations。
+- Section II 以 weight/activation densities 的乘積說明 multiplicative work reduction。
+- Section III 定義 PT-IS-CP-sparse dataflow 與其 input-stationary Cartesian-product structure。
+- Section IV 描述含 compressed buffers、\(F \times I\) multipliers、coordinate handling、scatter accumulation 的 PE architecture。
+- Section VIII 總結 SCNN 讓 weights/activations 保持 compressed，且只把 nonzero operands 送到 multipliers。
+
+### What students should remember
+
+1. SCNN 的 work reduction 來自兩個 operands 都 sparse。
+2. Cartesian-product multiplication 是用 nonzero groups 保持 multipliers 忙碌的方法。
+3. Sparse output routing 是這種自由度的代價。
+
+### Limitations and assumptions
+
+該設計專門針對 CNN-style convolution，依賴 paper 的 compressed block organization 與 accumulator banking。若沒有檢查 workload/baseline，不應泛化其量化結果。
+
+## Paper Bridge: Eyeriss v2
+
+### Bibliographic identity
+
+- **Title:** Eyeriss v2: A Flexible Accelerator for Emerging Deep Neural Networks on Mobile Devices
+- **Authors:** Y.-H. Chen et al.
+- **Year / venue:** JETCAS 2019
+- **Local PDF:** `papers/L17_EyerissV2_Chen_JETCAS2019.pdf`
+
+### Problem addressed
+
+Eyeriss v2 處理 compact and sparse DNNs；這些模型的 shapes 會讓 dense reuse 與 PE utilization 變困難。
+
+### Core idea
+
+它使用 hierarchical mesh NoC 與 sparse PE architecture。在 sparse PE mode 中，activations/weights 使用類 CSC compressed streams，count/address metadata 允許硬體在 compressed domain 跳過 zeros。
+
+### Relevance to this lecture
+
+Eyeriss v2 是 Lecture 08 到 Lecture 09 轉折的具體實作：original Eyeriss gated zero activations；Eyeriss v2 使用 compressed formats 與 skipping 來提升 throughput。
+
+### Key claims used in this chapter
+
+- Section IV 明確區分 original Eyeriss gating 與 Eyeriss v2 會 skipping zeros 以改善 throughput 的 sparse processing。
+- Section IV 描述 CSC compressed data、count/address metadata 與 sparse PE pipeline support。
+- Section V 報告 implementation results，並討論 workload imbalance，以及 sparse compression 不一定創造 skippable cycles 的情況。
+
+### What students should remember
+
+1. Sparse support 改變 PE pipeline，不只是 memory format。
+2. Flexible NoC 很重要，因為 sparse/compact models 對 bandwidth/reuse 的壓力不同。
+3. Workload imbalance 仍是限制因素。
+
+### Limitations and assumptions
+
+Paper 報告的 improvements 依賴 implementation、workloads、baselines。本章用 Eyeriss v2 說明 architectural mechanisms，不把數字當 universal constants。
 
 ## 獨立學習指南（Standalone Study Guide）
 
-### 進入下一講前必須掌握
+建議分五輪讀：
 
-- 用 fibertree abstraction 統一描述 dense 與 sparse tensors。
-- 說明 `getPayload()` 與 `getNext()` 的差異，以及為什麼 concordant traversal 便宜。
-- 區分 coordinate projection 與 fiber intersection。
-- 追蹤 sparse-weight、sparse-input 與 two-sparse convolution loop nests。
-- 依「利用哪種稀疏性」與「新增什麼硬體」比較 Cambricon-X、CNVLUTIN、SCNN、ISOSceles。
+1. 為一個小 sparse matrix 畫 fibertree。
+2. 對每個 stored value 標出 coordinate 與 position。
+3. 對每個 representation 問：`getPayload` 還是 `getNext` 便宜？
+4. 把 \(O[q]=\sum_s I[q+s]F[s]\) 重寫成 output-stationary、weight-stationary、input-stationary 形式。
+5. 把 SCNN 與 ISOSceles 解釋為「sparse products 在哪裡 accumulation？」的兩種答案。
 
-### 自我檢核問題
+## 自我檢核問題
 
-1. 為什麼 CSR 讓 row-major traversal 便宜，卻讓 column-major traversal 昂貴？
-2. 兩個運算元都稀疏時，為什麼只有 projection 不夠？
-3. ISOSceles 中 rank swizzling 解決了什麼問題？
+1. 為何 CSR 讓 row traversal 便宜，但 column traversal 昂貴？
+2. Compressed fiber 中 coordinate 與 position 有何差異？
+3. 為何 coordinate/payload list 的 `getNext()` 便宜，但 `getPayload()` 可能昂貴？
+4. Sparse-weight convolution 中，為何 input 常應保持 uncompressed？
+5. Sparse-input convolution 中，sliding-window condition 做什麼？
+6. Two-sparse convolution 為何需要 projection 和 intersection？
+7. SCNN 為何需要 scatter network？
+8. IS-OS pipeline 中 rank swizzling 解決什麼問題？
 
-### 練習
+## 練習
 
-1. 為一個 3x3、只有三個非零值的矩陣畫出 fibertree，並標出 coordinates、positions、fibers、payloads。
-2. 對 output-stationary sparse-weight convolution，為數個 `(q,s)` pair 計算 projected input coordinate `w`。
-3. 給定兩條排序過的 sparse fibers，手動執行 intersection，列出輸出的 matched payloads。
-
-### 常見誤區
-
-- 混淆 coordinate 與 position。Coordinate 是數學索引；position 是資料在儲存結構中的位置。
-- 假設 compressed storage 代表 cheap random access。許多壓縮格式只有 concordant traversal 便宜。
-- 因為 SCNN 與 ISOSceles 都利用 two-sparse work，就把兩者當成等價；它們的 output routing strategy 不同。
-
----
+1. **Fibertree：** 為 \(4 \times 4\) matrix 中 nonzeros \((0,1)\)、\((2,0)\)、\((2,3)\) 畫 fibertree 與 CSR arrays。
+2. **Traversal：** 同一 matrix 若用 CSR，列出 row traversal 與 column traversal 需要的 operations。
+3. **Projection：** 令 \(Q=4\)、\(S=3\)、filter nonzeros \(s=\{0,2\}\)。列出每個 \(q\) 的 projected \(w=q+s\)。
+4. **Intersection：** 對 \(q=2\)、filter nonzeros \(s=\{0,1,4\}\)、input nonzeros \(w=\{2,3,5,7\}\)，計算 projection plus intersection。
+5. **Design tradeoff：** 比較 Cnvlutin 與 SCNN。各自利用哪種 sparsity？各需什麼額外硬體？
+6. **Paper reading：** 在 SCNN Section III 中找出為何 input stationarity 有吸引力，以及 accumulation 為何變難。
 
 ## 關鍵詞彙（Key Terms）
 
-| 詞彙 | 說明 |
+| Term | Definition |
 |---|---|
-| **纖維樹（Fibertree）** | 張量的樹狀抽象：每層對應一個秩，每個節點持有（座標，承載值）對，每個子節點列表是一個纖維。 |
-| **纖維（Fiber）** | 纖維樹一層中某節點的有序（座標，承載值）元組列表。 |
-| **座標（Coordinate）** | 在一個秩中識別元素的索引（等同於數學意義上的下標）。 |
-| **位置（Position）** | 記憶體中的實體儲存位置（偏移量）；僅對未壓縮秩才與座標相等。 |
-| **承載值（Payload）** | 纖維節點中儲存的資料：非葉層節點是指向下一層纖維的引用，葉層節點是數值。 |
-| **`getPayload(c)`** | 對纖維中座標 `c` 的承載值進行隨機存取查詢。 |
-| **`getNext()`** | 依遍歷順序前進到纖維中下一個（座標，承載值）對的迭代器（協調遍歷）。 |
-| **未壓縮（U，Uncompressed）** | 每個座標都儲存、且位置＝座標的纖維表示法；`getPayload` 與 `getNext` 均為 O(1)。 |
-| **座標／承載值列表（C，Coordinate/Payload List）** | 只儲存非零（座標，值）對的壓縮纖維；`getPayload` 為 O(log n)，協調 `getNext` 為 O(1)。 |
-| **CSR（Compressed Sparse Row，壓縮稀疏行）** | `Tensor<U,C>(H,W)` — H 秩未壓縮，W 秩壓縮。 |
-| **CSC（Compressed Sparse Column，壓縮稀疏列）** | `Tensor<U,C>(W,H)` — 秩順序與 CSR 對調。 |
-| **COO（Coordinate List，座標列表）** | `Tensor<C2>(H,W)` — 兩個秩合併為一個平坦的 (H,W) 座標元組列表。 |
-| **協調遍歷（Concordant traversal）** | 按儲存順序迭代纖維（在座標／承載值列表上每步 O(1)，代價低）。 |
-| **非協調遍歷（Discordant traversal）** | 不按儲存順序存取纖維，例如查詢任意座標（在 C 列表上為 O(log n)，代價高）。 |
-| **座標投影（Coordinate projection）** | 透過算術從一個運算元的座標推導另一個所需的座標（如 `w = q + s`）。 |
-| **纖維求交（Fiber intersection）** | 只保留同時出現在兩個纖維中的座標位置；實現雙稀疏工作量縮減的硬體原語。 |
-| **按位置空間分裂纖維（Fiber split, position space）** | 按位置（非零數）把纖維等分為大小相等的塊，以供並行處理。 |
-| **閘控（Gating）** | 當運算元為零時抑制讀取與計算；省能耗，不省時間。 |
-| **跳過（Skipping）** | 重構迴圈只對非零座標迭代；同時省時間與能耗。 |
-| **Cambricon-X** | 稀疏加速器（Zhang 等，Micro 2016），透過後設資料引導的輸入載入利用權重稀疏性。 |
-| **SCNN** | 稀疏 CNN 加速器（Parashar 等，ISCA 2017），使用輸入駐留笛卡兒積乘法加散射網路實現雙稀疏縮減。 |
-| **ISOSceles** | IS-OS 流水線加速器（Yang 等，HPCA 2023），結合 IS 前端與 OS 後端及秩交換後的中間張量 T；延遲加速 7.5 倍。 |
-| **秩交換（Rank swizzle）** | 重新排列（轉置）張量的秩順序，以把非協調遍歷轉換為協調遍歷。 |
-
----
+| **Rank（秩）** | Tensor dimension，在 fibertree 中是一層。 |
+| **Coordinate（座標）** | 某 rank 內的數學 index。 |
+| **Point（點）** | 標示 tensor element 的 coordinate tuple。 |
+| **Position（位置）** | Storage array 中的 physical offset；只在 uncompressed ranks 中等於 coordinate。 |
+| **Payload（承載值）** | Scalar value 或指向 lower-rank fiber 的 pointer/reference。 |
+| **Fiber（纖維）** | 某 rank 上的有序 coordinate/payload pairs。 |
+| **Fibertree（纖維樹）** | Tensor 的 tree representation，levels 是 ranks，fibers 連接 levels。 |
+| **`getPayload(c)`** | 查詢 coordinate \(c\) 的 payload。 |
+| **`getNext()`** | 依 traversal order 回傳下一個 coordinate/payload pair 的 iterator。 |
+| **CSR** | Compressed Sparse Row；`Tensor<U,C>(H,W)`，適合 row-major traversal。 |
+| **CSC** | Compressed Sparse Column；`Tensor<U,C>(W,H)`，適合 column-major traversal。 |
+| **COO** | Coordinate list format，儲存 merged coordinate tuples。 |
+| **Concordant traversal** | Traversal order 與 storage/rank order 對齊，因此 sequential reads 便宜。 |
+| **Discordant traversal** | Traversal order 與 storage/rank order 衝突，常需 random lookup。 |
+| **Projection（投影）** | 在 tensor coordinate spaces 之間做 arithmetic mapping，例如 \(w=q+s\)。 |
+| **Intersection（求交）** | 只輸出兩個 sparse operands 都存在的 coordinates。 |
+| **Position-space split** | 依 stored nonzero count 切 fiber 以平衡工作。 |
+| **Coordinate-space split** | 依 coordinate ranges 切 fiber 以保留幾何意義。 |
+| **Rank swizzle** | 重排 tensor ranks，讓後續 traversal 變 concordant。 |
+| **Cnvlutin** | 使用 zero-free neuron encoding 與 lane decoupling 的 activation-sparsity accelerator。 |
+| **SCNN** | 使用 input-stationary Cartesian-product sparse multiplication 的 sparse CNN accelerator。 |
+| **ISOSceles** | 投影片引用的 IS-OS sparse convolution dataflow，使用 intermediate tensor 與 rank swizzling。 |
 
 ## 重點回顧（Takeaways）
 
-- **纖維樹統一了所有張量表示法：** 具有未壓縮、座標／承載值、遊程長度、雜湊或合併（CSR/CSC/COO）秩實作的纖維樹，全都實作相同的 `getPayload`/`getNext` 介面；硬體可以針對抽象設計，再針對具體表示法特化。
-- **協調遍歷便宜；非協調遍歷不便宜。** 稀疏迴圈巢的設計，必須確保被協調迭代的運算元是壓縮的，而被查詢的運算元要麼未壓縮（O(1) 隨機存取），要麼足夠小。
-- **座標投影**是摺積中跨運算元索引空間映射的算術（如 `w = q+s`）；代價低，但必須由硬體顯式計算。
-- **纖維求交**實現了乘法式（密度乘積）的工作量縮減；它是區分「只利用一個稀疏運算元」與「兩者都利用」的關鍵原語，需要顯式的座標匹配硬體。
-- **三個真實加速器**代表設計空間中的三個點：Cambricon-X（只利用權重稀疏性，權重駐留）、SCNN（兩者都稀疏，輸入駐留加笛卡兒積）、ISOSceles（兩者都稀疏，IS-OS 流水線加秩交換，最佳 PE 利用率）。
-- **資料佈局（Format）與迴圈順序（Mapping）在稀疏加速器中緊密耦合：** 改變哪個秩被壓縮或哪個迴圈在外面，可能把協調遍歷翻轉為非協調遍歷，使每步的 O(1) 操作變成 O(log n)。這正是 TeAAL 金字塔的 Format 層與 Mapping 層在實際中共同運作的體現。
+- Fibertrees 提供 dense/sparse tensor layouts 的共同語言。
+- 只要 rank 被壓縮，就必須分清 coordinate 與 position。
+- Sparse formats 依賴 traversal：concordant `getNext()` 可便宜，discordant `getPayload()` 可能昂貴。
+- Convolution sparsity 需要 coordinate projection；two-sparse convolution 還需要 intersection。
+- Cnvlutin、SCNN、Eyeriss v2、ISOSceles 分別代表不同設計點：activation skipping、two-sparse Cartesian products、compressed-domain sparse PE、IS-OS pipelining。
+- Sparse dataflow design 是 reuse、skipping、output routing 三者之間的協商。
 
----
+## 連結（Connections）
 
-## 與其他講次的連結（Connections）
-
-- **L08（稀疏架構 1）：** 引入了稀疏性的動機與基本的閘控/格式概念；本講（L09）把那些基礎延伸到完整的纖維樹抽象與跳過的迴圈巢設計。
-- **L10（稀疏架構 3）：** 繼續稀疏加速器的探討，涉及更多設計以及用於正式規範稀疏張量代數硬體的 TeAAL 框架，終結三講的弧線。
-- **Einsum 記法（L04 / L07）：** 本講中使用的 `Z[m,n] = A[m,k] × B[k,n]` 與摺積 Einsum 記法在更早的課程中引入；本講以求交（`&`）與投影（`.project()`）算子對其進行稀疏運算元的擴展。
-- **纖維表示法與 Format 層：** 本講引入的 CSR/CSC/COO/bitmask 格式，是 L01 首次出現的 TeAAL 關注點金字塔（Pyramid of Concerns）中 **Format 層**的具體實例。
-
----
+- **L08：** 介紹 SAFs 與 metadata tradeoffs；L09 說明 metadata 如何被 traversal。
+- **L10：** 進一步走向 formal sparse accelerator specification 與 TeAAL-style modeling。
+- **Mapping lectures：** stationarity 決定 tensor 是 streamed、looked up、還是 accumulated。
+- **Einsum lectures：** projection 與 reduction 直接來自 convolution index expressions。
+- **Paper bridges：** TeAAL 提供 abstraction，Cnvlutin 展示 activation skipping，SCNN 展示 two-sparse Cartesian products，Eyeriss v2 展示 compressed-domain sparse PE design。
 
 ## 附錄 — 投影片對照表（Slide-to-Section Map）
 
-| 投影片 | 章節 |
-|---|---|
-| L09-1 | 標題 |
-| L09-2 … L09-5 | 第一章 — 動機：無所不在的稀疏張量；三個稀疏性槓桿 |
-| L09-6 … L09-17 | 第一章 — 纖維樹抽象：秩、座標、承載值、纖維 |
-| L09-18 … L09-35 | 第二章 — 纖維表示法選擇；CSR/CSC/COO 記法 |
-| L09-36 … L09-51 | 第二章 — 遍歷效率：協調 vs. 非協調；硬體資料路徑 |
-| L09-52 … L09-71 | 第二章 — 合併/分裂秩；稀疏性規格（通道、子核、2:4、HSS）；Einsum 回顧 |
-| L09-72 … L09-96 | 第三章 — CONV 中的稀疏權重：輸出駐留與權重駐留迴圈巢；Cambricon-X |
-| L09-97 … L09-111 | 第四章 — 稀疏輸入：滑動視窗遍歷；CNVLUTIN |
-| L09-112 … L09-128 | 第四章 — 雙稀疏：投影加求交；輸出駐留硬體 |
-| L09-112 … L09-124 | 第五章 — SCNN：笛卡兒積、散射網路、延遲/能耗 vs. 密度 |
-| L09-129 … L09-138 | 第六章 — ISOSceles：IS-OS 兩步驟資料流、秩交換、7.5 倍加速 |
+| Slide range | Chapter section | Notes |
+|---|---|---|
+| L09-1 to L09-5 | Motivation and SAF recap | 擴成 TL;DR、problem、why it matters |
+| L09-6 to L09-18 | Tensor terminology and fibertree | 補 coordinate/position explanation |
+| L09-19 to L09-35 | Fiber representations, CSR/CSC | 重寫為 representation/storage examples |
+| L09-36 to L09-51 | Traversal efficiency | 擴充 `getPayload`/`getNext` cost model |
+| L09-52 to L09-60 | Merge, split, sparsity specs, HSS | 整合進 rank transformations |
+| L09-61 to L09-71 | Einsum review and convolution projection | 重寫為 coordinate projection |
+| L09-72 to L09-96 | Sparse weights in convolution | 補 loop nests 與 hardware blocks |
+| L09-97 to L09-111 | Sparse inputs and Cnvlutin | 補 sparse sliding window |
+| L09-112 to L09-128 | Sparse inputs and weights, SCNN, intersection | 補 projection-plus-intersection example |
+| L09-129 to L09-138 | ISOSceles IS-OS dataflow | slide-derived；Worker B input 無 local ISOSceles PDF |
+
+## Source Notes
+
+- Fibertree terminology 與 traversal ordering 依 Lecture 09 slides 6-51 以及 TeAAL Sections 2.1-2.3。
+- Rank merge/split/swizzle discussion 依 Lecture 09 slides 51-60 與 TeAAL Section 3.2。
+- Convolution projection 與 loop nests 依 Lecture 09 slides 72-128。
+- Cnvlutin discussion 使用 `papers/L18_Cnvlutin_Albericio_ISCA2016.pdf`，尤其 Sections III、IV-B、V。
+- SCNN discussion 使用 `papers/L17_SCNN_Parashar_ISCA2017.pdf`，尤其 Sections II-IV 與 VIII。
+- Eyeriss v2 discussion 使用 `papers/L17_EyerissV2_Chen_JETCAS2019.pdf`，尤其 Sections IV-V。
+- Cambricon-X 與 ISOSceles 僅依 Lecture 09 slide anchors 討論；Worker B input 未包含 local PDFs。
+- `papers/L08_FastAlgorithmsWinograd_Lavin_2015.pdf` 有檢視，但未實質使用，因為 Winograd convolution 不是 Lecture 09 sparse traversal 主線。
+
+## Uncertainty Notes
+
+- 本章根據 slides 與 papers 重建可能講解；live lecture 可能重點不同。
+- ISOSceles quantitative claims 只來自投影片。
+- 既有 `assets/L09/` images 可能有 copyright sensitivity，但 asset cleanup 不在 Worker B write scope。

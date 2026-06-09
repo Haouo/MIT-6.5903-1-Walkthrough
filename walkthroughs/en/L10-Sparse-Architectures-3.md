@@ -1,391 +1,479 @@
 # L10 — Sparse Architectures 3
 
 > **Course:** 6.5930/1 — Hardware Architectures for Deep Learning
-> **Instructors:** Joel Emer & Vivienne Sze (MIT EECS)
+> **Instructors:** Joel Emer & Vivienne Sze
 > **Lecture date:** March 9, 2026 · **Slides:** 66 · **Source:** [`Lecture/L10-Sparse_Architectures-3.pdf`](../../Lecture/L10-Sparse_Architectures-3.pdf)
 >
-> *This is a conceptual walkthrough that reconstructs the lecture's narrative from the slides. It is organized by idea, not slide-by-slide. Each section cites the slide range it draws from so you can follow along with the original deck.*
+> This chapter reconstructs the missing teaching layer from the slides. It does not reproduce slide or paper figures; diagrams are described textually for copyright safety.
 >
-> **Traceability note:** The PDF's internal slide labels are `L06-*` even though this repository treats the deck as Lecture 10. References below keep the PDF labels for exact source matching; file and asset names use `L10-*`.
+> **Traceability note:** the PDF internally labels these slides as `L06-*`. This repository treats the deck as Lecture 10, so source anchors below use both names: Lecture 10, slide label `L06-n`.
 
 ---
 
 ## TL;DR
 
-The third and final installment of the sparse-architectures series asks: **how do real accelerators exploit both sparse weights and sparse activations simultaneously?** The lecture begins with a crisp review of the two simpler cases — gating (energy savings only), and skipping sparse weights or sparse inputs separately — and then builds up to the hard joint case. Two landmark architectures anchor the analysis: **SCNN** (Sparse CNN, ISCA 2017), which uses a Cartesian-product multiplier array with a scatter network to handle input-stationary sparse-times-sparse multiplication; and **ISOSceles** (HPCA 2023), which splits the computation into a two-pass **IS→OS dataflow** pipeline that achieves up to **7.5× speedup** over a dense baseline by exploiting joint sparsity through fiber intersection and swizzled tensor traversal. The lecture ties together all the representation, intersection, projection, and skipping machinery from L08–L09 and shows how it is instantiated in concrete silicon.
+Sparse acceleration becomes genuinely hard when **both** weights and activations are compressed. If only one operand is sparse, a hardware designer can traverse the sparse operand and directly index the dense operand. If both operands are sparse, the accelerator must also solve a coordinate problem: which nonzero weight and nonzero activation pairs actually meet at the same output coordinate?
+
+Lecture 10 moves from the easy cases to the joint case. It begins with **gating** versus **skipping**, revisits sparse-weight-only and sparse-activation-only convolution, then studies two approaches to joint sparsity. **SCNN** uses an input-stationary Cartesian product of nonzero activations and nonzero weights, then scatters products to output accumulators. **ISOSceles** uses a two-stage **IS-OS dataflow**: an input-stationary pass creates a small intermediate tensor, then an output-stationary pass consumes it after rank swizzling. The central lesson is that sparsity is not only a format decision. It couples representation, loop order, coordinate generation, routing, buffer sizing, and load balance.
+
+---
+
+## What Problem This Lecture Solves
+
+Previous sparse lectures established that zeros can reduce arithmetic and memory traffic. The remaining question is architectural:
+
+> If weights and activations are both sparse, how can a real accelerator skip useless multiplies without drowning in metadata, random access, scatter traffic, and load imbalance?
+
+The naive answer is "compress both tensors and loop over their nonzeros." That is incomplete. A convolution product is legal only when the weight coordinate and activation coordinate imply a valid output coordinate. In dense code, the nested loops enforce legality for free. In sparse code, legality must be reconstructed from metadata.
+
+This lecture therefore solves a mapping problem, not merely a storage problem. It asks which dataflow makes the coordinate problem cheap enough to implement.
+
+---
+
+## Why This Lecture Matters
+
+Sparsity looks mathematically attractive because a zero product contributes nothing: $0 \times x = 0$. Hardware does not get that benefit automatically. A zero can save:
+
+- **Energy only**, if the machine gates the multiplier but still occupies a cycle.
+- **Energy and time**, if the machine removes the operation from the schedule.
+- **Nothing**, if metadata and routing overhead exceed the saved work.
+
+For a hardware architect, the useful question is not "is the tensor sparse?" but "where does the sparsity appear, is the coordinate stream regular enough to exploit, and what hardware must be added to keep the nonzero work flowing?"
+
+---
+
+## Prerequisites and Mental Model
+
+You should remember three ideas from L07-L09:
+
+- A **fiber** is a one-dimensional slice of a tensor, often represented as coordinate-payload pairs such as `(coord, value)`.
+- A **concordant traversal** visits compressed coordinates in their stored order; a **discordant traversal** asks for data in an order that the format does not naturally provide.
+- A **dataflow** chooses which tensor stays near the PE and which tensor streams through memory and interconnect.
+
+The mental model for this lecture is a small 1-D convolution:
+
+$$
+o[q] = \sum_s i[q+s] \cdot f[s].
+$$
+
+If `f` is sparse and `i` is dense, a nonzero weight coordinate `s` directly tells the hardware which input location `q+s` to read. If `i` is sparse and `f` is dense, a nonzero input coordinate `w` directly tells the hardware which filter location `w-q` to read. If both are sparse, neither direct lookup is free: the machine must discover coordinate matches or produce products and scatter them to their output coordinates.
 
 ---
 
 ## Learning Objectives
 
-After this lecture you should be able to:
+After this lecture, you should be able to:
 
-- Explain the difference between **gating** (saves energy, not time) and **skipping** (saves both energy and time) for zero-valued operands.
-- Trace through the loop-nest transformations that produce **output-stationary, weight-stationary, and input-stationary** dataflows for sparse convolution, and identify which sparsity each exploits.
-- Describe how **Cambricon-X** handles sparse-weight convolution via a compressed weight stream and indirect input-activation lookup.
-- Explain how **Cnvlutin** achieves speedup by skipping zero input activations and why it uses a per-channel encoder + reindexed weight lookup.
-- Describe the **SCNN** Cartesian-product architecture: why all-to-all multiplication works, what the scatter network does, and how **flattening** maps a 2-D convolution into a 1-D inner product.
-- Explain how SCNN's **latency and energy** scale with joint activation and weight sparsity.
-- Describe the **IS-OS two-pass dataflow** used by ISOSceles, including the role of tensor **swizzling** to convert a discordant traversal into a concordant one.
-- Read the ISOSceles speedup chart and explain why the **IS-frontend / OS-backend pipeline** produces multiplicative gains from joint sparsity.
-
----
-
-## Chapter 1 — Recap: Gating vs. Skipping and the 1-D Convolution Template
-
-> *Slides: L06-1 … L06-9*
-
-![L10 Title — Sparse Architectures Part 3](../../assets/L10/L10-p01-title.png)
-
-### The two levers on zero-valued operands
-
-Every sparse accelerator must decide what to do when an input activation or weight is zero. There are two options:
-
-- **Gating:** execute the multiply-accumulate (MAC) cycle anyway, but shut off the power to the multiplier and the memory reads through clock- or data-gating. This saves **energy but not time** — the cycle slot is wasted.
-- **Skipping:** actually remove the zero-valued operation from the schedule, so the hardware never issues that cycle. This saves **both energy and time**.
-
-The distinction matters because skipping is harder to implement: it requires knowing *ahead of time* (or very quickly) which operands are zero, compressing the data stream, and being able to merge results that arrive at unpredictable positions.
-
-### 1-D output-stationary convolution as the running example
-
-The lecture uses a simple 1-D convolution `o[q] += i[w] * f[s]` with `w = q + s` as the pedagogical template. This output-stationary loop nest is the starting point from which all four cases — sparse weights only, sparse inputs only, both sparse — are derived by changing the loop order and which tensor is compressed.
-
-**Eyeriss – Gating (slide L06-7):**
-Eyeriss (Chen et al., ISSCC 2016) gates the 2-stage pipelined multiplier and both memory read ports whenever the input activation is zero, saving ~**45% of PE power** while keeping throughput unchanged.
-
-![Eyeriss gating circuit — multiplier enable and zero buffer](../../assets/L10/L10-p07-eyeriss-gating.png)
-
-> **Why it matters:** Gating is the simplest form of sparsity exploitation and requires no change to the loop structure or data format. Its limitation — saving energy but not time — motivates the more complex skipping designs studied in the rest of this lecture.
+- Distinguish **gating** from **skipping**, and explain why only skipping reduces latency.
+- Rewrite a 1-D convolution loop for sparse weights, sparse inputs, and joint sparsity.
+- Explain why sparse-weight-only and sparse-input-only accelerators are easier than joint-sparse accelerators.
+- Describe how **Cambricon-X** and **Cnvlutin** fit the single-sparsity cases shown in the slides.
+- Explain SCNN's **input-stationary Cartesian-product** dataflow and why it needs a scatter accumulator.
+- Explain why SCNN's useful work scales with the product of activation density and weight density, while its hardware overhead does not disappear.
+- Explain ISOSceles's **IS-OS** split, why an intermediate tensor appears, and why **swizzling** changes a discordant traversal into a concordant one.
+- Evaluate sparse-accelerator claims by asking what is counted: arithmetic, memory traffic, metadata, routing, utilization, or end-to-end speedup.
 
 ---
 
-## Chapter 2 — Exploiting Sparse Weights Only
+## Main Textbook-Style Narrative
 
-> *Slides: L06-8 … L06-25*
+### 1. Gating Is Not Skipping
 
-### Output-stationary with sparse weights
+Lecture 10 starts by reminding the reader that a zero operand offers two different opportunities. **Gating** detects a zero and disables parts of the datapath, such as a multiplier or memory read port. The cycle still occurs, so latency does not improve. **Skipping** removes the operation from the dynamic schedule; the machine executes fewer useful cycles.
 
-When weights are sparse and stored in compressed form (coordinate + payload list), the outer loop walks over non-zero filter entries `(s, f_val)` via **concordant traversal**, directly giving their coordinate `s`. For each non-zero weight, the inner output loop computes `w = q + s` and looks up the (dense, uncompressed) input at position `w`. This is the **output-stationary sparse-weight** dataflow:
+Lecture 10 slide `L06-7` gives Eyeriss as the gating example and reports a 45% PE power reduction when input activations are zero. This is a slide-derived quantitative claim. The teaching interpretation is that gating is an excellent low-risk first step: it preserves the dense schedule and avoids complicated metadata-driven load balancing. Its limitation is equally important: if half the activations are zero, the accelerator does not automatically finish in half the time.
 
-```
+### 2. Sparse Weights Only: Traverse Weights, Index Inputs
+
+For sparse weights, the compressed filter stores only nonzero `(s, f_val)` pairs. A simple output-stationary loop is:
+
+```text
 for q in [0, Q):
-  for (s, f_val) in f:          # concordant traversal of sparse filter
+  for (s, f_val) in f:
     w = q + s
     o[q] += i[w] * f_val
 ```
 
-Because the filter fiber is traversed concordantly, the number of multiply-accumulates is exactly proportional to the number of non-zero weights — a direct, linear speedup.
+The sparse tensor is traversed concordantly. The dense input tensor is still directly indexed. The important hardware implication is that the coordinate generator must compute `w = q + s`, but it does not need to search for a matching input coordinate. This is why sparse-weight-only designs can be relatively clean.
 
-### Weight-stationary with sparse weights
+The weight-stationary variant swaps the first two loops:
 
-Swapping the loop order to `for (s, f_val) in f: for q in [0, Q):` gives the **weight-stationary** variant. The weight `f[s]` is loaded once and reused across all outputs — the hallmark of weight-stationary dataflow. Skipping is still over non-zero weights via concordant traversal.
-
-### Parallelism: fiber splitting in position space
-
-To compute multiple outputs in parallel, the filter fiber is split into **equal-sized chunks in position space** (`f.splitEqual(K)`), and each PE group works on one chunk. This exposes a `spatial-for` loop over the weight chunks. A key subtlety: splitting *by position* (not by coordinate) ensures each PE gets the same number of weight slots regardless of sparsity, enabling simple synchronization.
-
-### Cambricon-X — an industrial implementation
-
-**Cambricon-X** (Zhang et al., MICRO 2016) is a weight-stationary sparse accelerator. Compressed weights (metadata + values) are streamed in, and each PE looks up the corresponding input activation by using the weight's coordinate as an index into a shared input activation buffer.
-
-![Cambricon-X activation access — weight metadata drives indirect input lookup](../../assets/L10/L10-p23-cambricon-x.png)
-
-The coordinate of each non-zero weight directly addresses the input, making the lookup a simple indexed read. This is efficient when input activations are dense (or nearly so), but does not exploit input sparsity.
-
-> **Why it matters:** The sparse-weight-only case admits a clean implementation: compress weights, traverse them concordantly, and look up dense inputs by coordinate. Cambricon-X shows this can be done at scale with modest hardware overhead. Its limitation is that it leaves the sparsity of activations unexploited.
-
----
-
-## Chapter 3 — Exploiting Sparse Inputs Only
-
-> *Slides: L06-26 … L06-38*
-
-### Weight-stationary with sparse inputs
-
-When inputs are sparse (coordinates + payloads) and weights are dense, the weight `f[s]` is held stationary and the input fiber `i` is traversed. The loop restricts input coordinates to those falling within the active window for the current weight:
-
-```
-for s in [0, S):
-  for (w, i_val) in i if s <= w < Q + s:   # windowed traversal
-    q = w - s
-    o[q] += i_val * f[s]
+```text
+for (s, f_val) in f:
+  for q in [0, Q):
+    w = q + s
+    o[q] += i[w] * f_val
 ```
 
-The filter weight is fetched once per window position — it is stationary — and only the non-zero inputs generate MACs. This is the **weight-stationary sparse-input** skipping dataflow.
+Now the weight can remain close to the PE while multiple outputs reuse it. The tradeoff is output partial-sum traffic. If outputs are many and the local accumulator capacity is small, the design may save weight reads while increasing partial-sum movement.
 
-### Output-stationary with sparse inputs
+Lecture 10 slides `L06-22` through `L06-24` introduce parallel sparse-weight traversal by splitting a fiber into equal chunks. The subtlety is that a compressed fiber can be split by **position in the compressed stream** rather than by coordinate value. Position splitting gives each PE a similar number of nonzero entries, but the coordinate ranges may be irregular. Coordinate splitting gives clean spatial ownership, but load balance may become poor if nonzeros cluster.
 
-The output-stationary variant iterates over outputs first, then restricts the input fiber to the window relevant to each output:
+### 3. Sparse Inputs Only: Traverse Activations, Index Weights
 
-```
+For sparse input activations and dense weights, the roles reverse:
+
+```text
 for q in [0, Q):
-  for (w, i_val) in i if q <= w < q + S:   # sparse sliding window
+  for (w, i_val) in i if q <= w < q + S:
     s = w - q
     o[q] += i_val * f[s]
 ```
 
-The "sparse sliding window" visualization (slides L06-29 … L06-34) shows how the active input-coordinate set slides with `q`. The weight lookup `f[s]` requires computing `s = w - q` — a simple subtraction.
+The input fiber is sparse, so only nonzero activations produce MACs. The dense filter is directly indexed by `s = w - q`. Lecture 10 slides `L06-28` through `L06-35` present this as a sparse sliding window. The window condition matters: not every nonzero activation contributes to every output.
 
-### Cnvlutin — skipping zero activations at scale
+Cnvlutin, shown in Lecture 10 slides `L06-36` through `L06-38`, is the case-study architecture for activation skipping. The slide-derived lesson is that per-channel encoders remove zero activations, and the hardware uses activation coordinates to select the proper weight. The architectural constraint is that the dense side must remain cheap to index. If the weights were also compressed, direct `getPayload(s)` would no longer be a simple array lookup.
 
-**Cnvlutin** (CNVLUTIN, ISCA 2016) exploits sparse activations across a full 2-D multi-channel convolution. Per-channel encoders compress the input activation maps, removing zero entries and recording their coordinates. The output-stationary computation then maps each non-zero activation to the appropriate weight via reindexing:
+### 4. Joint Sparsity: The Coordinate Problem Appears
 
-```
-for q in [0, Q]:
-  for m, f_c in f:
-    for (c, (f_s, i_w)) in f_c & i_c:       # implicit intersection over channels
-      for (w, i_val) in getWindow(i_w, q, S):
-        s = w - q
-        o[m, q] += i_val * f_s.getPayload(s)  # uncompressed weight lookup
-```
+When both tensors are sparse, the loop cannot simply traverse one compressed stream and directly index the other. Suppose:
 
-By keeping weights uncompressed, the `getPayload(s)` lookup is cheap (direct index). Cnvlutin demonstrates that compressing zero activations and skipping their MACs translates directly into throughput speedup, with gains that scale with the activation sparsity of the network.
+- Nonzero input coordinates are $i = \{0, 3, 4\}$.
+- Nonzero filter coordinates are $f = \{0, 2\}$.
+- Output coordinate is computed by $q = w - s$.
 
-![Cnvlutin architecture — per-channel encoder feeds reindexed weights to PE array](../../assets/L10/L10-p36-cnvlutin.png)
+The Cartesian products are:
 
-> **Why it matters:** The sparse-input-only case is complementary to sparse weights: compress activations, skip their MACs via concordant traversal, and look up weights by coordinate. Cnvlutin shows this yields real speedup — but like Cambricon-X, it leaves the other dimension of sparsity on the table.
+| Input `w` | Weight `s` | Output `q = w-s` | Legal if output range includes `q`? |
+|---:|---:|---:|---|
+| 0 | 0 | 0 | yes |
+| 0 | 2 | -2 | usually no |
+| 3 | 0 | 3 | yes |
+| 3 | 2 | 1 | yes |
+| 4 | 0 | 4 | maybe yes |
+| 4 | 2 | 2 | yes |
 
----
+This example shows the new work: the accelerator must compute output coordinates, reject illegal products, and route legal products to accumulators. Dense loop indices used to do that silently.
 
-## Chapter 4 — Exploiting Sparse Weights and Sparse Inputs Simultaneously (SCNN)
+### 5. SCNN: Cartesian Products Plus Scatter
 
-> *Slides: L06-39 … L06-51*
+SCNN, attributed on Lecture 10 slides `L06-45` through `L06-51` to Parashar et al., ISCA 2017, chooses an **input-stationary Cartesian-product** strategy. In each PE, a vector of nonzero activations and a vector of nonzero weights are multiplied all-to-all. If there are $I$ activation lanes and $F$ weight lanes, the PE creates $I \times F$ candidate products per step.
 
-### The challenge of joint sparsity
+The conceptual loop is:
 
-When both weights **and** activations are sparse, neither can serve as the "outer" loop driver while the other is looked up densely. Both are compressed, both must be traversed, and their products must be **scattered** to output positions that are not known until runtime.
-
-### Input-stationary with both sparse — the Cartesian product idea
-
-The **input-stationary** dataflow keeps each input activation stationary while multiplying it against all non-zero filter weights, producing partial results that scatter to different outputs:
-
-```
-for (w, i_val) in i:
-  for (s, f_val) in f if w-Q <= s < w:    # restrict weights to current input
+```text
+for (w, i_val) in sparse_inputs:
+  for (s, f_val) in sparse_weights if product_is_legal(w, s):
     q = w - s
+    scatter_add(o[q], i_val * f_val)
+```
+
+The multiplication step is regular. The accumulation step is irregular. Each product may target a different output coordinate, so SCNN needs a scatter network and banked accumulators. This is a classic sparse-hardware pattern: removing zero MACs exposes irregular communication.
+
+From the SCNN paper, the architecture stores both weights and activations in compressed-sparse form, computes a Cartesian product inside a PE, computes output coordinates from sparse indices, and routes products through a scatter accumulator array (SCNN Sections III-IV, especially Figure 5 and Figure 6 in the paper). The paper reports 2.7x performance improvement and 2.3x energy reduction over a dense accelerator across evaluated networks (SCNN Abstract and Section VI). These numbers are paper-derived claims.
+
+### 6. ISOSceles: Split the Work Into IS Then OS
+
+Lecture 10 slides `L06-53` through `L06-66` present another way to handle joint sparsity. Instead of generating many irregular products and scattering them immediately, ISOSceles uses an **IS-OS** decomposition.
+
+The output-stationary joint-sparse idea can be written as an intersection:
+
+```text
+for q in [0, Q):
+  for (coord, (f_val, i_val)) in f.project(+q) & i:
     o[q] += i_val * f_val
 ```
 
-When parallelized, both the input split and the filter split are traversed spatially. This yields **all-to-all (Cartesian product) multiplication**: each of the K spatially active input values multiplies each of the K' spatially active filter values, producing K×K' partial products simultaneously.
+The projection shifts filter coordinates so they align with input coordinates. The intersection emits only jointly nonzero pairs. This is elegant mathematically, but it can become discordant if the storage order of the participating fibers does not match the loop order.
 
-### SCNN architecture
+ISOSceles splits the computation:
 
-**SCNN** (Parashar et al., ISCA 2017) implements exactly this:
+- **IS pass:** traverse input-oriented sparse streams and create an intermediate tensor `T`.
+- **OS pass:** traverse `T` in output order and accumulate final outputs.
 
-- **Flattening:** The 2-D convolution is reformulated by substituting index variables to produce a 1-D inner product over flattened indices `(hw)` and `(mrs)`. This makes the all-to-all multiplication regular.
-- **Sparse-compressed frontend:** Non-zero inputs (`i[C][W*H]`) and non-zero weights (`f[C][M*R*S]`) are stored in compressed format. The PE frontend consumes them in parallel.
-- **Dense backend / scatter network:** Each of the K×K' products is accompanied by a computed output coordinate `(m, p, q)`. A scatter network routes each product to the correct accumulator in the output partial-sum buffer.
+The key transformation is **swizzling**, a rank reordering of `T` so that the second pass can consume the intermediate tensor concordantly. In teaching terms, ISOSceles pays for a small intermediate buffer to avoid a more chaotic scatter pattern.
 
-![SCNN architecture — Cartesian-product multiply + scatter network for sparse inputs and weights](../../assets/L10/L10-p45-scnn-architecture.png)
-
-![SCNN PE microarchitecture — sparse-compressed frontend and dense scatter backend](../../assets/L10/L10-p49-scnn-pe-microarchitecture.png)
-
-### Flattening: why it enables the Cartesian product
-
-The substitution `h = p + r, w = q + s` converts the 2-D convolution `O[m,p,q] += I[c,h,w] * F[m,c,r,s]` into a form indexed over flat coordinates. Splitting both the flattened input and weight fibers equally and then traversing them spatially gives the all-to-all structure:
-
-```
-for (hw1, i_split) in i.splitEqual(4):
-  for (mrs1, f_split) in f.splitEqual(4):
-    spatial-for ((h,w), i_val) in i_split:
-      spatial-for ((m,r,s), f_val) in f_split if "legal":
-        p = h - r;  q = w - s
-        o[m,p,q] += i_val * f_val
-```
-
-### SCNN latency and energy vs. joint density
-
-The latency of SCNN scales with the **product of activation density × weight density** (the fraction of non-zero values in each tensor). At high joint sparsity (e.g., 90% zeros in both), SCNN achieves proportionally fewer MAC cycles. However, the scatter network introduces area and energy overhead that limits gains at moderate sparsity levels. The energy curve (slides L06-50 and L06-51) shows that SCNN's energy efficiency improves monotonically with joint sparsity, but the crossover point relative to a dense baseline depends on the scatter-network cost.
-
-> **Why it matters:** SCNN demonstrates that joint weight-and-activation sparsity can be exploited with a relatively simple hardware mechanism (Cartesian product + scatter), but the irregular scatter step is a real cost. This motivates architectures like ISOSceles that seek a more structured approach to handling the joint sparse case.
+Lecture 10 slide `L06-66` reports up to 7.5x speedup and about 1.7x average speedup for ISOSceles. This is a slide-derived quantitative claim attributed in the slides to Yang et al., HPCA 2023. Because the ISOSceles paper PDF is not in the provided local paper list for this worker, this chapter treats the detailed ISOSceles explanation as slide-derived plus teaching interpretation rather than independently paper-verified.
 
 ---
 
-## Chapter 5 — The IS-OS Two-Pass Dataflow and ISOSceles
+## Worked Examples
 
-> *Slides: L06-52 … L06-66*
+### Example 1: Gating Versus Skipping
 
-### The weight-stationary reversal and its cost
+Assume a PE receives eight activation-weight pairs. Four activations are zero.
 
-Before introducing ISOSceles, the lecture shows a **weight-stationary variant** of the joint-sparse loop (slide L06-52) where the filter split is the outer loop and the input split is inner. This reversal means the filter is more stationary, but the *input* must now be read from a larger buffer more frequently — a disadvantage that shows the sensitivity of dataflow choice to memory hierarchy costs.
+- With **gating**, the PE still consumes eight cycle slots. Four multiplier operations are disabled, so PE dynamic energy drops, but latency remains eight slots.
+- With **skipping**, the PE schedules only four nonzero products. Latency can drop toward four slots, but only if the compressed stream, coordinate generator, and accumulator can keep up.
 
-### The output-stationary joint-sparse case and fiber intersection
+Hardware meaning: gating is easy because the dense schedule remains intact. Skipping is more powerful because it changes the schedule, but it needs metadata and load balancing.
 
-The **output-stationary joint-sparse** dataflow iterates over outputs `q` and performs **fiber intersection** to find the (input, weight) pairs that both contribute to output `q`:
+### Example 2: Sparse Sliding Window
 
-```
-for q in [0,Q):
-  for (s, (f_val, i_val)) in f.project(+q) & i:
-    o[q] += i_val * f_val
-```
+Let $Q = 4$, $S = 3$, sparse input coordinates be $\{0, 2, 4, 5\}$, and dense weights be $f[0], f[1], f[2]$. For output $q = 2$, the window is $2 \le w < 5$, so the active sparse inputs are $w = 2$ and $w = 4$.
 
-`f.project(+q)` shifts the weight fiber's coordinates by `+q`, aligning them with input coordinates. The intersection `&` then finds only the (coordinate, payload) pairs present in **both** the projected weight fiber and the input fiber. Only non-zero pairs in both tensors contribute a MAC — achieving true joint skipping.
+The weight coordinates are:
 
-The hardware component diagram (slide L06-56) shows the intersection unit sitting between the weight and input streams, feeding a single MAC unit and a partial-sum accumulator.
+- For $w = 2$, $s = w-q = 0$.
+- For $w = 4$, $s = w-q = 2$.
 
-### IS-OS Dataflow: splitting the computation into two passes
+Thus output $o[2]$ receives only two products: $i[2]f[0]$ and $i[4]f[2]$. A dense loop would also test $i[3]f[1]$, but sparse traversal avoids it because `i[3]` is zero or absent.
 
-The key insight of **ISOSceles** (Yang et al., HPCA 2023) is that a single-pass output-stationary loop that exploits both sparsities leads to a discordant traversal of an intermediate tensor `T`. Instead, the computation is split into two mathematically equivalent passes:
+### Example 3: Joint Density Is a Product, Not a Sum
 
-**Step 1 (IS pass — Input-Stationary):**
+If activation density is $d_i = 0.3$ and weight density is $d_f = 0.2$, then the expected fraction of nonzero products under an independent-density model is $d_i d_f = 0.06$.
 
-```
-T[c,h-r,w-s] = I[c,h,w] × F[c,m,r,s]
-```
+Teaching interpretation: this is why joint sparsity can look so attractive. However, the accelerator still pays fixed and semi-fixed costs: metadata reads, coordinate arithmetic, scatter/intersection logic, underutilized lanes, and synchronization. A sparse accelerator is excellent only when the skipped work dominates those overheads.
 
-Traverse `i` concordantly (input-stationary), multiply by intersected filter entries, and accumulate into a *temporary* tensor `T` indexed by `[h, r, w-s]`.
+---
 
-**Step 2 (OS pass — Output-Stationary):**
+## Key Equations and How to Read Them
 
-```
-O[m,p,q] = T[c,p+r,q]
-```
+The dense 1-D convolution used throughout the lecture is:
 
-Traverse `T` and accumulate into output, but `T` must be accessed in a **different rank order** than it was written. This is a **discordant traversal** — naively expensive.
+$$
+o[q] = \sum_s i[q+s] f[s].
+$$
 
-**Swizzling to fix the traversal order:**
+Read it as: for one output coordinate $q$, slide the filter coordinate $s$ over the input coordinate $w=q+s$.
 
-The fix is to **swizzle the ranks** of `T`:
+The output coordinate for input-stationary traversal is:
 
-```python
-t = t.swizzleRanks(["H", "R", "Q"] -> ["Q", "R", "H"])
-```
+$$
+q = w - s.
+$$
 
-After swizzling, the Step-2 traversal becomes concordant, and the overall pipeline is:
+Read it as: once a nonzero input at coordinate $w$ and a nonzero filter entry at coordinate $s$ meet, the output coordinate is not an independent loop index; it must be computed and used for accumulation.
 
-- IS frontend processes sparse inputs and sparse weights → writes partial results to `T` (small).
-- OS backend reads `T` (concordantly after swizzle) → accumulates into outputs.
+The simple independent-density model is:
 
-![ISOSceles IS-OS pipeline — IS frontend feeds OS backend via small intermediate buffer](../../assets/L10/L10-p64-isosceles-pipeline.png)
+$$
+d_{\text{joint}} = d_i d_f.
+$$
 
-### Why the pipeline works
+Read it as: if activations and weights are independently nonzero with densities $d_i$ and $d_f$, only the product of the densities is expected to produce nonzero multiplication work. The equation does not include metadata, routing, or load-balance overhead.
 
-The IS frontend and OS backend operate as a **two-stage pipeline**:
+---
 
-1. **IS frontend:** Input wavefront traverses non-zero activations concordantly, intersects them with non-zero filter entries, and produces partial sums into a small `T` buffer.
-2. **OS backend:** Output wavefront traverses `T` concordantly (after swizzle) and drains partial sums into the output map.
+## Hardware Implications
 
-The "small" annotation on the `T` buffer in the diagram underlines a key implementation fact: because `T` is indexed by a shifted coordinate, its **active footprint at any moment is small**, fitting in on-chip memory and avoiding DRAM traffic.
+- **Metadata bandwidth:** Sparse formats replace some payload reads with coordinate reads. If coordinates are wide or irregular, metadata can become a first-order cost.
+- **Coordinate generation:** Sparse convolution requires arithmetic such as $w=q+s$ or $q=w-s$. This logic is modest compared with MAC arrays, but it must run at the PE rate.
+- **Accumulator design:** SCNN-style scatter needs banked accumulators and conflict management. ISOSceles-style decomposition needs an intermediate buffer and rank-swizzled access.
+- **Load balance:** Equal nonzero counts do not always imply equal execution time. Products may be illegal, scatter conflicts may differ, and layers have different densities.
+- **Memory hierarchy:** Sparse weights, sparse activations, and sparse outputs stress different memories. The best dataflow depends on which buffer is small, which tensor is reused, and which tensor can be streamed.
+- **Programmability:** Dataflow-specific sparse hardware is efficient but less general. A framework such as TeAAL, introduced earlier in the course, is useful because it separates format, mapping, architecture, and binding decisions.
 
-### ISOSceles speedup
+---
 
-The measured speedup of ISOSceles versus a dense baseline ranges up to **7.5×**, with an average around **1.7×** across benchmarks.
+## Common Misconceptions
 
-![ISOSceles speedup — up to 7.5× over dense baseline, average 1.7×](../../assets/L10/L10-p66-isosceles-speedup.png)
+### Misconception: Sparsity automatically gives speedup.
 
-The 7.5× peak arises at very high joint sparsity where both the IS and OS passes skip proportionally many operations. The gap between peak and average reflects the fact that not all layers are equally sparse, and the swizzle + pipeline overhead sets a floor on achievable speedup.
+Sparsity gives speedup only if the machine skips work rather than merely gating it, and only if metadata and routing overhead do not dominate.
 
-> **Why it matters:** ISOSceles closes the loop on the sparse-architecture series. It demonstrates that the full IS-OS split — combined with fiber intersection, projection, and tensor swizzling — can be implemented in real hardware and deliver substantial measured speedup. The two-pass structure trades the irregular scatter network of SCNN for a structured pipeline with a small intermediate buffer, a principled engineering tradeoff that generalizes to other workloads.
+### Misconception: Joint sparsity is just sparse weights plus sparse activations.
+
+The joint case introduces coordinate matching. With both operands compressed, the accelerator must either intersect coordinate streams or produce products and scatter them to computed output locations.
+
+### Misconception: Cartesian-product multiplication is wasteful because it creates many products.
+
+It can be wasteful if many products are illegal or collide in the accumulator, but it is also regular and parallel. SCNN uses this regularity to exploit two compressed streams at once.
+
+### Misconception: A peak sparse speedup number describes the whole network.
+
+Layer densities vary. Early layers often have different activation density from later layers, and some layers may be too dense or too small to amortize sparse overhead.
+
+---
+
+## Connections to Previous and Later Lectures
+
+- **L05 Mapping/Dataflows:** L10 is a direct application of mapping. Output-stationary, weight-stationary, input-stationary, and IS-OS choices determine which sparse operations are cheap.
+- **L07-L09 Sparse Formats:** The ideas of fibers, concordant traversal, discordant traversal, projection, and intersection become concrete hardware mechanisms here.
+- **L11 Advanced Technologies:** Compute-in-memory changes the cost of moving weights and partial sums, but it does not remove the metadata and utilization questions raised by sparse dataflows.
+- **L12 Reduced Precision:** Quantization can create additional zeros and can also reduce metadata/payload width. Precision and sparsity interact in both accuracy and hardware cost.
+- **Later accelerator modeling:** The sparse cases in this lecture are exactly the kind of design points that require source discipline in cost models: arithmetic count, memory traffic, metadata traffic, and utilization must be separated.
+
+---
+
+## Paper Bridge: SCNN
+
+### Bibliographic Identity
+
+- **Title:** SCNN: An Accelerator for Compressed-sparse Convolutional Neural Networks
+- **Authors:** Angshuman Parashar et al.
+- **Year / venue:** ISCA 2017
+- **Local PDF:** [`papers/L17_SCNN_Parashar_ISCA2017.pdf`](../../papers/L17_SCNN_Parashar_ISCA2017.pdf)
+- **Used in lecture:** Lecture 10 slides `L06-45` through `L06-51`
+
+### Problem Addressed
+
+SCNN addresses the gap between sparse models and dense accelerator schedules. Earlier designs could save energy by gating zeros or exploit only one sparse operand. SCNN asks how an accelerator can keep both weights and activations compressed, skip zero-valued products, and still accumulate correct convolution outputs.
+
+### Core Idea
+
+The paper's core abstraction is the **PlanarTiled-InputStationary-CartesianProduct-sparse** dataflow. Each PE fetches a vector of nonzero activations and a vector of nonzero weights, forms their Cartesian product, computes output coordinates from sparse indices, and routes products through a scatter accumulator.
+
+### Relevance to This Lecture
+
+SCNN is the concrete architecture behind Lecture 10's transition from single-sparse skipping to joint-sparse skipping. It clarifies why joint sparsity needs more than compressed storage: the PE must compute coordinates and route partial sums.
+
+### Key Claims Used in This Chapter
+
+- SCNN stores both sparse weights and sparse activations in compressed form and exploits both forms of sparsity; this is stated in the paper abstract and developed in Sections III-IV.
+- The PE forms Cartesian products of compressed activation and weight vectors, then computes output coordinates and scatters products; see SCNN Section III-B and Section IV, especially the descriptions around Figures 5 and 6.
+- The evaluated design uses 64 PEs with 16 multipliers per PE, for 1024 multipliers total; see SCNN Table IV and Section IV.
+- The paper reports 2.7x performance improvement and 2.3x energy reduction over a dense accelerator; see the abstract and Section VI.
+- The paper notes that accumulator and activation memories are a large part of PE area; see the area discussion around Table III.
+
+### What Students Should Remember
+
+1. SCNN's multiplication is regular; its accumulation is irregular.
+2. Keeping both operands compressed saves payload movement but introduces coordinate and scatter overhead.
+3. Sparse speedup depends on density and on how well the PE array avoids bank conflicts and load imbalance.
+4. SCNN is a design point, not a universal sparse recipe. It chooses scatter hardware as the price of joint skipping.
+
+### Limitations and Assumptions
+
+SCNN's published results depend on evaluated CNNs, pruning/activation sparsity patterns, and a specific area/performance model. The paper's speedup should not be generalized to all networks or all sparsity structures without checking density, layer shape, and accumulator behavior.
+
+### Suggested Insertion Points
+
+Reference SCNN when explaining joint-sparse Cartesian products, scatter accumulators, and the difference between arithmetic reduction and end-to-end accelerator speedup.
+
+---
+
+## Paper Bridge: State of Pruning
+
+### Bibliographic Identity
+
+- **Title:** What is the State of Neural Network Pruning?
+- **Authors:** Davis Blalock et al.
+- **Year / venue:** MLSys 2020
+- **Local PDF:** [`papers/L16_StateOfPruning_Blalock_MLSys2020.pdf`](../../papers/L16_StateOfPruning_Blalock_MLSys2020.pdf)
+- **Used in lecture:** Background bridge for where sparse weights come from
+
+### Problem Addressed
+
+The paper surveys the pruning literature and asks whether reported pruning results are comparable and what consistent conclusions can be drawn. This matters for Lecture 10 because sparse accelerators often assume pruned weights as input.
+
+### Core Idea
+
+Pruning is not a single technique. The paper distinguishes unstructured pruning, structured pruning, scoring rules, local versus global pruning, fine-tuning schedules, compression ratios, and theoretical speedups.
+
+### Relevance to This Lecture
+
+Lecture 10 treats sparse weights as available. The pruning survey reminds the reader that weight sparsity is produced by an algorithmic pipeline and that reported compression or theoretical speedup may not translate into hardware speedup.
+
+### Key Claims Used in This Chapter
+
+- The paper defines pruning as producing a masked or reduced model $f(x; M \odot W')$; see Section 2.
+- It distinguishes unstructured pruning from structured pruning and explains why unstructured pruning may not map cleanly to speedups on modern libraries and hardware; see Section 2.
+- It argues that pruning papers often use inconsistent metrics and baselines; see Sections 3-5.
+- It recommends reporting compression, theoretical speedup, controls, and tradeoff curves; see Section 6.
+
+### What Students Should Remember
+
+1. Sparse weights are not free; they come from an accuracy-efficiency tradeoff.
+2. Unstructured sparsity is attractive for compression but harder for hardware.
+3. Theoretical FLOP reduction is not the same as accelerator speedup.
+4. A sparse architecture paper should state the sparsity pattern, density, and evaluation baseline clearly.
+
+### Limitations and Assumptions
+
+This survey is about pruning methodology, not accelerator microarchitecture. It supports the source of sparse weights but does not validate any specific sparse accelerator.
+
+### Suggested Insertion Points
+
+Use this paper when discussing why sparse weight density varies across layers and why hardware speedup claims need careful evaluation.
 
 ---
 
 ## Standalone Study Guide
 
-### What to master before moving on
+### What to Master Before Moving On
 
-- Reconstruct the sequence from gating to single-sparse skipping to joint-sparse skipping.
-- Explain sparse-weight-only and sparse-input-only dataflows before attempting the joint case.
-- Describe SCNN's Cartesian-product multiplier and scatter backend.
-- Describe ISOSceles's IS-OS split, temporary tensor `T`, and swizzled traversal.
-- Read reported speedup and energy results as consequences of density, utilization, and routing overhead.
+- Explain the difference between a zero detected late and a zero skipped before scheduling.
+- Derive sparse-weight-only and sparse-input-only loops from $o[q] = \sum_s i[q+s]f[s]$.
+- Explain why joint sparsity requires coordinate matching.
+- Compare SCNN's scatter-based design with ISOSceles's intermediate-tensor design.
+- Read sparse speedup results as density plus overhead, not density alone.
 
-### Self-check questions
+### Self-Check Questions
 
-1. Why does Eyeriss gating reduce PE power without reducing latency?
-2. What makes the joint sparse case harder than sparse weights only?
-3. What hardware cost does SCNN pay that ISOSceles tries to avoid?
+1. Why does Eyeriss gating save PE power but not latency?
+2. In sparse-weight-only traversal, why is the dense input easy to index?
+3. In sparse-input-only traversal, what does the sparse sliding window restrict?
+4. Why does SCNN need a scatter accumulator?
+5. What does rank swizzling accomplish in the IS-OS dataflow?
+6. Why can pruning reduce theoretical MACs but fail to produce proportional hardware speedup?
 
 ### Exercises
 
-1. Starting from a dense 1-D convolution loop, rewrite it for sparse weights, sparse inputs, and both sparse.
-2. For a small set of non-zero inputs and weights, enumerate the SCNN Cartesian products and their output coordinates.
-3. Sketch the two ISOSceles passes and mark where `T` is written, swizzled, and read.
-
-### Common traps
-
-- Thinking "both sparse" simply means applying the two single-sparse tricks independently. It requires coordinate matching or scatter.
-- Reading peak speedup as average speedup. Sparsity varies across layers and networks.
-- Ignoring the cost of routing partial sums to irregular output positions.
+1. For input coordinates $\{1, 4, 5\}$ and filter coordinates $\{0, 2, 3\}$, list all legal products for outputs $q \in [0, 4)$.
+2. Rewrite the dense 1-D convolution loop into sparse-weight-only, sparse-input-only, and joint-sparse input-stationary loops.
+3. Assume activation density $0.4$ and weight density $0.25$. Compute the independent-density estimate of nonzero product density. Then list two hardware costs ignored by this estimate.
+4. Design a small accumulator banking scheme for four simultaneous SCNN products. What happens if two products target the same bank?
+5. Paper-reading bridge: read SCNN Section III-B and explain why the Cartesian product is paired with coordinate computation.
 
 ---
 
 ## Key Terms
 
-| Term | Gloss |
+| Term | Meaning |
 |---|---|
-| **Gating** | Shutting off multiplier/memory power when an operand is zero; saves energy but not time. |
-| **Skipping** | Removing zero-operand cycles from the schedule entirely; saves both energy and time. |
-| **Concordant traversal** | Iterating over a compressed fiber in coordinate order, so each non-zero element is visited exactly once in linear time. |
-| **Discordant traversal** | Accessing a tensor in an order that does not match its stored rank order; requires random lookup or reordering. |
-| **Fiber** | A 1-D slice of a multi-dimensional tensor, represented as a list of (coordinate, payload) pairs. |
-| **Fiber splitting (splitEqual)** | Dividing a fiber into equal-sized chunks by position, used to create spatial parallelism. |
-| **Fiber projection (project)** | Shifting a fiber's coordinates by an offset, used to align two fibers for intersection. |
-| **Fiber intersection (&)** | Finding coordinate-payload pairs present in both of two fibers; produces only jointly non-zero entries. |
-| **Output-stationary (OS)** | Dataflow where each output accumulator remains fixed while inputs and weights are streamed in. |
-| **Weight-stationary (WS)** | Dataflow where each filter weight remains fixed while inputs and outputs are streamed. |
-| **Input-stationary (IS)** | Dataflow where each input activation remains fixed while filter weights and outputs are cycled. |
-| **Cartesian product multiplication** | All-to-all multiplication of a split of K non-zero inputs with K' non-zero weights, producing K×K' partial products. |
-| **Scatter network** | Hardware network that routes each partial product from a Cartesian-product multiplier to the correct output accumulator address. |
-| **Flattening** | Substituting 2-D spatial indices (h,w) with a single flat index (hw) to make a 2-D convolution look like a 1-D inner product. |
-| **IS-OS dataflow** | Two-pass computation: IS pass produces an intermediate tensor T; OS pass reduces T to output. |
-| **Tensor swizzling (swizzleRanks)** | Reordering the rank axes of a tensor to convert a discordant traversal into a concordant one. |
-| **Eyeriss** | Weight-stationary accelerator (ISSCC 2016) with input-activation gating; saves ~45% PE power. |
-| **Cambricon-X** | Weight-stationary sparse accelerator (MICRO 2016); exploits sparse weights via indirect activation lookup. |
-| **Cnvlutin** | Output-stationary sparse accelerator (ISCA 2016); exploits sparse activations via per-channel encoding. |
-| **SCNN** | Sparse CNN accelerator (ISCA 2017); exploits joint weight and activation sparsity via Cartesian product + scatter. |
-| **ISOSceles** | IS-OS sparse accelerator (HPCA 2023); achieves up to 7.5× speedup via two-pass pipeline with tensor swizzling. |
+| **Gating** | Disabling hardware activity when an operand is zero. It saves dynamic energy but keeps the dense schedule. |
+| **Skipping** | Removing zero-valued operations from the dynamic schedule. It can save time and energy but needs compressed traversal. |
+| **Fiber** | A one-dimensional tensor slice, often represented by coordinate-payload pairs. |
+| **Concordant traversal** | Reading a compressed fiber in its natural coordinate order. |
+| **Discordant traversal** | Requesting data in an order that does not match the stored sparse order. |
+| **Fiber projection** | Shifting coordinates so two fibers can be aligned for intersection. |
+| **Fiber intersection** | Emitting only coordinates present in both sparse fibers. |
+| **Output-stationary** | A dataflow that keeps output accumulators local while inputs and weights stream through. |
+| **Weight-stationary** | A dataflow that keeps weights local to maximize weight reuse. |
+| **Input-stationary** | A dataflow that keeps input activations local while weights produce contributions to multiple outputs. |
+| **Cartesian product** | All-to-all multiplication between a group of nonzero activations and a group of nonzero weights. |
+| **Scatter accumulator** | Accumulation hardware that routes products to output coordinates computed at runtime. |
+| **IS-OS dataflow** | A two-pass sparse dataflow: input-stationary production of an intermediate tensor, then output-stationary reduction. |
+| **Swizzling** | Reordering tensor ranks so a later traversal becomes concordant. |
+| **Joint density** | The expected nonzero product density, often approximated as activation density times weight density under independence. |
 
 ---
 
 ## Takeaways
 
-- **Gating saves energy; skipping saves time.** The two are architecturally distinct and require different hardware mechanisms. Most high-performance sparse accelerators aim for both.
-- **Single-sparsity designs are tractable.** Sparse-weight-only (Cambricon-X) and sparse-input-only (Cnvlutin) architectures are each relatively straightforward, exploiting one compressed tensor with concordant traversal and a dense lookup for the other.
-- **Joint sparsity requires either a scatter network or a two-pass pipeline.** SCNN uses a Cartesian-product multiplier with a scatter network; ISOSceles uses an IS→OS two-pass pipeline with fiber intersection and tensor swizzling.
-- **SCNN's Cartesian product is conceptually clean** but pays an area and energy cost for the scatter network. Its gains scale with the **product** of weight and activation density.
-- **ISOSceles's IS-OS split converts an irregular scatter into a structured pipeline** by storing partial results in a small intermediate tensor `T`, then swizzling `T`'s ranks to make the second pass concordant. This achieves up to **7.5×** measured speedup.
-- **Fiber intersection is the mathematical primitive** that enables joint skipping in output-stationary and IS-OS dataflows. The hardware cost depends on the representation (bitmask and uncompressed are cheapest; coordinate lists require sorting or merge logic).
-- **Dataflow choice and sparsity exploitation are coupled.** Changing from output-stationary to weight-stationary reverses which tensor is more stationary and changes which data must be read from the larger buffer — illustrating that mapping decisions (the TeAAL Mapping layer) directly interact with Format-layer sparsity choices.
+- Sparse acceleration is a scheduling and communication problem, not just a compression problem.
+- Gating is useful but does not reduce latency; skipping changes the executed schedule.
+- Single-sparse cases are easier because the other operand can remain dense and directly indexed.
+- Joint sparsity introduces coordinate matching, legality checks, and irregular accumulation.
+- SCNN pays for scatter hardware to exploit both compressed operands directly.
+- ISOSceles pays for an intermediate tensor and swizzled traversal to make the second pass more structured.
+- Quantitative sparse claims must state their source and scope: layer density, architecture baseline, metadata cost, and measured versus theoretical speedup.
 
 ---
 
-## Connections to Later Lectures
+## Connections
 
-- **This lecture closes the sparse-architecture series (L07–L10).** L07 introduced sparsity motivation and formats; L08 introduced fiber representations, concordant/discordant traversal, and gating; L09 covered skipping for single-sparse cases; L10 (this lecture) covers joint sparse and two case-study accelerators (SCNN and ISOSceles).
-- **L11 — Advanced Technologies:** The next lecture shifts to novel device technologies (RRAM, optical, superconducting) that may enable different sparsity-exploitation strategies at the physical level.
-- **L12 — Reduced Precision:** Quantization and low-bit arithmetic interact with sparsity — zero-valued entries in quantized networks may arise from different sources, and both techniques can be composed.
-- **TeAAL Pyramid revisited:** The SCNN and ISOSceles case studies illustrate all four pyramid layers in action: **Format** (compressed fibers), **Mapping** (IS vs. OS vs. IS-OS dataflow), **Architecture** (Cartesian multiplier vs. IS-OS pipeline), and **Binding** (scatter network routing vs. swizzled tensor indexing).
+This lecture closes the sparse-architecture arc that began in L07. It also sets up L11 by sharpening the question of where data should move. Advanced memory technologies can reduce some movement costs, but they do not make sparse coordinate management disappear. The same separation of concerns from TeAAL remains useful: format determines what is stored, mapping determines the traversal, architecture determines the available hardware, and binding determines which hardware resource performs each operation.
 
 ---
 
 ## Appendix — Slide-to-Section Map
 
-| PDF Slide Label | Section |
-|---|---|
-| L06-1 | Title — Sparse Architectures Part 3, March 9, 2026 |
-| L06-2 … L06-4 | Ch.1 — CONV layer review; 1-D output-stationary convolution loop nest |
-| L06-5 … L06-6 | Ch.1 — Gating vs. skipping: energy vs. time savings |
-| L06-7 | Ch.1 — Eyeriss gating: 45% PE power reduction |
-| L06-8 … L06-9 | Ch.2 — Weight-stationary dataflow; dense vs. compressed representation |
-| L06-10 … L06-14 | Ch.2 — Output-stationary sparse-weight dataflow and datapath diagram |
-| L06-15 … L06-16 | Ch.2 — Weight-stationary sparse-weight dataflow and datapath diagram |
-| L06-17 … L06-21 | Ch.2 — Fiber splitting in position space; extending to multiple dimensions |
-| L06-22 … L06-24 | Ch.2 — Parallel weight-stationary sparse-weight loop nest |
-| L06-23 | Ch.2 — Cambricon-X: weight metadata drives indirect activation lookup |
-| L06-25 | Ch.3 — Transition: exploiting sparse inputs |
-| L06-26 … L06-27 | Ch.3 — Weight-stationary sparse-input dataflow and datapath |
-| L06-28 … L06-34 | Ch.3 — Output-stationary sparse-input dataflow; sparse sliding window |
-| L06-35 | Ch.3 — Output-stationary sparse-input datapath diagram |
-| L06-36 … L06-38 | Ch.3 — Cnvlutin: per-channel encoder, loop nest, speedup |
-| L06-39 … L06-41 | Ch.4 — Input-stationary sparse weights & inputs; datapath diagram |
-| L06-42 … L06-43 | Ch.4 — Fiber splitting for joint sparse; parallel IS loop nest |
-| L06-44 | Ch.4 — Cartesian product multiplication visualization |
-| L06-45 … L06-46 | Ch.4 — SCNN architecture overview and flattening |
-| L06-47 … L06-48 | Ch.4 — SCNN tile loop nest (one channel; flattened) |
-| L06-49 | Ch.4 — SCNN PE microarchitecture: sparse frontend + dense scatter backend |
-| L06-50 … L06-51 | Ch.4 — SCNN latency and energy vs. joint density |
-| L06-52 | Ch.5 — Weight-stationary joint-sparse: reversed loops and buffer cost |
-| L06-53 … L06-56 | Ch.5 — Output-stationary joint-sparse: fiber projection + intersection |
-| L06-57 … L06-62 | Ch.5 — IS-OS dataflow math: two-pass derivation and swizzleRanks |
-| L06-63 … L06-65 | Ch.5 — ISOSceles IS-OS pipeline diagram (IS frontend → T → OS backend) |
-| L06-66 | Ch.5 — ISOSceles speedup: up to 7.5×, average 1.7× |
+| Slide label | Chapter section | Notes |
+|---|---|---|
+| `L06-1` | Title and framing | PDF label differs from repository lecture number. |
+| `L06-2`-`L06-7` | Gating vs. skipping | Includes Eyeriss 45% PE power slide-derived claim. |
+| `L06-8`-`L06-25` | Sparse weights only | Output-stationary, weight-stationary, fiber splitting, Cambricon-X. |
+| `L06-26`-`L06-38` | Sparse inputs only | Sparse sliding window and Cnvlutin. |
+| `L06-39`-`L06-51` | SCNN and joint sparsity | Expanded with SCNN paper bridge. |
+| `L06-52`-`L06-66` | IS-OS and ISOSceles | Slide-derived explanation of projection, intersection, swizzling, and reported speedup. |
+| Background | State of pruning bridge | Added to explain where sparse weights come from and why speedup metrics need care. |
+
+---
+
+## Source Notes
+
+- The lecture ordering and loop-nest examples follow Lecture 10 slides `L06-1` through `L06-66`.
+- Eyeriss gating 45% PE power reduction is stated on Lecture 10 slide `L06-7`.
+- Cambricon-X and Cnvlutin are used as slide-stated architecture examples from Lecture 10 slides `L06-23` and `L06-36` through `L06-38`; their original PDFs were not part of this worker's provided local paper list.
+- SCNN details and numerical results are derived from `papers/L17_SCNN_Parashar_ISCA2017.pdf`, especially the abstract, Sections III-IV, Section VI, and Tables III-IV.
+- Pruning context is derived from `papers/L16_StateOfPruning_Blalock_MLSys2020.pdf`, especially Sections 2-6.
+- ISOSceles details and speedup numbers are slide-derived from Lecture 10 slides `L06-53` through `L06-66`; the original ISOSceles PDF was not available in the specified local paper inputs.
+- Worked examples are original teaching examples constructed for this chapter.
+
+## Uncertainty Notes
+
+- The live lecture may have emphasized different implementation details for Cambricon-X, Cnvlutin, or ISOSceles than can be recovered from the slides alone.
+- The independent-density equation $d_i d_f$ is a teaching model, not a guarantee. Real activation and weight sparsity can be correlated by layer, channel, and data distribution.
+- Existing repository assets under `assets/L10/` may be copyright-sensitive slide captures. This chapter no longer embeds them, but this worker did not delete assets outside the owned walkthrough files.

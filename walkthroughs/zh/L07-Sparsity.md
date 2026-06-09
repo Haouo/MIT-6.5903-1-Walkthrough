@@ -1,330 +1,627 @@
-# L07 — DNN 模型與硬體協同設計：稀疏性（Co-Design of DNN Models and Hardware: Sparsity）
+# L07 - Co-Design of DNN Models and Hardware: Sparsity（DNN 模型與硬體共同設計：稀疏性）
 
-> **課程：** 6.5930/1 — 深度學習硬體架構（Hardware Architectures for Deep Learning）
-> **講師：** Joel Emer 與 Vivienne Sze（MIT EECS）
-> **講授日期：** 2026 年 2 月 25 日 · **投影片：** 53 頁 · **來源：** [`Lecture/L07 - Sparsity.pdf`](../../Lecture/L07%20-%20Sparsity.pdf)
+> **課程：** 6.5930/1 - Hardware Architectures for Deep Learning
+> **授課者：** Joel Emer & Vivienne Sze（MIT EECS）
+> **日期：** 2026-02-25 · **投影片：** 53 頁 · **來源：** [`Lecture/L07 - Sparsity.pdf`](../../Lecture/L07%20-%20Sparsity.pdf)
 >
-> *本文是以「概念」為單位重建講課脈絡的導讀（walkthrough），依主題而非逐頁編排。每一節都標註其對應的投影片範圍，方便你對照原始投影片閱讀。*
+> 本章根據投影片與 local papers 重建缺少的 lecture narration。它是自學教材，不是投影片逐頁摘要。
 
 ---
 
-## 一句話總結（TL;DR）
+## TL;DR
 
-深度神經網路（Deep Neural Network, DNN）裡充滿了**零**——而如果硬體知道如何跳過它們，零就是免費的。本講橫跨 TeAAL 關注點金字塔（Pyramid of Concerns）中 **Format（格式）** 層（資料如何表示）與 **Compute（運算）** 層（計算什麼）的邊界，說明這些零從何而來，以及如何製造更多。**激活稀疏性（activation sparsity）** 自然地由 ReLU 與圖（graph）等結構化輸入資料產生；**權重稀疏性（weight sparsity）** 則可透過**剪枝（pruning）**——一個評分、分組、排名、微調的迭代循環——刻意引入。兩大硬體收益是：**(1) 降低資料搬移與儲存成本**（零不必被取出或傳輸）以及 **(2) 減少運算量**（任何數乘以零等於零）。難點在於：在硬體中充分利用稀疏性並非易事，需要特化支援——而這正是 L08–L10 的主題。
+Sparsity（稀疏性）表示 tensor 中有許多重複值，DNN 裡最常見的是重複的 zeros。對 DNN hardware 來說，zero 帶來兩種機會：不要儲存或搬動這個 zero；不要執行結果不會改變 output 的 multiply-add。L07 解釋 zeros 從哪裡來，也解釋為什麼 zeros 不會自動變成好處。Activation sparsity 可以自然來自 ReLU、input data 的相關性，或 graph structure。Weight sparsity 通常由 pruning（剪枝）創造；pruning 是一個 model-hardware co-design process，需要決定移除哪些 weights 或 groups、如何恢復 accuracy，以及要最佳化哪個硬體指標。
 
----
-
-## 學習目標（Learning Objectives）
-
-讀完本講後，你應該能夠：
-
-- 區分**激活稀疏性**（自然產生）與**權重稀疏性**（透過剪枝刻意製造）。
-- 說明稀疏性帶來的兩項**硬體層級收益**：降低資料搬移／儲存成本，以及減少運算量。
-- 定義**有效運算（effectual operation）** 與**無效運算（ineffectual operation）**，並理解後者在硬體上引發的成本取捨。
-- 追溯**剪枝管線（pruning pipeline）** 的四個步驟（評分 scoring → 分組 grouping → 排名 ranking → 微調 fine-tuning → 排程 scheduling）。
-- 比較**基於量級（magnitude-based）** 與**能量感知（energy-aware）** 的剪枝準則，並說明為何 MAC 數等間接指標可能產生誤導。
-- 區分**細粒度（非結構化，unstructured）** 與**粗粒度（結構化，structured）** 的權重稀疏性，並說明各自的硬體含義。
-- 說明為何 **30–70%** 量級的稀疏性對 DNN 硬體已然重要，儘管現有軟體庫針對的是 >99% 的情境。
+核心警告是：sparsity 是 opportunity，不是 guarantee。要跳過 zeros，需要 metadata、compression formats、zero detection、scheduling 與 load balancing。dense accelerator 可能仍然執行所有 ineffectual work；sparse accelerator 雖然能跳過工作，卻要付 overhead。最佳設計取決於 sparsity level、granularity、dataflow、memory hierarchy 與實際 deployment platform。
 
 ---
 
-## 第一章 — 稀疏性帶來什麼（以及它的代價）
+## 這堂課要解決什麼問題
 
-> *投影片：L07-2 … L07-8*
+前幾堂課已經說明，DNN accelerator efficiency 往往受 memory movement 與 PE utilization 支配，而不只是 MAC count。L07 問的是：如果 DNN 裡很多值是 zero，系統能不能避免搬動與計算它們？
 
-### 兩個目標
+天真的答案是「可以，因為 anything times zero is zero」。硬體答案更謹慎：系統必須夠早知道哪些值是 zero，才能避免 fetch、route 或 multiply。它也必須在移除工作後仍讓 PEs 忙碌。如果 nonzeros 分布不規則，一個 PE 可能拿到很多 nonzeros，另一個 PE 卻沒事做。sparse representation 還需要 indices、run lengths、masks 或其他 metadata；metadata 本身會消耗 storage、bandwidth 與 control logic。
 
-本講開門見山地聲明範圍：今日聚焦於透過利用稀疏性（sparsity）——廣義上指重複出現的值，在大多數 DNN 場景中特指**重複出現的零**——來**減少儲存與運算所需的操作次數**。
+因此，這堂課把 sparsity 視為 co-design。model 決定 zeros 從哪裡來；hardware 決定那些 zeros 是否真的變成 savings。
 
-![今日講課目標——利用稀疏性降低資料搬移與運算](../../assets/L07/L07-p02-goals.png)
-
-張量中出現一個零，可帶來兩種截然不同的硬體收益：
-
-1. **降低資料搬移與儲存成本** —— 由於 `任何數 × 0 = 0` 以及 `任何數 + 0 = 任何數`，零值根本不需要從記憶體中取出，也不需要跨晶片上網路（Network-on-Chip, NoC）傳輸。省去讀取與通訊直接轉化為能耗節省——正如 L01 所建立的，DRAM 存取耗能約為算術運算的 200 倍。
-2. **減少運算次數** —— 當一個運算元為零時，乘加運算（MAC）可以完全繞過，同時省下運算時間與 ALU 本身的能耗。
-
-### 有效運算 vs. 無效運算
-
-本講引入了一套精確的核算框架：
-
-> **演算法總操作數** = 有效運算（effectual）+ 無效運算（ineffectual）
-
-**有效運算**是指會改變輸出結果的運算；**無效運算**（涉及零的運算）則不改變結果。充分利用稀疏性的硬體只需執行有效的部分。然而現實中：
-
-> **實際執行的操作數** = 有效運算 + *未被利用的*無效運算
-
-完全避免*所有*無效運算非常困難——硬體需要在執行時知道哪些輸入是零，繞過它們並維持有效吞吐量。這造成一個核心矛盾：更精密的稀疏性利用機制**能跳過更多運算，但每次運算的成本（面積、功耗、控制開銷）也隨之上升**。投影片 L07-7 與 L07-8 以圖形呈現這個取捨：吞吐量與能量效率同時取決於硬體複雜度與工作負載中實際的稀疏程度。正確的設計點因部署情境而異。
-
-> **為什麼重要：** 稀疏性並非免費——它創造了一個機會，而硬體必須被設計來捕捉它。理解有效／無效運算的區別，是設計或評估稀疏加速器的第一步。
+Source note：L07 slides 2-6 直接定義本堂課 goals、sparsity definition，以及 effectual/ineffectual operation framework。
 
 ---
 
-## 第二章 — 激活稀疏性：自然零值從哪裡來
+## 為什麼這堂課重要
 
-> *投影片：L07-9 … L07-23*
+Sparsity 是降低 DNN inference cost 的主要槓桿之一，但它橫跨 accelerator stack 的多層。
 
-### 稀疏性的來源
+- **Algorithm/model：**pruning 會改變 trained network，也可能改變 accuracy。
+- **Format：**compressed representations 決定 nonzeros 與 metadata 如何儲存。
+- **Mapping：**dataflow 決定 sparse values 在哪裡 reuse，以及 zero-skipping 發生在哪裡。
+- **Architecture：**PEs 需要 gating、skipping、intersection、buffering 或 load-balancing support。
+- **Evaluation：**正確 metric 可能是 energy、latency、storage、throughput、accuracy，或完整 tradeoff curve。
 
-本講識別出兩大類零值的起源：
-
-![稀疏性的來源——激活稀疏性（ReLU、相關性、圖結構）與權重稀疏性（重排、剪枝）](../../assets/L07/L07-p03-sources-of-sparsity.png)
-
-**激活稀疏性**（特徵圖／中間張量中的零）：
-- **ReLU 非線性函數** —— 最主要的來源：任何負的預激活值都被夾至零。
-- **輸入的空間與時間相關性** —— 特徵圖中鄰近像素高度相關；影片中相鄰幀高度相似。
-- **輸入表示的結構稀疏性** —— 例如圖（graph）的鄰接矩陣（adjacency matrix）通常非常稀疏。
-
-**權重稀疏性**（學到的參數中的零）：
-- **冗餘權重** —— 許多權重近乎相同，可在執行前合併（而不影響模型）。
-- **網路剪枝** —— 刻意移除對準確率影響很小的權重。
-
-### ReLU 與 AlexNet 的激活稀疏性
-
-標誌性的結果：在 **AlexNet** 上，所有五個卷積層在 ReLU 之後的輸出特徵圖中含有**約 75% 的零**。投影片第 10 頁的長條圖顯示，五個 CONV 層中非零激活值的比例從未超過約 25%。這意味著在樸素的稠密（dense）實作中，每四個激活值中有三個是零——它們所對應的所有乘法運算都是無效的。
-
-![ReLU 在 AlexNet 特徵圖中產生約 75% 的零](../../assets/L07/L07-p10-relu-activation-sparsity.png)
-
-### 硬體對激活稀疏性的因應
-
-本講調查了幾種利用激活零值的架構技術：
-
-- **壓縮（Compression）** —— 只儲存非零值及其索引或長度編碼，縮小儲存佔用與記憶體頻寬需求——意味著在記憶體階層的每一層可以保存更多有用資料。
-- **跳過零激活（Cnvlutin, ISCA 2016）** —— 建立在 DaDianNao 之上，避免取出並乘以零激活值，以 4.49% 的面積開銷實現 1.37 倍加速（加上激活值剪枝可達 1.52 倍）。
-- **激活值剪枝（Minerva, ISCA 2016）** —— 更進一步移除小但非零的激活值；在 ImageNet 上加速 11%，在 MNIST 上降低 2 倍功耗。
-- **SnaPEA（ISCA 2018）** —— 在完成卷積*之前*預測 ReLU 的輸出是否為零。若部分和已超過閾值表明結果為負，則跳過剩餘計算。需要額外硬體來決定何時安全終止。
-- **PredictiveNet / Song（ISCA 2018）** —— 簡化預測：只對每個權重的高位元進行計算；若高位元結果已為負，則跳過低位元計算。
-
-### 空間與時間相關性
-
-除了 ReLU，稀疏性還可從輸入的結構中提取：
-
-- **空間相關性（Diffy, MICRO 2018）** —— 特徵圖中相鄰激活值差異很小。對相鄰值之間的**差量（delta）**進行處理，而非完整值，可在差量表示中引入稀疏性。
-- **時間相關性** —— 連續影片幀大幅重疊。EVA2、Euphrates、FAST（均為 2018 年）等架構利用幀間冗餘跳過重複計算，代價是需要額外儲存和動態向量計算。此方法限於影片應用，並假設每幀執行相同操作。
-
-### 圖神經網路（GNN）：結構稀疏性
-
-圖神經網路（Graph Neural Network, GNN）在圖（分子、社群網路、生物網路、金融網路）上運算。圖的拓樸以**鄰接矩陣（adjacency matrix）**編碼，通常極度稀疏——大多數節點彼此並不相連。GNN 每層的運算為：
-
-> X_(l+1) = σ(Â · X_(l) · W_(l))
-
-其中 Â 為正規化鄰接矩陣（稀疏），X 為節點特徵矩陣（稠密），W 為權重矩陣（稠密）。兩個矩陣乘法的執行順序——`Â × (X × W)` 或 `(Â × X) × W`——對中間結果的有效密度有根本影響，進而決定稀疏性被利用的程度。
-
-> **為什麼重要：** CNN 中的激活稀疏性是結構性的——ReLU 保證了它的存在。在 AlexNet 等標準網路中，約 75% 的激活值為零。任何針對 CNN 推論的加速器都可以將這一事實納入設計規劃。GNN 與影片模型引入了額外的結構稀疏性，但硬體挑戰各有不同。
+這堂課是 L08-L10 的前置。L07 說明 sparsity 從哪裡來、引入哪些設計決策；後續 lectures 才會說 sparse accelerator mechanisms。
 
 ---
 
-## 第三章 — 權重稀疏性：對 DNN 模型進行剪枝
+## 先備知識與心智模型
 
-> *投影片：L07-24 … L07-51*
+你應該知道：
 
-### 冗餘權重與高斯技巧
+- ReLU：$\operatorname{ReLU}(x)=\max(0,x)$。
+- Dense MAC：例如 $z\leftarrow z+a\cdot w$ 的 multiply-accumulate。
+- Memory hierarchy：資料從越遠的 memory 搬動，通常 energy 越高。
+- Dataflow and partitioning：mapping 決定 values 住在哪裡、何時 reuse。
 
-在討論剪枝之前，本講指出有時可以在不損失準確率的情況下利用權重冗餘。若卷積核中有兩個相等的權重（例如 [A B A]），可以先對對應輸入求和，再乘以該權重，從而將 3 次乘法減少為 2 次。這是 **UCNN（ISCA 2018）** 的核心思想——對權重進行預處理以找出並利用此類冗餘。這個洞見是高斯乘法演算法（以加法換乘法）在 DNN 卷積上的推廣。
+心智模型：把 dense accelerator 想成一條會處理每個箱子的產線，即使箱子是空的也照樣搬、照樣檢查。Sparsity 問的是：空箱子能不能在消耗 conveyor bandwidth、storage、worker time 前被辨識出來？答案取決於 label system、routing system，以及剩下非空箱子分布是否均勻。
 
-### 剪枝管線
+---
 
-現代網路剪枝是一個四階段的迭代循環：
+## 學習目標
 
-![剪枝管線：評分 → 分組 → 排名 → 微調 → 排程](../../assets/L07/L07-p29-pruning-pipeline.png)
+讀完本章後，你應該能夠：
 
-**1. 評分（Scoring）** —— 為每個權重（或一組權重）賦予一個反映其對準確率或效率重要性的分數：
-- **基於量級的剪枝（Magnitude-based pruning）**（最常見）：分數即 |w|。大量級權重視為重要；小量級者為移除候選。典型結果：不重新訓練可達 50% 稀疏性，重新訓練後可達 80%【Han, NeurIPS 2015】。
-- **基於特徵的剪枝（Feature-based pruning）**：根據對輸出特徵圖的影響評分，而非權重量級【Yang, CVPR 2017】。
+- 定義 sparsity、density、effectual operation、ineffectual operation。
+- 區分 activation sparsity 與 weight sparsity。
+- 解釋 ReLU 為什麼創造自然 activation zeros。
+- 解釋 graph adjacency matrix 為什麼帶來 structural sparsity。
+- 描述 pruning loop：scoring、grouping、ranking、fine-tuning、scheduling。
+- 比較 magnitude-based、feature-based、energy-aware、platform-aware pruning objectives。
+- 解釋 unstructured sparsity 與 structured sparsity 的硬體 tradeoffs。
+- 解釋 MAC count 與 weight count 為什麼可能是 latency/energy 的差代理指標。
+- 說明 L08-L10 必須加入什麼機制，才能把 sparse workloads 變成硬體 speedups。
 
-**2. 分組（Grouping）** —— 決定移除的*粒度*：個別權重、整行（row）、整個通道（channel）或整個濾波器（filter）。這就是結構化／非結構化這個維度。
+---
 
-**3. 排名（Ranking）** —— 按分數對權重（或組）排序，選出低於閾值者進行移除。
+## 主要教材式敘事
 
-**4. 微調與排程（Fine-tuning & Scheduling）** —— 每次剪枝後，重新訓練存活的權重以恢復準確率。排程決定每次迭代的剪枝力度。一項重要改進：**拼接（splicing, Guo, NeurIPS 2016）** 允許已被剪掉的權重在梯度顯示其重要時被**恢復**，與不可逆剪枝相比，可將保持準確率所需的非零權重數量減少約一半。
+### 1. Sparsity 產生 effectual 與 ineffectual work
 
-經典演算法是**最優腦損傷（Optimal Brain Damage, LeCun, NeurIPS 1989）**：訓練 → 計算每個權重的二階導數 → 計算顯著性（saliency） → 刪除低顯著性權重 → 微調 → 重複。
+在這堂課中，sparsity 通常指 zeros。若一個 tensor 有 75% zeros，density 就是 25%，表示只有四分之一 entries 是 nonzero。
 
-### 能量感知評分
+硬體機會來自兩個 identity：
 
-關鍵洞見：**權重數量本身不是能量的好代理指標（proxy）**。一個權重的能量成本取決於*它在記憶體階層中的位置*以及*所使用的資料流（dataflow）*。在 65 nm 製程上，階層如下（L01 已建立）：
+$$
+a\times0=0,\qquad a+0=a.
+$$
 
-| 資料來源 | 相對能耗 |
-|---|---|
-| 暫存器檔（RF） | 1×（基準） |
-| 鄰近 PE（NoC） | 2× |
-| 全域緩衝區（Global Buffer） | 6× |
-| DRAM | 200× |
+如果一個 MAC 使用 zero activation 或 zero weight，multiply 可能產生 zero，add 也可能不改變 accumulator。投影片把有用的 operations 稱為 **effectual operations**，把 zero-related 的無效 operations 稱為 **ineffectual operations**：
 
-DRAM 中的權重存取成本是暫存器檔中的 200 倍。**能量感知剪枝（Energy-Aware Pruning, EAP, Yang, CVPR 2017）** 將此直接納入評分指標：優先剪枝消耗最多能量的層。
+$$
+\text{total operations}=\text{effectual operations}+\text{ineffectual operations}.
+$$
 
-![帶能量感知的評分——權重的能量成本取決於記憶體階層](../../assets/L07/L07-p32-energy-aware-scoring.png)
+但硬體實際執行通常是：
 
-成效顯著：EAP 將 AlexNet 的能耗降低 **3.7 倍**，而基於量級的剪枝僅降低 2.1 倍，EAP **額外改善了 1.7 倍**。投影片 L07-34 的 GoogLeNet 能耗分解揭示了 MAC 數為何具有誤導性：輸出特徵圖（43%）、輸入特徵圖（25%）、權重（22%）合計遠超運算（10%）的總能耗佔比。
+$$
+\text{actual operations}=\text{effectual operations}+\text{unexploited ineffectual operations}.
+$$
 
-### 平台感知適應：NetAdapt
+ineffectual operations 與 unexploited ineffectual operations 之間的差距，就是 sparse accelerator design space。理想 sparse machine 會跳過所有 ineffectual work；實際 sparse machine 只能跳過一部分，並為此付出 overhead。
 
-即使是能量，有時也不是正確的指標。**NetAdapt【Yang, ECCV 2018】** 揭示了更深層的觀點：相關指標是**在實際目標平台上經實測的裝置端延遲或能量**，而非分析估算。原因在於編譯器、執行時期（runtime）與硬體架構的交互作用，使 MAC 數成為真實延遲的糟糕預測指標。
+硬體意義：zero-skipping 只有在節省的 arithmetic 與 movement 大於 zero detection、metadata、data steering、load balancing 成本時才值得。
 
-NetAdapt 的演算法：
-1. 從預訓練網路出發。
-2. 每次迭代提出多個精簡網路（透過縮減各層的通道數或濾波器數）。
-3. 在目標平台上實測每個提案的延遲／能量。
-4. 在滿足資源預算的提案中，選擇準確率最高者。
-5. 微調所選網路，重複直到達到目標預算。
+Source note：effectual/ineffectual operation framework 直接來自 L07 slides 5-8。
 
-結果：NetAdapt 在 Google Pixel 1 CPU 上將 MobileNet 的真實推論速度提升最高 **1.7 倍**，準確率相當。關鍵在於：以 MAC 數（而非延遲）引導的 NetAdapt 版本在 MAC vs. 準確率上表現更好，但這並**不**代表更低的延遲。結論：**使用直接指標（direct metrics）**。
+### 2. Compression 省的不只是容量，也是 movement
 
-### 結構化 vs. 非結構化權重稀疏性
+Compression 只儲存 useful values，加上足以重建位置的 metadata。對 sparse tensors，這可能是 coordinate lists、compressed sparse rows、run-length encoding、masks 或 structured patterns。
 
-剪枝粒度的選擇——管線的**分組**維度——對硬體有深遠影響：
+compression format 必須 uniquely decodable。對 DNN inference，通常也要 lossless，因為改變 tensor values 可能影響 accuracy，除非近似本身就是 model design 的一部分。
 
-![剪枝粒度的連續譜：從個別權重（細粒度／非結構化）到整個濾波器（粗粒度／結構化）](../../assets/L07/L07-p42-structured-vs-unstructured.png)
+compression 的硬體意義不只是 capacity。如果 compressed activation tile 放得進 local buffer，但 dense tile 放不進去，accelerator 就可能避免 DRAM reads。storage win 會變成 data-movement win。
 
-從細到粗的連續譜：
+常見誤解：compression 本身保證 speedup。Compression 可以減少 bytes moved，但如果 compute engine 必須 decompress 成 dense stream 並照跑 dense MACs，operation count 不會下降。要 speedup，compute path 也必須 exploit sparse representation。
 
-| 粒度 | 移除什麼 | 硬體收益 | 準確率代價 |
+Source note：compression requirements 與 benefits 直接來自 L07 slide 11。
+
+### 3. Activation sparsity：資料與 nonlinearities 自然產生 zeros
+
+Activation sparsity 指 intermediate feature maps 裡的 zeros。L07 指出三個來源：ReLU、input correlations、sparse input structure。
+
+**ReLU：**如果 pre-activation 是負的，ReLU 輸出 zero。對小矩陣：
+
+$$
+\begin{bmatrix}
+9 & -1 & -3\\
+1 & -5 & 5\\
+-2 & 6 & -1
+\end{bmatrix},
+$$
+
+ReLU 會產生：
+
+$$
+\begin{bmatrix}
+9 & 0 & 0\\
+1 & 0 & 5\\
+0 & 6 & 0
+\end{bmatrix}.
+$$
+
+九個值中有五個是 zero。在 convolution layer 中，如果硬體能跳過，單一 zero activation 可能消除許多 weight multiplications。
+
+投影片報告 AlexNet convolutional output feature maps 經 ReLU 後，在顯示的 convolution layers 中約有 75% zeros。這是 L07 slide 10 的 slide-stated quantitative claim。
+
+**Spatial correlation：**image feature map 中相鄰 activations 往往相似。系統可以處理 full values 的 differences/deltas；若鄰近值很接近，delta representation 可能 sparse。這依賴 application 與 representation。
+
+**Temporal correlation：**連續 video frames 很相似。系統可以 reuse 前一 frame 的 computation 或處理 motion/delta information，但需要額外 storage 與找出 redundancy 的方法。這通常只適合相同 operation 在時間上反覆套用的情境。
+
+**Graph structure：**graph neural networks 使用 adjacency matrices。真實 graphs 通常不是 complete graph，所以 adjacency matrices 通常 sparse。layer 可寫為：
+
+$$
+X^{(\ell+1)}=\sigma(\hat{A}X^{(\ell)}W^{(\ell)}),
+$$
+
+其中 $\hat{A}$ 是 normalized sparse adjacency matrix，$X^{(\ell)}$ 是 dense node-feature matrix，$W^{(\ell)}$ 是 dense weight matrix。multiplication order 很重要：$(\hat{A}X)W$ 與 $\hat{A}(XW)$ 在結合律下數學結果相同，但 intermediate density 與 memory traffic 可以不同。
+
+硬體意義：activation sparsity 是 dynamic 的。zero pattern 會隨 input 改變。硬體需要 runtime detection，或使用攜帶 nonzero positions 的 format。
+
+Source note：ReLU、Cnvlutin、SnaPEA、PredictiveNet/Song、Diffy、temporal-correlation examples 與 GNN setup 依據 L07 slides 10-23。本 worker pass 中，architecture result numbers 只使用 slide deck 作為來源。
+
+### 4. Weight sparsity：由 model design 創造 zeros
+
+Weight sparsity 指 learned parameters 中的 zeros。不同於 activation sparsity，weight sparsity 可以在 training 後固定，因此較容易 offline 壓縮 weights，並依此規劃 mappings。
+
+投影片先指出，即使 pruning 之前，weights 也可能有 redundancy。若 filter 是 $[A,B,A]$、input 是 $[1,2,3]$，dense processing 會算：
+
+$$
+A\cdot1+B\cdot2+A\cdot3.
+$$
+
+因為 $A$ 出現兩次，可以改寫成：
+
+$$
+A(1+3)+B\cdot2.
+$$
+
+這把三次 multiplications 與三次 weight reads 降成兩次 multiplications 與兩次 weight reads，代價是多一次 addition，且進入 multiply 的值可能需要更寬 bitwidth。這個例子直接根據 L07 slide 26。
+
+這還不是 pruning，而是利用 repeated weights。Pruning 進一步把選定 weights 或 groups 設成 zero。
+
+### 5. Pruning pipeline
+
+Pruning pipeline 可拆成五個概念。
+
+**Scoring：**對 weight 或 group 指派分數。Magnitude-based pruning 使用 $|w|$。Feature-based pruning 估計對 output features 的影響。更進階方法可能使用 gradients、saliency、energy 或 measured latency。
+
+**Grouping：**決定 granularity。可以移除 individual weights、rows、channels、filters、blocks 或 patterns。
+
+**Ranking：**比較 scores 並選擇要移除的項目。
+
+**Fine-tuning：**更新 surviving weights 以恢復 accuracy。
+
+**Scheduling：**決定每次 iteration pruning 多激進。
+
+簡化 loop 是：
+
+```text
+train dense model
+repeat:
+    score weights or groups
+    remove the lowest-ranked weights or groups
+    fine-tune the remaining weights
+until target accuracy/energy/latency/storage budget is reached
+```
+
+早期經典方法 Optimal Brain Damage 使用 second-derivative saliency 估計刪除 weight 對 training error 的影響。投影片引用 LeCun, NeurIPS 1989 作為此歷史脈絡。
+
+Source note：pipeline 依據 L07 slides 27-30 與 46-48。Blalock et al., "What is the State of Neural Network Pruning?" Sections 2.1-2.4 支撐 pruning masks、高階 prune/fine-tune algorithm、structure/scoring/scheduling/fine-tuning categories，以及 evaluation metrics。
+
+### 6. Energy-aware 與 platform-aware pruning
+
+Magnitude-based pruning 問：「哪些 weights 看起來對 accuracy 最不重要？」Energy-aware pruning 問的是另一件事：「對這個 hardware 與 dataflow，移除哪些 weights 最能降低 energy？」
+
+這個差別重要，因為硬體上不是每個 weight 的成本都一樣。從 DRAM fetch 的 weight 遠比已在 register file 的 weight 昂貴。高 reuse layer 裡的 weight，也可能比低 reuse layer 裡的 weight 有不同 energy impact。
+
+L07 slide 32 給出 Yang, CVPR 2017 的 memory hierarchy energy table：ALU/RF 作為 $1\times$、NoC $2\times$、global buffer $6\times$、DRAM $200\times$。這些比例應視為 course example 的 slide-stated values，不是 universal constants。
+
+投影片報告 Energy-Aware Pruning 在 cited work 中讓 AlexNet energy 降低 $3.7\times$，並比 magnitude-based pruning 多 $1.7\times$ improvement。Source：L07 slide 35，citing Yang, CVPR 2017。
+
+Platform-aware pruning 更進一步。NetAdapt 直接在 target platform 上量測 latency 或 energy，而不是只依賴 MAC count。本講來源用這個例子說明，最佳化 MACs 不一定最佳化 real latency。Source：L07 slides 37-41，citing Yang, ECCV 2018。
+
+硬體意義：pruning objective 必須對齊 deployment objective。如果目標是 phone latency，就量 phone latency；如果目標是 accelerator energy，就用實際 mapping 與 memory hierarchy 去 model 或 measure accelerator energy。
+
+### 7. Structured vs. unstructured sparsity
+
+Grouping 是 model accuracy 與 hardware regularity 之間的橋。
+
+**Unstructured sparsity：**移除 individual weights。這給 model 最大彈性，在同 sparsity level 下通常較能保 accuracy，但 zero pattern 不規則。硬體需要 indices、intersection 或 sparse scheduling。
+
+**Structured sparsity：**移除 rows、channels、filters、blocks 或 fixed patterns。這對 dense SIMD、systolic、vector hardware 比較友善，因為剩下的 computation 形狀規則。代價是整組移除是較粗的 model change，accuracy 可能較早下降。
+
+granularity spectrum 可這樣讀：
+
+| Granularity | What disappears | Hardware effect | Model risk |
 |---|---|---|---|
-| **權重（非結構化）** | 個別純量權重 | 最大壓縮比 | 最小 |
-| **行剪枝（Row pruning）** | 權重矩陣的整行 | 部分向量化 | 中等 |
-| **通道剪枝（Channel pruning）** | 整個輸入通道 | 消除整批 MAC | 較高 |
-| **濾波器剪枝（Filter pruning）** | 整個輸出濾波器 | 剩餘稠密子矩陣 | 最高 |
+| Weight | individual scalar | irregularity 最高、彈性最大 | 較低 |
+| Row/block/pattern | 小型 regular group | 有部分 vector regularity | 中等 |
+| Channel | 完整 input channel | 移除重複 dense work | 較高 |
+| Filter | 完整 output channel/filter | 縮小 dense layer shape | 較高 |
 
-**非結構化稀疏性（unstructured sparsity）** 壓縮比最高、準確率損失最小，但產生的不規則零值模式難以在稠密硬體上利用。**結構化（粗粒度）稀疏性（structured/coarse-grained sparsity）** 產生可自然映射到 SIMD 單元、脈動陣列（systolic array）或其他並行資料路徑硬體的規則零值，代價是在給定稀疏度下準確率更高的損失。
+投影片引用 Scalpel 作為 matching SIMD organization 的 pruning，pattern-based pruning 作為 middle ground，mixture-of-experts 作為 dynamic coarse-grained sparsity。這些是 L07 slides 43-45 的 slide-stated examples。
 
-**Scalpel【Yu, ISCA 2017】** 透過使剪枝符合底層硬體的資料並行組織（data-parallel organization）來彌合這一差距。對於 2-way SIMD 單元，它確保零值成對出現，相比完全非結構化剪枝實現 1.92 倍加速。
+常見誤解：90% unstructured sparsity 的 model 一定比 50% structured sparsity 的 model 快。前者可能 compression 更好，但 hardware utilization 更差；後者可能能映射到 dense kernels，因此更快。
 
-**基於模式的剪枝（Pattern-based pruning）【PCONV, AAAI 2020；PatDNN, ASPLOS 2020】** 取中間路線：在每個濾波器內按一組小型結構化零值模式進行剪枝，比非結構化剪枝更具硬體規律性，比通道／濾波器剪枝的準確率損失更小。
+### 8. Pruning 與 layer type、starting architecture 互動
 
-**混合專家（Mixture of Experts, MoE）** 模型也可理解為一種粗粒度稀疏性：推論時，對任何給定輸入只啟動一小部分「專家」子網路，其餘保持閒置。
+Pruning 對不同 layers 的影響不一樣。以 AlexNet 為例，投影片報告 fully connected layers 的 weight reduction 大於 convolutional layers，且 MAC reduction 小於 weight reduction。Source：L07 slide 49，citing Han, NeurIPS 2015。
 
-### 剪枝與準確率：與模型效率的交互
+現代 efficient models 也更難 prune。MobileNet、EfficientNet 這類 model 原本就透過 architecture design 移除許多 redundancy，因此 pruning 可能更快造成 accuracy drop。投影片明確指出，modern efficient DNN models accuracy drops more quickly，且 unpruned efficient model 可以 outperform pruned inefficient model。Source：L07 slides 50-51，citing Hoefler JMLR 2021 and Blalock MLSys 2020。
 
-兩個重要的微妙之處為本章收尾：
+硬體意義：pruning 不是 architecture design 的替代品，而是更廣泛 model-hardware co-design loop 中的一個工具。
 
-![剪枝高效模型時準確率下降更快](../../assets/L07/L07-p50-pruning-accuracy-tradeoff.png)
+### 9. 為什麼需要 specialized hardware
 
-1. **高效模型更難剪枝。** 現代緊湊型模型（MobileNets、EfficientNets）在設計上已移除大部分冗餘。對它們進行剪枝比對 AlexNet 等過度參數化的舊模型剪枝，準確率下降更快。起始模型越優化，「免費壓縮」的空間越小。
+L07 結尾指出，practical DNN sparsity 常在 30-70% 量級，而 conventional sparse software libraries 多為更高 sparsity levels 設計。Source：L07 slide 52。
 
-2. **從更好的模型出發比剪枝差模型更重要。** 在相同的計算預算下，未剪枝的高效 DNN 模型可以勝過剪枝後的低效模型【Blalock, MLSys 2020】。言下之意：**架構搜索（architecture search）與剪枝是互補的策略，而非可互換的替代品**。
+這解釋為什麼需要後續 lectures。在 30-70% sparsity 下，zeros 多到值得在意，但還沒有多到 generic sparse libraries 必然勝出。硬體必須用低 overhead exploit moderate sparsity。
 
-![未剪枝的高效模型可優於剪枝後的低效模型](../../assets/L07/L07-p51-pruning-dnn-model.png)
+Specialized sparse hardware 可能需要：
 
-> **為什麼重要：** 剪枝是創造權重稀疏性的主要槓桿，但其設計空間廣闊——評分、分組、排程、微調與起始模型的選擇都相互影響。能量感知與平台感知方法（EAP、NetAdapt）系統性地優於單純基於量級的方法，因為它們從一開始就針對正確的目標優化。
-
----
-
-## 第四章 — 硬體的缺口與前行之路
-
-> *投影片：L07-52 … L07-53*
-
-### 本講的結論
-
-總結投影片凝結了 L07 的核心訊息：
-
-![總結——稀疏性的收益、典型稀疏度水準，以及對特化硬體的需求](../../assets/L07/L07-p52-summary.png)
-
-- 稀疏性可同時降低**運算次數、資料搬移量與儲存成本**。
-- **微調（fine-tuning）** 至關重要：它讓模型在移除權重後恢復準確率，並在不崩潰的情況下達到更高稀疏度。
-- 實際 DNN 的稀疏性在 **30–70%** 量級——雖然有意義，但遠低於現有稠密軟體庫（cuSPARSE、MKL-sparse）開始顯現收益的 >99% 閾值。現成軟體在這裡幫不上忙。
-- **粗粒度剪枝** 也可在不需要自訂稀疏硬體的情況下改善速度與儲存成本。
-- 直接以硬體指標（能量、延遲）為目標，比間接代理指標（運算次數、權重數量）產生更好的準確率 vs. 複雜度取捨。
-
-### 缺失的一塊：特化硬體
-
-L07 的最後訊息是一個前向指引：**利用 30–70% 的稀疏性需要特化硬體**。即使軟體知道零值的存在，稠密加速器也會在零乘法上浪費時鐘週期與能量。有效跳過這些零需要：
-
-- 在 PE 層級（或資料取出之前）偵測零運算元。
-- 允許非零值在無需零鄰居開銷的情況下儲存與讀取的壓縮格式。
-- 當某一輸入資料流比另一個更稠密時，防止 PE 閒置的負載平衡機制。
-
-這些正是 L08–L10 的主題。
-
-> **為什麼重要：** 沒有硬體支援，稀疏性只是理論上的收益。有了正確的硬體（接下來三講的主題），30–70% 的權重或激活稀疏性可直接轉化為近乎等比例的能耗與執行時間減少。
+- compressed storage formats，
+- fetch 前或 MAC 前 zero detection，
+- 避免無用 switching 的 gating，
+- metadata decode 與 address generation，
+- sparse intersection logic，
+- variable-rate nonzero streams 的 buffering，
+- PEs 之間 load balancing，
+- account for density 的 mapping strategies。
 
 ---
 
-## 獨立學習指南（Standalone Study Guide）
+## Worked Examples
 
-### 進入下一講前必須掌握
+### Example 1：effectual fraction
 
-- 分開理解 activation sparsity、weight sparsity 與 structured sparsity。
-- 說明 ReLU 為何自然產生 activation zeros，而 pruning 為何產生模型權重零值。
-- 描述剪枝流程：訓練、評分、剪枝、微調、評估。
-- 說明非結構化剪枝與結構化剪枝之間的 accuracy-hardware trade-off。
+假設 dot product 有 $8$ 個 weights 與 $8$ 個 activations。activation vector 在 positions 1、4、7 是 zero；weight vector 在 positions 2、7 是 zero。
 
-### 自我檢核問題
+只要任一 operand 是 zero，該 MAC 就是 ineffectual。受 zero 影響的位置是 $\{1,2,4,7\}$，所以 $8$ 個 MACs 中有 $4$ 個 ineffectual。effectual fraction 是 $4/8=50\%$。
 
-1. 為什麼 activation sparsity 會隨輸入資料變動，而 weight sparsity 可在訓練後固定？
-2. 剪掉一個值、一個 channel、一個 block 有什麼差異？
-3. 為什麼準確度最高的 sparse model 可能很難被硬體加速？
+硬體意義：dense PE 會跑完全部 $8$ 個 MACs。sparse PE 可能只跑 $4$ 個，但前提是能有效辨識與排程 nonzero pairs。
 
-### 練習
+### Example 2：metadata 可能壓過 tiny values
 
-1. 為一個 CNN layer 設計剪枝實驗：選 scoring rule、sparsity target 與 fine-tuning step。
-2. 從最佳化目標角度比較 magnitude pruning 與 energy-aware pruning。
-3. 給定一個目標 sparsity，判斷 unstructured、block、channel 或 N:M pruning 哪個最硬體友善。
+假設 length $16$ 的 sparse vector 有四個 nonzeros。每個 value 是 8 bits，每個 index 是 4 bits，compressed representation 需要 $4(8+4)=48$ bits。dense representation 需要 $16\cdot8=128$ bits。compression 有幫助。
 
-### 常見誤區
+如果 vector 有十二個 nonzeros，compressed storage 是 $12(8+4)=144$ bits，反而比 dense storage 差。這就是 sparse format choice 取決於 density 與 metadata cost 的原因。
 
-- 假設 sparsity 自動節省時間。只有硬體能 skip work 時才會省時間。
-- 比較 sparsity 百分比時沒有說明 granularity。
-- 忘記 pruning 會影響 accuracy，因此屬於 model-hardware co-design。
+### Example 3：pruning objective 會改變答案
+
+假設兩個 candidate weights 被 prune 後 accuracy loss 相同。$w_1$ 只從 local buffer fetch 一次；$w_2$ 因 mapping 缺少 reuse，會從 DRAM fetch 多次。若 $|w_1|\approx|w_2|$，magnitude pruning 可能把它們視為相近。energy-aware pruning 應優先移除 $w_2$，因為它節省更多 movement。
 
 ---
 
-## 關鍵詞彙（Key Terms）
+## Key Equations and How to Read Them
 
-| 詞彙 | 說明 |
-|---|---|
-| **稀疏性（Sparsity）** | 張量中為零（或低於某閾值）的值所占的比例。稀疏性越高，零越多。 |
-| **密度（Density）** | 稀疏性的互補量：*非零*值所占的比例。75% 稀疏的張量密度為 25%。 |
-| **激活稀疏性（Activation sparsity）** | 中間特徵圖中的零，主要由 ReLU 產生。 |
-| **權重稀疏性（Weight sparsity）** | 學習到的模型參數中的零，主要由剪枝製造。 |
-| **有效運算（Effectual operation）** | 改變輸出的乘加運算（兩個運算元均非零）。 |
-| **無效運算（Ineffectual operation）** | 至少一個運算元為零的乘加運算；結果恆為 0 或不變。 |
-| **剪枝（Pruning）** | 將模型權重設為零（或移除）以減少運算與儲存的過程。 |
-| **基於量級的剪枝（Magnitude-based pruning）** | 移除絕對值最小的權重；最常見的評分方法。 |
-| **能量感知剪枝（Energy-Aware Pruning, EAP）** | 將權重存取的能量成本（由其在記憶體階層中的位置決定）納入剪枝評分。 |
-| **顯著性（Saliency）** | 衡量移除一個權重對訓練誤差影響程度的指標（源自最優腦損傷）。 |
-| **微調（Fine-tuning）** | 剪枝後對存活權重進行重新訓練以恢復準確率。 |
-| **拼接（Splicing）** | 在微調過程中允許已被剪掉的權重在重新變得重要時被恢復。 |
-| **排程（Scheduling）** | 決定剪枝循環每次迭代中移除多少權重。 |
-| **非結構化稀疏性（Unstructured sparsity）** | 零值散布在任意位置（個別權重）。彈性最高，硬體最難利用。 |
-| **結構化稀疏性（Structured sparsity）** | 零值出現在規則模式中（整行、整個通道或整個濾波器）。硬體更容易利用，準確率代價更高。 |
-| **基於模式的剪枝（Pattern-based pruning）** | 折中方案：在濾波器內按一組小型結構化零值模式剪枝。 |
-| **NetAdapt** | 以實測延遲／能量引導剪枝的平台感知 DNN 適應演算法。 |
-| **Cnvlutin** | 跳過零激活值乘法的硬體架構（ISCA 2016）。 |
-| **SnaPEA** | 提前終止部分和計算（當 ReLU 輸出可預測為零時）的預測器（ISCA 2018）。 |
-| **混合專家（Mixture of Experts, MoE）** | 推論時對每個輸入只啟動部分「專家」子網路的模型架構；是一種動態粗粒度稀疏性。 |
-| **圖神經網路（GNN）** | 在稀疏鄰接矩陣上運算的神經網路，是結構稀疏性的一種形式。 |
+### Sparsity and density
 
----
+$$
+\text{sparsity}=\frac{\#\text{zeros}}{\#\text{total values}},\qquad
+\text{density}=1-\text{sparsity}.
+$$
 
-## 重點回顧（Takeaways）
+sparsity 告訴你 opportunity size；density 告訴你還剩多少 useful work。硬體成本還取決於 metadata 與 load balance。
 
-- DNN 張量含有大比例的零：**AlexNet 卷積激活值的約 75%** 在 ReLU 後為零；權重剪枝可在不顯著損失準確率的情況下創造 **50–80% 的權重稀疏性**。
-- 稀疏性帶來兩項硬體收益：**降低資料搬移／儲存**（跳過零值取出）與**減少運算**（跳過有零運算元的乘加）。
-- **有效／無效運算**框架精確定義了機會的大小：實際硬體僅能在複雜度預算允許的範圍內捕捉這部分機會。
-- **剪枝**是四階段迭代循環：**評分 → 分組 → 排名 → 微調**。排程控制每次迭代的剪枝力度。
-- **能量感知評分**（EAP）在 AlexNet 能耗上比基於量級的評分多改善 **1.7 倍**，因為它針對的是真實目標而非代理指標。
-- **MAC 數是真實延遲的糟糕代理**（NetAdapt）：始終在實際平台上量測。
-- **非結構化稀疏性**壓縮最多但硬體最難利用；**結構化稀疏性**以部分準確率換取硬體規律性。
-- 實際 DNN 稀疏性在 **30–70%** 量級——標準軟體庫無濟於事，**需要特化硬體**。
-- 從設計良好的高效模型出發，與剪枝同等重要：在相同計算預算下，未剪枝的高效模型可勝過剪枝後的低效模型。
+### Effectual operation accounting
+
+$$
+\text{actual operations}
+=\text{effectual operations}+\text{unexploited ineffectual operations}.
+$$
+
+sparse hardware 的目標是降低第二項，同時不要讓每個剩餘 operation 的 overhead 太高。
+
+### GNN layer
+
+$$
+X^{(\ell+1)}=\sigma(\hat{A}X^{(\ell)}W^{(\ell)}).
+$$
+
+$\hat{A}$ 是 sparse graph structure；$X^{(\ell)}$ 與 $W^{(\ell)}$ 通常 dense。mapping 必須決定早點還是晚點乘上 $\hat{A}$，因為 intermediate density 會影響 memory traffic。
+
+### Pruned model mask
+
+$$
+f(x;M\odot W)
+$$
+
+$M$ 是 binary mask，$W$ 是 weight tensor。若 $M_i=0$，weight $W_i$ 被 pruned。此 notation 依據 Blalock et al., Section 2.1。
 
 ---
 
-## 與後續講次的連結（Connections）
+## Hardware Implications
 
-- **L08–L10（稀疏架構，Sparse Architectures）：** 直接續集。L07 建立稀疏性的*來源與量級*；L08–L10 展示硬體（Eyeriss v2、SCNN、ExTensor 等）如何被設計來有效地偵測、壓縮並利用稀疏性。
-- **L01 關注點金字塔——Format 層：** 權重與激活稀疏性是 **Format（格式）** 層的體現。選擇使用稠密或壓縮表示、以及在何種粒度下使用，是 Format 層的決策，與其上下的 Mapping 層和 Architecture 層相互作用。
-- **L01 能耗階層：** 能量感知剪枝（EAP）與平台感知適應（NetAdapt）的全部動機，都可追溯到 L01 的洞見：DRAM 存取耗能約為 ALU 運算的 200 倍。跳過一次從 DRAM 取出的零值權重，節省的能量是被跳過的乘法的 200 倍。
-- **L05–L06（映射／切分，Mapping/Partitioning）：** EAP 中一個權重存取的能量成本取決於資料流（mapping）：不同的迴圈順序導致同一個權重從 DRAM、全域緩衝區或暫存器檔中讀取。忽略這一點的剪枝評分是次優的。
-- **L12（精度，Precision）：** 降低精度（量化，quantization）與稀疏性是互補的壓縮技術：兩者都減少了需要儲存和搬移的值的位元寬度與數量。許多量產加速器同時採用兩種技術。
+**Energy：**跳過 zero 可以省 compute energy 與 data movement energy，但 metadata 與 control 也會耗能。
+
+**Bandwidth：**compressed tensors 可以降低 bandwidth，但 irregular nonzero streams 可能造成 bursty 或難以 coalesce 的 accesses。
+
+**Latency：**skipping work 只有在 scheduler 避免 bubbles 與 load imbalance 時才會降低 latency。
+
+**Area：**sparse support 需要額外硬體：decoders、comparators、masks、queues、arbiters、intersection units。
+
+**Utilization：**random sparsity 可能讓 PEs 閒置，除非 work 被動態平衡。
+
+**Correctness：**pruning 可能改變 model outputs；activation skipping 必須保留 exact dense semantics，除非本來就設計為 approximate inference。
+
+**Programmability：**sparse mappings 較難指定，因為 format、mapping、architecture 互相影響。
 
 ---
 
-## 附錄 — 投影片對照表（Slide-to-Section Map）
+## Common Misconceptions
 
-| 投影片 | 章節 |
-|---|---|
-| L07-1 | 標題 |
-| L07-2 … L07-8 | 第一章 — 稀疏性帶來什麼（以及它的代價） |
-| L07-9 … L07-23 | 第二章 — 激活稀疏性：自然零值從哪裡來 |
-| L07-24 … L07-51 | 第三章 — 權重稀疏性：對 DNN 模型進行剪枝 |
-| L07-52 … L07-53 | 第四章 — 硬體的缺口與前行之路 |
+### 誤解：只要值是 zero，data movement 就會自動省下來。
+
+只有當 zeros 沒被 fetch，或 compressed storage 避免搬動 zeros，movement 才會省下來。如果 zeros 已用 dense format 從 DRAM fetch 到 PE 才丟掉，DRAM bandwidth 已經花掉了。
+
+### 誤解：sparsity 越高，execution 一定越快。
+
+高 sparsity 可能表示較少工作，但也可能帶來更多 irregularity、metadata overhead 與 load imbalance。granularity 很重要。
+
+### 誤解：weight count 是好的 energy metric。
+
+不同 weights 可能因 layer shape、reuse、dataflow 而造成不同 memory traffic。Energy-aware pruning 的存在就是因為 weight count alone 不夠。
+
+### 誤解：prune 一個 inefficient model 等同設計一個 efficient model。
+
+Pruning 可以幫忙，但從更好的 architecture 開始可能更重要。L07 明確指出 unpruned efficient model 可以 outperform pruned inefficient model。
+
+---
+
+## Connections to Previous and Later Lectures
+
+**L01-L03：**energy 與 memory hierarchy 解釋為什麼 skipping movement 可能比 skipping MACs 更重要。
+
+**L05-L06：**pruning energy 取決於 mapping；同一個 zero 在不同 dataflows 與 partitions 下，可能節省不同 memory levels。
+
+**L08-L10：**這些 lectures 會提供 exploit sparse weights 與 activations 的 accelerator mechanisms。
+
+**L12：**precision 與 sparsity 是互補 compression axes：一個降低 bits per value，另一個降低 represented values 的數量。
+
+**L13：**sparse workloads 的 data motion counting 必須計入 nonzeros、metadata，以及每個 memory level 的 movement。
+
+---
+
+## Paper Bridge: Computing's Energy Problem
+
+### Bibliographic identity
+
+- **Title:** "Computing's Energy Problem (and what we can do about it)"
+- **Author:** Mark Horowitz
+- **Year / venue:** ISSCC 2014
+- **Used in lecture(s):** 支撐 L01/L03 的 memory-energy themes，也支撐 L07 避免 data movement 的動機。
+
+### Problem addressed
+
+這篇 paper 解釋為什麼 energy，而不只是 transistor count 或 peak operations，成為 computing 的核心限制。它強調 memory movement 可能主導 energy。
+
+### Core idea
+
+energy-efficient systems 需要 locality 與 specialization。DRAM accesses 遠比 internal cache accesses 或 functional operations 昂貴，因此 algorithms 與 hardware 應最大化 reuse 並避免不必要 movement。
+
+### Relevance to this lecture
+
+Sparsity 吸引人的原因之一，是 zeros 不必被搬動。Horowitz 提供 energy context，解釋為什麼避免 DRAM fetch zero 可能比避免單一 arithmetic operation 更重要。
+
+### Key claims used in this chapter
+
+- DRAM access energy 約為 1-2 nJ，而 internal cache access 或 functional operation 約為 10 pJ。Source：Horowitz ISSCC 2014，Section 5 "Don't Forget the Memory Energy."
+- energy-efficient computation 需要強 locality 與 many operations per memory fetch。Source：Horowitz ISSCC 2014，Sections 5-6。
+
+### What students should remember
+
+- Sparse acceleration 不只是 arithmetic，也同樣關於 memory movement。
+- 從 DRAM fetch 的 zero 已經花掉 energy。
+- locality 與 format choices 決定 sparsity 是否成為真實硬體收益。
+
+### Limitations and assumptions
+
+數值 energy values 依 technology 與 system 而變。請把它們當成 scale intuition，不是 universal constants。
+
+### Suggested insertion points
+
+在 compression、energy-aware pruning，以及「太晚在 PE 才丟掉 zero 不如一開始就不要搬」的段落引用。
+
+---
+
+## Paper Bridge: What is the State of Neural Network Pruning?
+
+### Bibliographic identity
+
+- **Title:** "What is the State of Neural Network Pruning?"
+- **Authors:** Davis Blalock, Jose Javier Gonzalez Ortiz, Jonathan Frankle, John Guttag
+- **Year / venue:** MLSys 2020
+- **Used in lecture(s):** L07 pruning methodology 與 evaluation discipline。
+
+### Problem addressed
+
+這篇 paper 問：pruning literature 是否有可靠、可比較的證據說明哪些方法最好？它指出 dataset、architecture、metrics、baselines 不一致，使比較非常困難。
+
+### Core idea
+
+paper 把 pruning 表示為對 model 套用 binary mask，並從 structure、scoring、scheduling、fine-tuning、evaluation metrics 比較 pruning methods。它主張 standardized benchmarking，並提出 ShrinkBench。
+
+### Relevance to this lecture
+
+L07 教 pruning design space；Blalock et al. 說明為什麼這個 design space 必須嚴謹評估：parameter count、FLOPs、theoretical speedup、latency、accuracy 不能互相替換。
+
+### Key claims used in this chapter
+
+- pruned model 可表示為 $f(x;M\odot W')$，其中 $M$ 是 binary mask。Source：Blalock et al., Section 2.1。
+- 許多 pruning strategies 遵循 train、score/prune、fine-tune、iterate。Source：Algorithm 1 and Section 2.2。
+- methods 主要差異在 structure、scoring、scheduling、fine-tuning。Source：Section 2.3。
+- evaluation goals 不同；parameter count 與 FLOPs 是 latency、throughput、memory usage、power 的 loose proxies。Source：Section 2.4。
+- paper 指出 inconsistent metrics 與 benchmarking 是 pruning research 的重大問題。Source：abstract and Section 5.2。
+
+### What students should remember
+
+- Pruning 不是單一方法，而是一組 choices。
+- 永遠要問 pruning result 最佳化的是什麼 metric。
+- sparse model 應該以 accuracy-efficiency curve 評估，而不是 cherry-picked single point。
+- hardware-facing pruning 應盡可能報告 direct metrics。
+
+### Limitations and assumptions
+
+這篇 paper 是 pruning survey 與 benchmarking study，不是 sparse accelerator architecture paper。它支撐 pruning methodology 與 evaluation discipline，不支撐特定硬體機制。
+
+### Suggested insertion points
+
+在 pruning pipeline、direct-metrics discussion，以及 efficient architectures vs. pruned inefficient models 的警告中引用。
+
+---
+
+## 獨立學習指南
+
+### 如何讀這堂課
+
+1. 先掌握 effectual vs. ineffectual operations。
+2. 把 activation sparsity 與 weight sparsity 分開。
+3. 對每個 sparsity source 問：zero pattern 是否在 runtime 前已知？
+4. 對每個 pruning strategy 問：它最佳化哪個 metric？
+5. 對每個 sparse representation 估計 metadata 與 load-balance cost。
+
+### Self-check questions
+
+1. sparsity 與 density 差在哪裡？
+2. ReLU 為什麼創造 activation sparsity？
+3. 為什麼在 PE 才 skip zero，比一開始就不要 fetch zero 省得少？
+4. 為什麼只依 weight magnitude pruning 可能錯過 energy opportunities？
+5. unstructured sparsity 與 structured sparsity 差在哪裡？
+6. MAC count 與 latency 為什麼不能互換？
+7. 為什麼 L08-L10 需要 specialized hardware mechanisms？
+
+### Exercises
+
+1. **Conceptual：**用兩元素 dot product 解釋 effectual 與 ineffectual operations。
+2. **Small calculation：**一個 vector 有 64 entries、20 nonzeros、8-bit values、6-bit indices。比較 dense 與 coordinate-list storage。
+3. **Design tradeoff：**選一個 layer，判斷 weight pruning 或 activation skipping 哪個比較容易 exploit，並說明 assumptions。
+4. **Pruning pipeline：**替小型 MLP 設計 pruning loop，指定 scoring、grouping、ranking、fine-tuning、stopping criterion。
+5. **Paper-reading bridge：**根據 Blalock et al.，解釋為什麼只報 parameter reduction 會誤導。
+6. **Architecture reasoning：**設計一個 PE-level zero-skipping mechanism，列出一個 benefit 與一個 overhead。
+
+---
+
+## 關鍵詞彙
+
+### Sparsity（稀疏性）
+
+tensor values 中為 zero 或可被利用的 repeated values 的比例。本章通常指 zeros。
+
+### Density（密度）
+
+nonzero values 的比例。70% sparse tensor 有 30% density。
+
+### Effectual operation（有效操作）
+
+會改變 output 的 computation。對 MAC 來說，通常表示兩個 operands 都有意義。
+
+### Ineffectual operation（無效操作）
+
+涉及 zero 且不改變結果的 computation。sparse hardware 試圖跳過這些操作。
+
+### Activation sparsity（activation 稀疏性）
+
+intermediate activations 裡的 zeros。通常是 dynamic 且 input-dependent，尤其在 ReLU 後。
+
+### Weight sparsity（weight 稀疏性）
+
+model parameters 裡的 zeros。通常由 pruning 創造，且 inference 前通常已知。
+
+### Compression format（壓縮格式）
+
+儲存 nonzeros 與 metadata 的表示法。metadata 可能在 moderate density 下吃掉 savings。
+
+### Pruning（剪枝）
+
+移除 weights 或 groups of weights，通常透過 binary mask 並 fine-tune remaining model。
+
+### Scoring（評分）
+
+pruning 前對 weights 或 groups 指派重要性分數。
+
+### Grouping（分組）
+
+選擇 pruning granularity：individual weights、blocks、rows、channels、filters 或 patterns。
+
+### Ranking（排序）
+
+排序 scored weights/groups 以決定移除對象。
+
+### Fine-tuning（微調）
+
+pruning 後 retrain remaining weights 以恢復 accuracy。
+
+### Scheduling（排程）
+
+決定每次 iteration prune 多少 weights 或 groups。
+
+### Unstructured sparsity（非結構化稀疏）
+
+任意位置的 individual zeros。對 model 彈性高，對硬體困難。
+
+### Structured sparsity（結構化稀疏）
+
+zeros 以 regular groups 排列。對硬體較容易，對 accuracy 通常較限制。
+
+### Energy-aware pruning（能量感知剪枝）
+
+不只根據 weight magnitude 或 accuracy，也把移除項目的 energy impact 納入 scoring。
+
+### Platform-aware pruning（平台感知剪枝）
+
+使用 target platform 上的 latency 或 energy 等 direct measurements 來 pruning/adapt network。
+
+### Metadata（中繼資料）
+
+定位 nonzeros 所需的額外資訊，例如 indices、masks、run lengths。
+
+---
+
+## 重點回顧
+
+- Sparsity 提供節省 storage、data movement、computation 的可能。
+- Effectual/ineffectual accounting 區分數學機會與硬體實際跳過的工作。
+- Activation sparsity 通常 dynamic；weight sparsity 通常可在 training 後固定。
+- Pruning 是 scoring、grouping、ranking、fine-tuning、scheduling 的 pipeline。
+- 正確 pruning metric 取決於 deployment objective。
+- Unstructured sparsity 偏向 model flexibility；structured sparsity 偏向 hardware regularity。
+- moderate DNN sparsity 需要 specialized hardware support，才會可靠轉成 speedup 或 energy savings。
+
+---
+
+## 連結
+
+L07 透過 memory energy 連到 L01-L03，透過 mapping-dependent reuse 連到 L05-L06，透過 sparse accelerator mechanisms 連到 L08-L10，透過 precision/compression tradeoffs 連到 L12，並透過 explicit data-movement accounting 連到 L13。統一問題是：當一個 value 是 zero，stack 的哪一層能夠夠早知道，並避免成本？
+
+---
+
+## 附錄 - Slide-to-Section Map
+
+| Slide range | Chapter section | Notes |
+|---|---|---|
+| L07-1 | Title and metadata | Lecture identity |
+| L07-2-L07-8 | Sparsity 產生 effectual/ineffectual work | 擴充硬體 overhead 解釋 |
+| L07-9-L07-17 | Activation sparsity | ReLU、compression、activation skipping、correlation |
+| L07-18-L07-23 | Graph sparsity | GNN notation 與 operation-order discussion |
+| L07-24-L07-26 | Weight redundancy | Gauss/UCNN-style repeated-weight intuition |
+| L07-27-L07-31 | Pruning pipeline | Scoring 與 classic pruning |
+| L07-32-L07-41 | Energy/platform-aware pruning | 擴充 direct-metric reasoning |
+| L07-42-L07-45 | Structured vs. unstructured sparsity | 擴充 granularity tradeoff |
+| L07-46-L07-48 | Ranking, fine-tuning, scheduling | 整合進 pruning pipeline |
+| L07-49-L07-51 | Layer type 與 model architecture 互動 | 擴充 Blalock connection |
+| L07-52-L07-53 | Summary and readings | 用於 takeaways 與 paper bridge |
+
+---
+
+## Source Notes
+
+- 本章順序依據 `Lecture/L07 - Sparsity.pdf`。
+- effectual/ineffectual operation definitions、sparsity sources、ReLU/AlexNet activation sparsity、activation-sparsity architecture examples、GNN setup、pruning pipeline、energy-aware pruning examples、NetAdapt examples、structured-pruning examples、summary sparsity range 依據 L07 slides 2-53。
+- 約 75% AlexNet feature-map zeros、Cnvlutin speedup/area overhead、Minerva speed/power results、Energy-Aware Pruning energy improvements、NetAdapt latency improvements、Han pruning reductions、30-70% practical sparsity 等 quantitative claims 都是 L07 slide-stated claims；若要在本 companion 外重用，應回到原 papers 查證。
+- memory-energy motivation 使用 `papers/L07_ComputingsEnergyProblem_Horowitz_ISSCC2014.pdf`，尤其 Section 5。
+- pruning methodology 與 evaluation discipline 使用 `papers/L16_StateOfPruning_Blalock_MLSys2020.pdf`，尤其 Sections 2.1-2.4 與 5.2。
+- worked examples 是原創教學例子。
+
+## Uncertainty Notes
+
+- slides 引用的多個 architecture examples，包括 Cnvlutin、Minerva、SnaPEA、Diffy、UCNN、EAP、NetAdapt、Scalpel、PCONV、PatDNN，本 worker pass 未以 local PDFs 獨立核對。
+- 本章沒有刪除 `assets/L07` 既有 slide-derived assets；只是避免新增 copied figures。
+- 精確 sparse-hardware mechanisms 刻意留到 L08-L10。

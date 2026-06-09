@@ -16,6 +16,36 @@ Knowing *what* dataflow a DNN accelerator uses is not enough — you need to kno
 
 ---
 
+## What Problem This Lecture Solves
+
+Earlier mapping lectures taught qualitative dataflow labels: output-stationary keeps partial sums near the PE, weight-stationary keeps weights near the PE, row-stationary tries to balance several forms of reuse. Those labels are useful, but they are not enough to design hardware. A hardware architect eventually needs numbers:
+
+- How many input values enter L1?
+- How many weights are retained across tiles?
+- When can an output partial sum be evicted?
+- What is the minimum live set in a buffer?
+- How does a different loop order change bandwidth?
+
+The naive way to answer these questions is to simulate the loop nest and count accesses. That works for one small example, but it does not scale well to design-space exploration. Lecture 13 instead teaches a symbolic method: express computation, data access, schedule, fill, and eviction as integer sets and relations. Then memory traffic becomes set algebra.
+
+## Why This Lecture Matters
+
+Data movement is the main cost theme of the course, but "data movement" is easy to say and hard to count. This lecture gives the missing quantitative layer. Once you can write the iteration space, projection maps, and timestamp map, you can ask "what moves?" without relying on vague stationarity labels.
+
+This matters because buffer capacity and bandwidth are architectural contracts. If the L1 buffer must hold \(S\) weights plus \(S\) sliding-window inputs plus one output accumulator, the PE design, SRAM banking, NoC pressure, and compiler schedule must all respect that live set. A wrong data-motion estimate can make a design look efficient on paper and then fail timing, bandwidth, or energy targets.
+
+## Prerequisites and Mental Model
+
+You need three pieces from earlier lectures:
+
+1. **Einsum / loop-nest thinking:** every DNN layer can be described as a set of loop indices and tensor accesses.
+2. **Dataflow thinking:** a mapping chooses which loop dimensions are temporal, which are spatial, and which data are reused at each level.
+3. **Memory-hierarchy thinking:** an access at RF, L1, global buffer, and DRAM has different cost.
+
+The mental model for this lecture is a calendar. The iteration space says which work appointments exist. Projection maps say which data each appointment needs. The timestamp map places each appointment on the calendar. Delta and shrink compare neighboring calendar slots to decide what must enter or leave the room.
+
+---
+
 ## Learning Objectives
 
 After this lecture you should be able to:
@@ -34,8 +64,6 @@ After this lecture you should be able to:
 
 The lecture grounds every abstraction in a single concrete computation: **1-D convolution**, one of the simplest DNN-kernel primitives.
 
-![Title slide — Calculating Data Motion, March 18 2026](../../assets/L13/L13-p01-title.png)
-
 The operation is:
 
 ```
@@ -50,9 +78,7 @@ for q in [0, Q):
         o[q] += i[q + s] * f[s]
 ```
 
-![1-D convolution — output-stationary traversal, Q × S iteration space](../../assets/L13/L13-p02-output-stationary-1d-conv.png)
-
-The slide labels this traversal **Output Stationary (OS)**: the inner loop iterates over `s` while the outer loop walks `q`, so each output accumulates all its partial sums before the schedule moves on. This is the *reference mapping* against which all subsequent analysis is performed.
+The lecture source labels this traversal **Output Stationary (OS)**: the inner loop iterates over `s` while the outer loop walks `q`, so each output accumulates all its partial sums before the schedule moves on. This is the *reference mapping* against which all subsequent analysis is performed.
 
 > **Why it matters:** 1-D convolution is simple enough to trace by hand, yet it contains all the structure of a full DNN kernel — inputs, weights, outputs, a reduction dimension, and reuse of data. Every formula derived here applies directly to 2-D convolution and other Einsums.
 
@@ -76,8 +102,6 @@ The **iteration space** for 1-D convolution is the Cartesian product Q × S — 
 ispace = isl.Set('{ IterationSpace[q, s] : 0 <= q < Q and 0 <= s < S }')
 ```
 
-![Iteration space of 1-D convolution — Q × S grid, one point per MAC](../../assets/L13/L13-p14-iteration-space.png)
-
 The iteration space is purely a combinatorial object; it carries no notion of time or memory location. Those concepts are introduced by the *projection* and *timestamp* maps.
 
 ### Projection Maps
@@ -85,8 +109,6 @@ The iteration space is purely a combinatorial object; it carries no notion of ti
 An ISL **map** is a relation `Domain[...] -> Range[...]` constrained by affine equalities. Three projection maps link iteration-space points to data elements:
 
 - **Weight projection** (`is2weight`): `IterationSpace[q, s] -> Weight[s]` — every point in the same `s`-column maps to the same weight.
-
-![Weight projection — many-to-one: all q values at a given s share the same weight](../../assets/L13/L13-p21-weight-projection-manytoone.png)
 
   This many-to-one relationship is exactly what weight-stationarity exploits: the weight `F[s]` is *reused* across all `q` positions.
 
@@ -119,8 +141,6 @@ The timestamp is a two-component tuple `(t1, t0)` with `t1` being the slower (ou
 df_ts2is = df_is2ts.reverse()
 ```
 
-![Iteration space traversal visualized — output-stationary loop order q (slow), s (fast)](../../assets/L13/L13-p25-iteration-space-traversal.png)
-
 ### Composing Maps to Reach Data
 
 By composing maps through `apply_range`, the timestamp can be connected directly to any data element:
@@ -142,8 +162,6 @@ These composed maps answer: *"At time step (t1, t0), which weight / input / outp
 > *Slides: L13-35 … L13-43*
 
 With every time step mapped to a data element, the lecture introduces the core recipe for **calculating data movement**.
-
-![Calculating data movement — the five-step recipe](../../assets/L13/L13-p35-calculating-data-movement.png)
 
 The recipe is:
 
@@ -192,8 +210,6 @@ These deltas represent the data movement at the *finest* granularity — what wo
 
 In a real accelerator, data is staged in an **L1 (on-chip) buffer**, not transferred one element per MAC. The lecture shows how to lift the per-timestep analysis to the **tile level** using a straightforward timestamp-tiling map.
 
-![L1 buffering recipe — four steps to compute tile-level data movement](../../assets/L13/L13-p44-l1-buffering-recipe.png)
-
 ### Tiling the Timestamps
 
 Group fine-grained timestamps into L1 tiles by projecting out the fast dimension:
@@ -229,8 +245,6 @@ Tile 2 loads: Input[4]                        (1 new)
 
 Each successive tile only needs one new input element, reflecting the unit stride of the 1-D convolution. This is a classic result: the input reuse pattern of a sliding-window convolution is exactly one new element per output position.
 
-![L1 input deltas — the sliding-window pattern (one new input per tile)](../../assets/L13/L13-p54-l1-input-deltas-sliding-window.png)
-
 For **outputs**: each tile writes exactly one new output accumulator (the one for the current `q`), draining it as a complete partial sum, yielding Q delta entries total.
 
 > **Why it matters:** The tile-level delta is what a hardware designer actually uses to size the L1 buffer and estimate the bandwidth required between the L1 buffer and the global buffer (or DRAM). Identifying the sliding-window pattern in inputs, for instance, immediately suggests a *line buffer* micro-architecture.
@@ -264,11 +278,126 @@ ws_schedule = isl.Map('{ IterationSpace[q, s] -> Timestamp[t1, t0] : t1 = s and 
 
 The outer loop now walks `s` (slow) and the inner loop walks `q` (fast). Running the same delta pipeline through this new timestamp map produces a completely different data-movement profile: under WS, weights are stationary (zero delta after tile 0), while inputs must be loaded afresh for each `s`-tile, and outputs accumulate partial sums across all tiles, resulting in Q × (S − 1) partial-sum read-back events.
 
-![Changing schedule: OS (outer q, inner s) vs. WS (outer s, inner q)](../../assets/L13/L13-p65-os-vs-ws-schedule.png)
-
 This closing comparison makes the payoff of the whole lecture concrete: **the formal ISL framework lets you mechanically compute and compare the data-movement cost of any two dataflows** without building hardware — exactly the kind of analysis that drives the Mapping layer of the TeAAL Pyramid of Concerns.
 
 > **Why it matters:** Dataflow selection is one of the highest-leverage decisions in accelerator design. The ISL method turns that decision from intuition into arithmetic: you write down the timestamp map, run the delta pipeline, and read off the memory traffic figures. This is the foundation of automated design-space exploration tools.
+
+---
+
+## Worked Examples
+
+### Example 1: Enumerating the OS Schedule
+
+Let \(Q = 3\) and \(S = 2\). The iteration space contains six MACs:
+
+\[
+(q,s) \in \{(0,0),(0,1),(1,0),(1,1),(2,0),(2,1)\}.
+\]
+
+For the output-stationary schedule, \(t_1=q\) and \(t_0=s\). The timestamp order is therefore \((0,0)\), \((0,1)\), \((1,0)\), \((1,1)\), \((2,0)\), \((2,1)\). The output projection maps the first two points to \(O[0]\), the next two to \(O[1]\), and the final two to \(O[2]\). The output fill delta is nonzero only at \((0,0)\), \((1,0)\), and \((2,0)\), because the second MAC for each output reuses the same accumulator.
+
+Hardware meaning: OS reduces partial-sum traffic at the lowest level because the accumulator remains live across the reduction loop.
+
+### Example 2: L1 Input Sliding Window
+
+Let \(Q = 5\) and \(S = 3\), matching the lecture's small convolution. Under OS tiling, one L1 tile corresponds to all \(s\) values for a fixed \(q\). Tile 0 needs inputs \(\{I[0], I[1], I[2]\}\). Tile 1 needs \(\{I[1], I[2], I[3]\}\). The delta is only \(\{I[3]\}\), because \(I[1]\) and \(I[2]\) are already live. The pattern continues: after the initial \(S\) inputs, each tile needs one new input for stride 1.
+
+Hardware meaning: this is exactly the reason line buffers work for convolution. The symbolic delta calculation rediscovers the sliding-window microarchitecture.
+
+### Example 3: Fill and Shrink Determine Capacity
+
+For \(Q = 5, S = 3\), the OS L1 input live set stays at size 3 after warmup: \(\{I[q], I[q+1], I[q+2]\}\). Fill adds \(I[q+2]\) when the window advances; shrink removes \(I[q-1]\) once it is no longer needed. The maximum live input set is therefore 3 elements, not the full \(Q+S-1 = 7\) input tensor.
+
+Hardware meaning: bandwidth and capacity are different questions. Delta counts new arrivals; shrink plus carry-over determines live capacity.
+
+---
+
+## Key Equations and How to Read Them
+
+- Iteration space: \(\mathcal{I} = \{(q,s) : 0 \le q < Q,\ 0 \le s < S\}\). This is the set of MACs, not the set of data elements.
+- Projections: \(P_W(q,s)=s\), \(P_O(q,s)=q\), and \(P_I(q,s)=q+s\). These maps define reuse: many iteration points can refer to the same data element.
+- Output-stationary schedule: \(T_{\mathrm{OS}}(q,s)=(q,s)\). The output index changes slowly; the reduction index changes quickly.
+- Weight-stationary schedule: \(T_{\mathrm{WS}}(q,s)=(s,q)\). The weight index changes slowly; the output index changes quickly.
+- Fill delta at time \(t\): \(D_{\mathrm{fill}}(t)=A(t)-A(t-1)\), where \(A(t)\) is the set of data elements accessed at time \(t\). In ISL this is implemented as a set/map difference between current and previous accesses.
+- Shrink at time \(t\): \(D_{\mathrm{shrink}}(t)=A(t)-A(t+1)\). Fill asks what must enter; shrink asks what can leave.
+
+These equations are teaching notation for the ISL relations shown in the slides. ISL's exact syntax matters when implementing the calculation, but the mathematical idea is relation composition plus set difference.
+
+---
+
+## Hardware Implications
+
+- **Bandwidth:** Fill deltas count new values crossing a boundary. Summing them gives bandwidth demand for that memory level.
+- **Capacity:** Live sets derived from fill/shrink determine the minimum buffer size. Capacity can be small even when total traffic is large, and vice versa.
+- **Latency hiding:** If a tile's next fill set is known symbolically, a compiler or DMA engine can prefetch it.
+- **SRAM banking:** The schedule determines whether accesses are sequential, strided, or repeated. That affects bank conflicts and port requirements.
+- **NoC traffic:** Projection maps reveal multicast opportunities. If many iterations share a weight or input, the interconnect may broadcast instead of issuing independent reads.
+- **Correctness:** Shrink is a correctness question as well as an optimization question. Evicting a value before its last use changes the computation or forces a costly reload.
+- **Design-space exploration:** Changing only the timestamp map lets a tool compare OS, WS, and other schedules while keeping the same mathematical layer.
+
+---
+
+## Common Misconceptions
+
+### Misconception: The iteration space already tells you data movement.
+
+The iteration space tells you how many MACs exist. Data movement depends on projection maps, schedule order, and buffer tiling. Two schedules can have identical MAC count and very different traffic.
+
+### Misconception: A stationary dataflow means zero movement for that tensor.
+
+Stationary means the mapping tries to retain that tensor at a chosen level. It may still need an initial fill, final eviction, reloads across tiles, or movement at other hierarchy levels.
+
+### Misconception: Delta is the same as total access count.
+
+Delta counts **new** data relative to a previous time or tile. A value may be accessed many times while live, but not refetched across the modeled boundary.
+
+### Misconception: Shrink is optional bookkeeping.
+
+Without shrink, you can count fills but cannot size the buffer. Shrink tells when a value is dead and therefore when storage can be reused.
+
+---
+
+## Paper Bridge: TETRIS
+
+### Bibliographic identity
+
+- Title: *TETRIS: Scalable and Efficient Neural Network Acceleration with 3D Memory*
+- Authors: Mingyu Gao, Jing Pu, Xuan Yang, Mark Horowitz, and Christos Kozyrakis
+- Year / venue: ASPLOS 2017
+- Used in this lecture: as a system-level example of why analytical scheduling and data-motion accounting matter.
+
+### Problem addressed
+
+TETRIS addresses the memory-system bottleneck that appears when NN accelerators scale to larger PE arrays and larger networks. More compute is not useful if buffers, DRAM bandwidth, and interconnect traffic cannot feed it efficiently.
+
+### Core idea
+
+The paper uses 3D memory to rebalance accelerator area between compute and buffers, move some accumulation near memory, and derive dataflow schedules analytically rather than by exhaustive search. The key connection to L13 is that scheduling and data movement are treated as quantities to be modeled, not merely architectural intuition.
+
+### Relevance to this lecture
+
+Lecture 13 teaches the mechanics behind this kind of analytical data-motion reasoning. TETRIS shows why the mechanics matter in a full accelerator: memory hierarchy, bypassing, accumulation location, and partitioning all depend on knowing which data move where.
+
+### Key claims used in this chapter
+
+- Abstract and Section 1 state that scaling NN accelerators worsens on-chip SRAM and off-chip DRAM overheads, making the memory system a bottleneck.
+- Sections 3.2 and 3.3 argue that 3D memory changes the PE/buffer balance and enables in-memory accumulation to reduce memory traffic.
+- Section 4 develops software scheduling and partitioning techniques; it includes analytical scheduling choices rather than only exhaustive search.
+- Section 6 reports that TETRIS improves performance and energy relative to conventional 2D DRAM accelerator baselines under the paper's assumptions.
+
+### What students should remember
+
+- Data-motion accounting is not a classroom exercise; it determines area allocation, buffer bypass, and partitioning in real accelerator proposals.
+- A different memory technology changes the cost model, so the optimal schedule can change.
+- Analytical scheduling is valuable because exhaustive search over every mapping and partitioning choice becomes expensive quickly.
+
+### Limitations and assumptions
+
+TETRIS studies a 3D-memory accelerator design space, not the exact ISL recipe shown in L13. Use it as a system-level bridge for analytical scheduling and memory traffic, not as proof that every accelerator should use 3D memory.
+
+### Suggested insertion points
+
+Use this paper after Chapter 5's L1-buffering recipe and Chapter 6's OS-vs-WS comparison, where the lecture moves from hand calculation toward automated mapping tools.
 
 ---
 
@@ -363,3 +492,17 @@ This is the final lecture of 6.5930/1. It completes the arc that L01 initiated:
 | L13-57 … L13-64 | Ch.6 — Shrink calculation for weights, inputs, outputs |
 | L13-65 | Ch.6 — Comparing OS vs. WS by swapping the timestamp map |
 | L13-66 | Closing |
+
+## Source Notes
+
+- The lecture ordering, 1-D convolution example, ISL set/map syntax, timestamp construction, delta recipe, L1 tiling recipe, shrink recipe, and OS-vs-WS comparison follow `Lecture/L13-Calculating_Motion.pdf`.
+- The OS loop nest and projections are slide-derived from L13-2 and L13-19 through L13-24.
+- The delta/fill explanation is based on L13-35 through L13-43; the L1 tile-level explanation is based on L13-44 through L13-56; shrink is based on L13-57 through L13-64.
+- The TETRIS paper bridge is based on Gao et al., *TETRIS: Scalable and Efficient Neural Network Acceleration with 3D Memory*, ASPLOS 2017, especially the Abstract, Sections 1, 3, 4, and 6.
+- The small OS enumeration, sliding-window live-set, and capacity examples are original teaching examples constructed from the lecture's 1-D convolution setup.
+
+## Uncertainty Notes
+
+- The local file `papers/L13_Buffets_Pellauer_ASPLOS2019.pdf` appears to contain a Douglas-Rachford / ADMM optimization paper, not the Buffets paper indicated by the filename. This chapter therefore does not cite it as a source.
+- The chapter presents ISL operations pedagogically. Exact implementation details may differ depending on the ISL Python binding version and helper functions used in a local notebook.
+- The live lecture may have emphasized tool implementation details that are not visible in the slide PDF; this walkthrough reconstructs the likely narration from the slides and available local papers.

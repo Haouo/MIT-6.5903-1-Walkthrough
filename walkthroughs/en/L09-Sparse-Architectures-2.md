@@ -1,406 +1,688 @@
 # L09 — Sparse Architectures, Part 2
 
 > **Course:** 6.5930/1 — Hardware Architectures for Deep Learning
-> **Instructors:** Joel Emer & Vivienne Sze (MIT EECS)
-> **Lecture date:** March 4, 2026 · **Slides:** 138 · **Source:** [`Lecture/L09-Sparse_Architectures-2.pdf`](../../Lecture/L09-Sparse_Architectures-2.pdf)
->
-> *This is a conceptual walkthrough that reconstructs the lecture's narrative from the slides. It is organized by idea, not slide-by-slide. The deck is animation-heavy — many slides are intermediate build states of the same figure; each section below cites the slide range it synthesizes and shows the most-complete version of each diagram.*
+> **Instructors:** Joel Emer and Vivienne Sze
+> **Lecture date:** March 4, 2026
+> **Primary source:** [`Lecture/L09-Sparse_Architectures-2.pdf`](../../Lecture/L09-Sparse_Architectures-2.pdf)
+
+This chapter reconstructs the lecture narration from the public slides and local papers. The original deck is animation-heavy; this walkthrough collapses repeated build slides into self-contained explanations.
 
 ---
 
 ## TL;DR
 
-Sparsity is pervasive in real DNN workloads, but extracting the resulting speedup and energy savings requires two things working together: a **compressed tensor representation** that skips over zeros in storage, and **hardware that can traverse and intersect those representations efficiently**. This lecture builds the entire formal vocabulary for doing so — fibertrees, fiber representations (uncompressed, coordinate/payload list, CSR/CSC), concordant vs. discordant traversal, coordinate projection, and fiber intersection — then applies that vocabulary to a progression of increasingly sophisticated sparse-CONV loop nests (output-stationary, weight-stationary, input-stationary, and two-sparse combined), culminating in three real accelerators: **Cambricon-X**, **SCNN**, and **ISOSceles**.
+Lecture 08 introduced the sparse hardware vocabulary: gating, skipping, format, metadata, and structured sparsity. Lecture 09 turns that vocabulary into a working method for designing sparse convolution accelerators.
 
----
+The main idea is the **fibertree abstraction**. A tensor is represented as ranks, fibers, coordinates, and payloads. Once we view sparse tensors this way, sparse acceleration becomes a question of which fiber operation is cheap:
+
+- `getNext()` is cheap when traversal is **concordant**, meaning the loop order matches the storage order.
+- `getPayload(coordinate)` can be expensive in compressed formats because it is random access.
+- **Projection** maps coordinates between tensors, e.g., \(w=q+s\) in convolution.
+- **Intersection** keeps only coordinates that are present in both sparse operands.
+
+The lecture then applies these primitives to sparse convolution: sparse weights, sparse inputs, and both operands sparse. It closes with SCNN and ISOSceles, showing two very different ways to exploit the same mathematical sparsity.
+
+## What Problem This Lecture Solves
+
+Lecture 08 showed that skipping requires knowing where the nonzeros are. Lecture 09 asks the next question: once a tensor is compressed, how does the hardware traverse it while still computing the correct DNN operation?
+
+The problem is not simply "store sparse tensors." The problem is:
+
+1. Represent sparse tensors in a way that exposes coordinates.
+2. Match loop order to representation order.
+3. Use coordinate projection to connect convolution operands.
+4. Use intersection when multiple operands are sparse.
+5. Choose a dataflow that balances reuse, skipping, routing, and utilization.
+
+This is the bridge from sparse format design to sparse accelerator microarchitecture.
+
+## Why This Lecture Matters
+
+In dense convolution, changing loop order mainly changes reuse. In sparse convolution, changing loop order can change whether the inner loop is a cheap iterator or a random metadata lookup. That is a much sharper constraint.
+
+For example, a coordinate/payload list is excellent when the loop says "visit the next stored nonzero." It is much less convenient when the loop says "tell me whether coordinate 137 exists." This is why sparse architecture design needs a formal vocabulary for traversal.
+
+Hardware implications include:
+
+- **Bandwidth:** compressed formats read fewer values only when traversal is concordant.
+- **Latency:** skipping is possible only if the next useful coordinate can be produced quickly.
+- **Area:** coordinate generators, position generators, intersection units, and scatter networks become first-class hardware blocks.
+- **Utilization:** sparse work is irregular; splitting by position can balance work but may destroy geometric regularity.
+- **Correctness:** projection such as \(w=q+s\) and \(q=w-s\) must route products to the right output coordinate.
+
+## Prerequisites and Mental Model
+
+You should remember:
+
+- Lecture 08's distinction among gating, skipping, and format.
+- 1-D convolution: \(O[q] = \sum_s I[q+s]F[s]\).
+- Tensor ranks and coordinates from the earlier Einsum lectures.
+- Dataflow: which loop is stationary, which loop streams, and which loop is parallelized.
+
+Mental model:
+
+> Sparse convolution is dense convolution plus explicit coordinate bookkeeping.
+
+The MAC is still simple. The difficult part is producing the right pairs of nonzero payloads and sending each product to the correct partial sum.
 
 ## Learning Objectives
 
-After this lecture you should be able to:
+After this lecture, you should be able to:
 
-- Define the **fibertree abstraction** and explain how ranks, fibers, coordinates, and payloads represent any tensor — dense or sparse.
-- Name the principal **fiber representations** (uncompressed array, coordinate/payload list, bitmask, CSR, CSC, COO) and state the time complexity of `getPayload()` and `getNext()` for each.
-- Distinguish **concordant** (stride-aligned) from **discordant** (random-access) traversal and explain why discordant traversal is expensive.
-- Write loop nests for **output-stationary, weight-stationary, and input-stationary** convolutions that exploit weight sparsity, input sparsity, and both simultaneously.
-- Explain **coordinate projection** and **fiber intersection** as the two key primitives for combining sparse operands.
-- Describe the hardware dataflow and microarchitecture of **Cambricon-X**, **SCNN**, and **ISOSceles**, and state the sparsity they exploit and the PE utilization gains they achieve.
+- Define rank, coordinate, point, fiber, payload, and fibertree.
+- Explain the difference between coordinate and position.
+- Compare uncompressed arrays, coordinate/payload lists, bitmasks, RLE, hash tables, CSR, CSC, and COO.
+- Explain `getPayload()` and `getNext()` and why their costs differ by representation.
+- Distinguish concordant, partially discordant, and discordant traversal.
+- Use \(w=q+s\), \(q=w-s\), and \(s=w-q\) as coordinate projections in 1-D convolution.
+- Write loop nests for sparse weights, sparse inputs, and two-sparse convolution.
+- Explain how Cnvlutin exploits activation sparsity.
+- Explain how SCNN uses input-stationary Cartesian-product sparse multiplication and why it needs scatter.
+- Explain what ISOSceles tries to solve with an IS-OS pipeline and rank swizzling.
 
----
+## Main Textbook-Style Narrative
 
-## Chapter 1 — Why Sparsity, and the Fibertree Abstraction
+### 1. Sparse tensors need a representation-independent abstraction
 
-> *Slides: L09-1 … L09-17*
+The lecture begins with a simple tensor vocabulary:
 
-### Sparsity is everywhere
+- A **rank** is a tensor dimension.
+- A **coordinate** is an index along a rank.
+- A **point** is a tuple of coordinates, one per rank.
+- A **payload** is either a scalar value or a pointer/reference to a lower-rank fiber.
+- A **fiber** is an ordered set of coordinate/payload pairs at one rank.
+- A **fibertree** is a tree whose levels are ranks and whose edges carry fibers.
 
-Real DNN tensors are far from dense. The opening slide (from the ExTensor paper, MICRO 2019) shows a representative cross-section of problems — natural-language processing, graph analytics, recommendation systems, scientific simulation, and image classification — all of which consume **sparse tensors** as their primary input or intermediate state.
+For a dense \(3 \times 3\) matrix, every row and every column coordinate exists. For a sparse matrix, all-zero subtrees can be omitted. A point such as \((2,1)\) is found by asking the H-rank fiber for coordinate 2, then asking the W-rank child fiber for coordinate 1.
 
-![Sparse tensors appear across many problem domains](../../assets/L09/L09-p02-sparse-motivation.png)
+The abstraction matters because it separates semantics from layout. The tensor has mathematical coordinates; the implementation chooses how to store those coordinates and payloads.
 
-A companion slide (from the SCNN paper, ISCA 2017) drills into AlexNet specifically: **input-activation density** (fraction of non-zero values) after ReLU is well below 1.0 for all convolutional layers, and **weight density** drops across the network too. Crucially, the work (number of multiply-accumulates) is proportional to the product of both densities — so simultaneously exploiting weight and activation sparsity can in principle reduce work to `density_weight × density_activation × dense_work`. The hardware challenge is realizing that potential in practice.
+### 2. Coordinate is not position
 
-The lecture organizes three orthogonal tools for handling sparsity:
+A **coordinate** is the mathematical index. A **position** is the physical offset in storage.
 
-![The three sparsity levers: Gating, Format, and Skipping](../../assets/L09/L09-p05-sparsity-aspects.png)
+In an uncompressed vector, coordinate equals position. In a compressed coordinate/payload list, they differ:
 
-- **Gating:** execute the same loop schedule as the dense case but suppress reads, multiplies, and writes whenever a zero operand is detected. *Saves energy, not time.*
-- **Format:** compress the tensor representation to omit zeros from storage, reducing memory footprint and the bandwidth needed to stream data. *Saves storage and bandwidth.*
-- **Skipping:** restructure the loop traversal itself to iterate only over non-zero coordinates, eliminating the wasted cycles entirely. *Saves both time and energy.*
+```text
+Dense vector coordinates:   0  1  2  3  4  5
+Dense values:               0  0  c  d  0  f
 
-This lecture focuses heavily on **Format** and **Skipping**, since they enable the most substantial speedup.
+Compressed positions:       0  1  2
+Stored coordinates:         2  3  5
+Stored payloads:            c  d  f
+```
 
-### The fibertree abstraction
+Coordinate 5 is stored at position 2. This distinction becomes crucial when a loop variable such as \(s\) is a mathematical coordinate, but a hardware pointer is a storage position.
 
-To reason about any tensor representation in a unified way, the course introduces the **fibertree** (fiber-tree) abstraction. A tensor of *n* ranks is represented as a tree with *n* levels:
+### 3. Fiber operations: `getPayload` and `getNext`
 
-- Each **rank** (dimension) corresponds to a level of the tree.
-- Each node at a given level holds a **coordinate** and a **payload**. For non-leaf levels, the payload is a reference to a child fiber. For leaf levels, the payload is the numeric value.
-- A **fiber** is the ordered list of (coordinate, payload) tuples at one node's children.
+The lecture uses two operations:
 
-![Fibertree abstraction: ranks, coordinates, fibers, and payloads](../../assets/L09/L09-p10-fibertree-abstraction.png)
+- `getPayload(coordinate)`: return the payload at a requested coordinate, if present.
+- `getNext()`: return the next coordinate/payload pair in traversal order.
 
-In the dense case (all elements non-zero), every valid coordinate appears at every level. In the sparse case, only non-zero coordinates appear — rows (or higher-rank slices) that are entirely zero simply vanish, shrinking the tree.
+Their costs depend on representation:
 
-Two operations on a fiber drive all tensor traversal:
-
-- **`getPayload(coordinate)`** — random access to the payload at a given coordinate.
-- **`getNext()`** — sequential (concordant) iteration to the next coordinate in traversal order.
-
-The efficiency of each operation depends heavily on the chosen fiber representation, introduced next.
-
-> **Why it matters:** The fibertree abstraction separates *what* a tensor represents from *how* it is stored. Any hardware that implements `getPayload` and `getNext` correctly can exploit sparsity regardless of the specific storage format, enabling a clean architectural interface between the sparse-format layer and the compute layer.
-
----
-
-## Chapter 2 — Tensor Representations and Traversal Efficiency
-
-> *Slides: L09-18 … L09-51*
-
-### Fiber representation choices
-
-A fiber can be stored in several ways, each with different trade-offs in space and access time:
-
-| Representation | Description | `getPayload` cost | `getNext` (concordant) cost |
+| Representation | `getPayload(c)` | Concordant `getNext()` | Hardware intuition |
 |---|---|---|---|
-| **Uncompressed (U)** | Dense array; position = coordinate | O(1) | O(1) |
-| **Run-length encoded (R)** | (run of zeros, non-zero value) pairs | O(n) linear scan | O(1) |
-| **Coordinate/payload list (C)** | Sorted list of (coordinate, value) pairs | O(log n) binary search | O(1) |
-| **Hash table (Hf/Hr)** | Hash from coordinate to payload | O(1) amortized | O(n) (poor locality) |
-| **Coordinate bitmask** | One bit per coordinate, 1 = non-zero | O(popcount) | O(1) |
+| Uncompressed array | \(O(1)\) | \(O(1)\) | Address = coordinate |
+| Coordinate/payload list | \(O(\log n)\) with binary search, or scan | \(O(1)\) | Pointer increments are cheap; random lookup is not |
+| RLE | \(O(n)\) scan/accumulate | \(O(1)\) | Good streaming, poor random access |
+| Hash table | \(O(1)\) average | Poor locality for ordered traversal | Uses hashing and extra references |
+| Bitmask | Test bit; payload lookup may need popcount | Often cheap | Good for presence checks |
 
-For **concordant traversal** (iterating in storage order), the coordinate/payload list is as efficient as the uncompressed array. For **discordant traversal** (random access by arbitrary coordinate), only the uncompressed array and hash table offer O(1) lookup. The bitmask format also allows cheap non-zero checking even without compression, as used in Eyeriss gating.
+This table explains the lecture's repeated warning: compressed storage does not automatically mean efficient sparse computation. It is efficient only for the traversal patterns it supports.
 
-### Compressed Sparse Row (CSR) — a concrete implementation
+### 4. Concordant and discordant traversal
 
-The most widely used 2-D format is **CSR** (Compressed Sparse Row), which in fibertree notation is written `Tensor<U,C>(H,W)`:
+A traversal is **concordant** when the loop visits coordinates in the same order the representation stores them. A row-major scan over CSR is concordant. A column-major scan over CSR is discordant because each column lookup jumps across row fibers.
 
-- **H rank is uncompressed (U):** the row index equals its position, so no coordinate metadata is needed. A *segment array* of length H+1 stores the starting position and length of each row's fiber in the payload array.
-- **W rank is compressed (C):** only non-zero column coordinates are stored, in a *coordinate array*. The corresponding values appear at the same position in a *value array*.
+CSR and CSC have the same nonzeros and similar storage cost, but opposite natural traversal orders:
 
-![CSR: Tensor<U,C>(H,W) — segment array, coordinate array, value array](../../assets/L09/L09-p31-csr-representation.png)
+- CSR, written as `Tensor<U,C>(H,W)`, has uncompressed H rank and compressed W fibers. It is naturally row-major.
+- CSC, written as `Tensor<U,C>(W,H)`, swaps rank order and is naturally column-major.
 
-Swapping rank order gives **CSC** (Compressed Sparse Column): `Tensor<U,C>(W,H)`. The two formats have identical memory footprint for the same data, but their **concordant traversal orders differ** — CSR is efficient for row-major scans, CSC for column-major scans. Forcing a traversal to go in the opposite direction from the storage order is a **discordant traversal** and can require O(log n) or worse random access per element.
+Hardware meaning:
 
-Merging two ranks into a single flat coordinate produces **COO** (Coordinate List): `Tensor<C2>(H,W)`, which stores (H,W) coordinate tuples directly. More merge options and their notation (`U2`, `R2`, `H2`) allow other trade-offs.
+- Concordant traversal can be implemented with counters, pointers, and sequential SRAM reads.
+- Discordant traversal may require binary search, hash lookup, decompression, or a format conversion.
 
-### Merging, splitting, and specifying sparsity patterns
+This is the first major bridge from Lecture 09 back to mapping: loop order must be selected together with format.
 
-Slides 52–71 make an important move: sparsity is no longer just "some coordinates are missing." It becomes a **formal specification over ranks** in the fibertree. That is what lets the same notation describe unstructured pruning, channel pruning, sub-kernel sparsity, Nvidia-style 2:4 sparsity, and hierarchical structured sparsity.
+### 5. CSR as a concrete fibertree implementation
 
-**Merging ranks** combines two or more tensor ranks into one storage rank. For example, `Tensor<C2>(H,W)` stores a flat list of `(h,w)` coordinate tuples, while `Tensor<U2>(H,W)` stores a flattened dense array whose original coordinates can be recovered with division and modulo arithmetic. Merging is useful when the hardware wants to traverse a multi-dimensional object as one linear fiber.
+For a sparse matrix with nonzeros:
 
-**Splitting fibers** goes the other direction: a single rank is divided into multiple ranks. There are two distinct choices:
-
-- **Coordinate-space splitting:** split by coordinate ranges, e.g., coordinates `0–7`, `8–15`, and so on. This preserves geometric locality and makes the meaning of each tile easy to reason about, but sparse tiles may have very different occupancies.
-- **Position-space splitting:** split by stored positions, i.e., by non-zero count. This balances work across PEs because each split gets about the same number of stored elements, but the coordinate ranges become irregular.
-
-The specification examples show how pruning patterns can be written as transformations on the rank order:
-
-- **Channel-based sparsity:** keep the `C` rank explicit and apply an unstructured rule to channel fibers, yielding a pattern like `C unstructured -> R -> S`.
-- **Sub-kernel sparsity:** flatten the spatial filter ranks `R` and `S` into `RS`, then apply a structured rule such as "2 of 4" within that flattened rank.
-- **Fully unstructured sparsity:** flatten `C`, `R`, and `S` into one `CRS` rank, then apply an unstructured rule over the full filter volume.
-- **2:4 sparsity:** reorder and partition the channel rank into outer and inner ranks (`C1`, `C0`), then apply the 2-of-4 rule at the innermost rank where hardware can decode it cheaply.
-- **Hierarchical Structured Sparsity (HSS):** partition a rank into several nested ranks and apply different `G:H` rules at different levels, such as a coarse 3:4 rule outside a fine 2:4 rule.
-
-> **Why it matters:** These rank transformations are the bridge between model pruning rules and hardware format design. A pruning method is hardware-friendly only if its rank order, flattening, and split points make the remaining non-zero coordinates cheap to encode, traverse, and distribute across PEs.
-
-### Hardware for concordant traversal
-
-The figure below shows the hardware structure for a 2-D concordant traversal (e.g., scanning a CSR tensor in row-major order). Two stages of position generators (Pgen) and coordinate/payload extractors operate in a pipeline: the H-rank stage produces the fiber boundaries, and the W-rank stage sequences through the coordinates within each fiber.
-
-![Hardware for 2-D concordant traversal of a sparse tensor](../../assets/L09/L09-p48-2d-concordant-traversal.png)
-
-Each rank in the hardware directly implements the `getNext()` iterator. For uncompressed ranks, the position generator is a simple counter. For coordinate/payload list ranks, it is a pointer that advances through the stored list. The outputs at every rank are a (coordinate, payload) pair — a clean, representation-agnostic interface.
-
-> **Why it matters:** Concordant traversal in a coordinate/payload list has the same O(1) per-element cost as an uncompressed array, while only reading non-zero elements. This is the key enabler for **time savings** from sparsity. Discordant traversal destroys that advantage, which is why the design of loop nests — and which operand is iterated vs. looked up — matters so much.
-
----
-
-## Chapter 3 — Exploiting Sparse Weights in Convolution
-
-> *Slides: L09-72 … L09-96*
-
-### The convolution loop nest and coordinate arithmetic
-
-The 1-D convolution `O[q] += I[w] * F[s]` subject to the index constraint `w = q + s` is the running example throughout this portion of the lecture. Dense implementations iterate over all (q, s) pairs; the two inner indices are always coordinates and positions simultaneously (uncompressed tensors).
-
-When filters are sparse (many zero weights), the natural approach is to compress F into a coordinate/payload list and traverse it concordantly. The choice of **which loop is outer** then determines the dataflow:
-
-**Output-stationary with sparse weights:**
+```text
+row 0: (col 0 -> a), (col 2 -> c)
+row 1: empty
+row 2: (col 0 -> g), (col 1 -> h)
 ```
+
+CSR stores:
+
+```text
+segment array:    [0, 2, 2, 4]
+coordinate array: [0, 2, 0, 1]
+value array:      [a, c, g, h]
+```
+
+The segment array tells where each row's W fiber begins and ends. Row 1 has start and end both equal to 2, so it is empty. This is a concrete implementation of a fibertree: the H rank is uncompressed, and each W-rank fiber is compressed.
+
+### 6. Rank transformations: merge, split, swizzle
+
+Sparse accelerators often transform ranks:
+
+- **Merge/flatten:** combine ranks, e.g., \((H,W)\) into a single coordinate tuple. COO is a coordinate-list version of this idea.
+- **Split by coordinate space:** divide a rank into fixed coordinate ranges. This preserves geometry but can give uneven nonzero counts.
+- **Split by position space:** divide a rank by stored nonzero count. This balances work but creates irregular coordinate ranges.
+- **Swizzle:** reorder ranks, e.g., changing a tensor's rank order from \([H,R,Q]\) to \([Q,R,H]\).
+
+These transformations are not mathematical changes to the DNN operation. They are layout and scheduling choices that make a sparse dataflow more implementable.
+
+### 7. Convolution as coordinate projection
+
+The 1-D convolution in the lecture is:
+
+\[
+O[q] = \sum_s I[q+s]F[s].
+\]
+
+The relation \(w=q+s\) is a **coordinate projection**: given output coordinate \(q\) and filter coordinate \(s\), it tells which input coordinate \(w\) is needed.
+
+Projection has three common forms:
+
+- Output-stationary view: \(w=q+s\).
+- Weight-stationary input view: \(q=w-s\).
+- Output-stationary sparse-input view: \(s=w-q\).
+
+The arithmetic is small, but it is not optional. Without this coordinate generator, the hardware cannot route the product to the correct partial sum.
+
+### 8. Exploiting sparse weights
+
+If weights are sparse and inputs are dense or randomly accessible, the natural schedule is to iterate the compressed filter concordantly:
+
+```text
 for q in [0, Q):
-    for (s, f_val) in f:        # concordant traversal of compressed filter
-        w = q + s               # coordinate projection
-        o[q] += i[w] * f_val   # look up input by computed coordinate
+    for (s, f_val) in f:
+        w = q + s
+        o[q] += i[w] * f_val
 ```
-This traversal is concordant for F. The computed `w = q+s` is a **coordinate projection** — the coordinate of the required input activation is derived from the output and weight coordinates. Input activation `i` is kept uncompressed so that `i[w]` is O(1).
 
-![Output-stationary with sparse weights: compressed filter traversal vs. dense](../../assets/L09/L09-p83-output-stationary-sparse-weights.png)
+This is output-stationary: \(o[q]\) remains the accumulation target while the filter nonzeros stream. The filter traversal is cheap because it uses `getNext()`. The input \(i[w]\) should be uncompressed or otherwise cheap to index.
 
-The slide compares the compressed-filter schedule (right) against the uncompressed schedule (left): with 2-of-5 weights non-zero, the compressed version performs only 2 iterations of the inner loop instead of 5 — a direct speedup proportional to weight density.
+A weight-stationary version reverses the outer loops:
 
-**Weight-stationary with sparse weights:** loop order is reversed (`for (s,f_val) in f: for q in [0,Q):`), keeping each weight stationary while sweeping over all outputs. The projection `w = q+s` still applies. Both dataflows achieve the same work reduction; the difference is which buffer holds the stationary data.
-
-### Hardware microarchitecture
-
-The hardware for the output-stationary sparse-weight schedule has three data streams:
-
-1. **Filter fiber** — a Pgen + Coord/Payload stage that sequences through non-zero (s, f_val) pairs.
-2. **Input activation array** — an uncompressed array indexed by the computed `w = q + s`.
-3. **Partial sum array** — indexed by `q`; accumulates results with a MAC unit.
-
-A coordinate generator (Cgen) computes `w` and `q` from the traversal state. The Cambricon-X accelerator (Zhang et al., Micro 2016) uses exactly this structure: metadata stored alongside each weight identifies which input activations are needed, and the PE loads those activations by their computed address rather than streaming a dense window.
-
-> **Why it matters:** Sparse weight traversal is the simplest form of skipping. If weights are 50% sparse, the inner loop runs half as many times, halving both time and energy for the filter and output reads. The critical hardware requirement is a fast coordinate projection unit and an uncompressed input buffer that can be randomly accessed by the computed coordinate.
-
----
-
-## Chapter 4 — Exploiting Sparse Inputs, and Both Simultaneously
-
-> *Slides: L09-97 … L09-128*
-
-### Sparse inputs: the sliding-window problem
-
-When input activations are sparse (many post-ReLU zeros) but weights are dense, the dual approach is to compress `i` and iterate concordantly over non-zero inputs. For a weight-stationary dataflow:
-
+```text
+for (s, f_val) in f:
+    for q in [0, Q):
+        w = q + s
+        o[q] += i[w] * f_val
 ```
+
+Both exploit weight sparsity. They differ in reuse: one keeps the output stationary, the other keeps the weight stationary.
+
+Hardware blocks:
+
+- A position generator for the compressed filter fiber.
+- A coordinate generator computing \(w=q+s\).
+- A random-access input buffer.
+- A partial-sum buffer indexed by \(q\).
+
+Cambricon-X is slide-cited as an accelerator that follows this weight-sparsity style: metadata associated with weights guides activation access.
+
+### 9. Exploiting sparse inputs
+
+If inputs are sparse and weights are dense or randomly accessible, iterate nonzero inputs. For weight-stationary sparse inputs:
+
+```text
 for s in [0, S):
-    for (w, i_val) in i if s <= w < Q+s:  # windowed concordant traversal
-        q = w – s
+    for (w, i_val) in i if s <= w < Q+s:
+        q = w - s
         o[q] += i_val * f[s]
 ```
 
-The `if s <= w < Q+s` constraint is a **sparse sliding window**: for each weight position `s`, only the input coordinates `w` that fall within the valid convolution window contribute to any output. As the slides animate with increasing `q`, the active window slides through the input fiber, picking up non-zero values and projecting them to the corresponding output coordinates. The CNVLUTIN accelerator exploits exactly this structure: it compresses zero activations, and for each non-zero input it looks up the appropriate weight and accumulates into the appropriate output.
+The condition \(s \le w < Q+s\) is a sparse sliding window. Each weight \(s\) only interacts with input coordinates \(w\) that produce legal output coordinates \(q\).
 
-For an output-stationary dataflow with sparse inputs:
-```
+For output-stationary sparse inputs:
+
+```text
 for q in [0, Q):
     for (w, i_val) in i if q <= w < q+S:
-        s = w – q
-        o[q] += i_val * f[s]   # look up weight by computed s
+        s = w - q
+        o[q] += i_val * f[s]
 ```
-Each output `q` iterates over the (sparse) inputs within its window and looks up the weight by the derived `s = w - q`. This requires random access to weights (uncompressed filter recommended).
 
-### Two-sparse: projection followed by intersection
+This visits only nonzero inputs in the active window, then looks up the corresponding weight. The sparse input traversal can be cheap; the weight lookup must also be cheap, so weights are often uncompressed for this view.
 
-When **both** weights and inputs are sparse, the maximum work reduction requires iterating only over (w, s) pairs where both `i[w] ≠ 0` and `f[s] ≠ 0`. An output-stationary formulation is:
+Cnvlutin is slide-cited and paper-verified as an activation-sparsity design. Its central idea is to remove zero-valued neurons from the input stream and encode nonzero neurons with offsets so lanes can skip zeros while still indexing the correct weights.
 
-```
-for q in [0,Q):
+### 10. Exploiting sparse weights and sparse inputs
+
+When both operands are sparse, projection alone is insufficient. You must project one operand's coordinates into the other's coordinate space and then intersect.
+
+Output-stationary two-sparse convolution can be written:
+
+```text
+for q in [0, Q):
     for (s, (f_val, i_val)) in f.project(+q) & i:
         o[q] += i_val * f_val
 ```
 
-This uses two primitives chained together:
+Read this carefully:
 
-1. **Coordinate projection** (`f.project(+q)`): shift the coordinate of every non-zero weight by `+q` to compute the required `w` for each `s`. This produces a new (virtual) fiber in the `w` coordinate space.
-2. **Fiber intersection** (`&`): retain only coordinates present in *both* the projected filter fiber and the input activation fiber.
+1. `f.project(+q)` converts each filter coordinate \(s\) into input coordinate \(w=s+q\).
+2. `& i` intersects the projected filter fiber with the input fiber.
+3. Only coordinates present in both operands produce a multiply.
 
-![Fiber intersection: only coordinates present in both fibers are kept](../../assets/L09/L09-p127-fiber-intersection.png)
+Example:
 
-The slide shows that intersecting two fibers with coordinates {2,4,7,8} and {1,2,5,8} yields {2,8} — only the common coordinates. The multiply-accumulate is performed only for those pairs. For a dense kernel (all 8 coordinates present in one fiber), intersection degenerates to a simple lookup; for a sparse kernel and sparse activations, it achieves the product-of-densities work reduction.
-
-The coordinate bitmask and uncompressed representations make intersection particularly fast (a bitwise AND), at the cost of storing metadata for all coordinates, even zeros. The coordinate/payload list requires a merge-sort-style pass.
-
-The hardware for the output-stationary two-sparse schedule feeds both the projected filter fiber and the input fiber into a shared **Intersection** unit, which emits matched (s, f_val, i_val) triples to the MAC unit.
-
-> **Why it matters:** Fiber intersection is the key primitive that achieves **multiplicative** work reduction — if weight density is `d_W` and input density `d_I`, the work scales as `d_W × d_I`. Without intersection, the best you can do is exploit only one operand's sparsity, leaving work proportional to the denser of the two. Achieving full two-sparse reduction requires explicit coordinate matching hardware.
-
----
-
-## Chapter 5 — SCNN: Cartesian-Product Sparse Acceleration
-
-> *Slides: L09-112 … L09-124*
-
-### The SCNN input-stationary dataflow
-
-SCNN (Sparse CNN, Parashar et al., ISCA 2017) uses an **input-stationary** dataflow that places the inner loop over weights:
-
+```text
+filter nonzeros s:        0, 2, 5, 6
+for q = 2, projected w:   2, 4, 7, 8
+input nonzeros w:         1, 2, 5, 8
+intersection:             2, 8
 ```
+
+Only projected coordinates 2 and 8 have matching input activations. The hardware emits two products, not four.
+
+### 11. SCNN: Cartesian-product sparse convolution
+
+SCNN uses an input-stationary Cartesian-product dataflow. A simplified 1-D view is:
+
+```text
 for (w, i_val) in i:
     for (s, f_val) in f if w-Q <= s < w:
-        q = w – s
+        q = w - s
         o[q] += i_val * f_val
 ```
 
-For each non-zero input `i[w]`, SCNN iterates over all non-zero weights `f[s]` that could interact with it (those within the valid window). This exploits both input and weight sparsity simultaneously — the outer loop skips zero inputs, the inner loop skips zero weights.
+SCNN tiles input activations and weights by position and multiplies groups of nonzeros against each other. If a tile supplies \(I\) nonzero activations and \(F\) nonzero weights, a PE can form up to \(I \times F\) products.
 
-### All-to-all multiplication and the scatter network
+The catch is output routing. The product's output coordinate is computed from \(q=w-s\), so products from the same Cartesian product tile scatter to different output locations. SCNN therefore needs a scatter network and a dense accumulation backend.
 
-To maximize PE utilization, SCNN tiles both the input and weight fibers by position, then performs a **Cartesian product** (all-to-all) multiplication of the non-zero elements within each tile:
+This is a beautiful sparse-design tradeoff:
 
-![SCNN: Cartesian product of non-zero inputs and non-zero weights](../../assets/L09/L09-p117-scnn-cartesian-product.png)
+- The compressed frontend keeps zeros away from the multipliers.
+- The all-to-all multiplier array exposes many useful products.
+- The scatter/accumulator backend pays the price of irregular output coordinates.
 
-If a tile has 4 non-zero inputs {i₁, i₂, i₃, i₄} and 4 non-zero weights {w₁, w₂, w₃, w₄}, the PE produces 16 partial products in one shot, using a 4×4 multiplier array. The coordinate of each partial product determines which output accumulator it belongs to via `q = w – s`; products are then routed by a **scatter network** to the correct output partial-sum buffer.
+### 12. ISOSceles and the IS-OS pipeline
 
-The SCNN PE microarchitecture reflects this: a densely packed frontend stores compressed weights and activations (with metadata), feeds them into an all-to-all multiplier array, and a scatter network routes products to the output-stationary backend accumulator bank.
+The slides end with ISOSceles, an IS-OS dataflow. The idea is to split convolution through an intermediate tensor \(T\):
 
-SCNN's measured results show that at realistic CNN sparsity levels, **latency scales roughly linearly with joint density** (the product of weight and activation density), and **energy per non-zero multiply drops significantly** compared to a dense baseline — confirming that the Cartesian product + scatter approach effectively converts joint sparsity into proportional savings.
+\[
+T[\cdot] = I[\cdot]F[\cdot],
+\qquad
+O[\cdot] = \text{reduce}(T[\cdot]).
+\]
 
-> **Why it matters:** SCNN demonstrates that input-stationary dataflow with Cartesian-product multiplication achieves full two-sparse work reduction in hardware. The scatter network is the hardware cost of that generality — partial products land at scattered output addresses, requiring a flexible routing fabric rather than a simple accumulate-in-place structure.
+The exact slide notation uses substitutions such as \(h=p+r\) and \(q=w-s\). The conceptual point is:
 
----
+1. An input-stationary frontend processes sparse input wavefronts and creates partial results in \(T\).
+2. An output-stationary backend reads \(T\) and accumulates final outputs.
+3. The intermediate \(T\) is written in one rank order and read in another, so ISOSceles uses rank swizzling to make the backend traversal concordant.
 
-## Chapter 6 — ISOSceles: IS-OS Pipelined Dataflow
+This is the same lesson as CSR vs. CSC, now inside a pipeline: if a tensor is produced in one order and consumed in another, a rank transformation may be cheaper than repeated discordant lookups.
 
-> *Slides: L09-129 … L09-138*
+Quantitative ISOSceles results in this chapter are slide-derived because the local ISOSceles PDF was not part of the Worker B input.
 
-### The IS-OS two-step computation
+## Worked Examples
 
-ISOSceles (Yang et al., HPCA 2023) introduces an **IS-OS (Input-Stationary / Output-Stationary) pipelined dataflow** designed to combine the strengths of both dataflows while avoiding their individual weaknesses. The key observation is that the convolution Einsum
+### Example 1: CSR lookup vs. traversal
 
+Using:
+
+```text
+segment array:    [0, 2, 2, 4]
+coordinate array: [0, 2, 0, 1]
+value array:      [a, c, g, h]
 ```
-O[n,p,q,m] = I[n,h,w,c] × F[m,c,r,s]   (with h=p+r, w=q+s)
-```
 
-can be split into two steps by introducing an intermediate tensor T:
+Concordant row traversal:
 
-**Step 1 (IS frontend):**
-```
-T[h,w,r,s] = I[h,w,c] × F[m,c,r,s]
-```
-This step iterates input-stationarily over non-zero inputs `(h,w)`, intersects with non-zero filters `(c,r,s)`, and accumulates into T indexed by `(h, w-s, r)`. The `w-s` projection maps each (input, weight) pair to the appropriate position in T.
+- Row 0 uses positions 0 to 1: \((0,a),(2,c)\).
+- Row 1 uses positions 2 to 1: empty.
+- Row 2 uses positions 2 to 3: \((0,g),(1,h)\).
 
-**Step 2 (OS backend):**
-```
-O[p,q] = T[h,w,r,s]   (with h=p+r, q=w-s)
-```
-This step reads T in an output-stationary fashion, accumulating partial results into final outputs.
+This is cheap because each W fiber is read sequentially. Asking "what is column 1 in every row?" is not as cheap in CSR, because each row's compressed coordinate list may need a search.
 
-The challenge is that T is written in IS order (indexed by input coordinates `h,w`) but read in OS order (indexed by output coordinates `p,q`). This is a **discordant traversal** of T. ISOSceles solves it by **rank-swizzling** T's storage layout between the two steps — reindexing the stored tensor from `(H,R,Q)` to `(Q,R,H)` — so that the OS backend can traverse T concordantly.
+### Example 2: Sparse-weight convolution
 
-### The pipelined microarchitecture
+Let \(f\) have nonzeros \((s=0,f_0=8)\) and \((s=2,f_2=6)\). Let \(Q=3\). Output-stationary sparse-weight traversal emits:
 
-![ISOSceles IS-OS pipeline: IS frontend → small T buffer → OS backend](../../assets/L09/L09-p136-isosceles-pipeline.png)
+- For \(q=0\): use \(w=0\) and \(w=2\).
+- For \(q=1\): use \(w=1\) and \(w=3\).
+- For \(q=2\): use \(w=2\) and \(w=4\).
 
-The ISOSceles pipeline has three stages:
+Dense traversal with \(S=3\) would perform 9 filter positions. Sparse traversal performs 6 because only two of three filter coordinates exist.
 
-1. **IS frontend** — processes an input wavefront, computes all partial products involving the current batch of non-zero inputs, and writes results into a small intermediate tensor T.
-2. **Small T buffer** — holds the rank-swizzled intermediate results between the two pipeline stages. Keeping T small is critical; ISOSceles tiles the computation so T fits in a local buffer.
-3. **OS backend** — reads T concordantly and accumulates results into the output wavefront.
+### Example 3: Projection plus intersection
 
-The pipeline delivers a measured **7.5× latency speedup** over a dense baseline on a sparse CNN benchmark, with a **1.7× energy improvement** as well. These results appear on the final slide:
+Let \(q=1\), filter nonzeros \(s=\{0,3,4\}\), input nonzeros \(w=\{1,2,5\}\).
 
-![ISOSceles speedup: 7.5× latency, 1.7× energy improvement](../../assets/L09/L09-p138-isosceles-speedup.png)
+Project filter by \(+q\): \(w=\{1,4,5\}\). Intersect with input: \(\{1,5\}\). Only \(s=0\) and \(s=4\) produce products. The \(s=3\) nonzero weight is real, but for this output coordinate it wants \(w=4\), where the input is zero.
 
-The IS frontend exploits input sparsity (skips zero activations); the OS backend exploits output sparsity (skips zero partial sums); and the intersection in Step 1 further reduces work when both operands are sparse. The rank-swizzle overhead is a one-time reindexing of T, which is small compared to the total compute saved.
+## Key Equations and How to Read Them
 
-> **Why it matters:** ISOSceles shows that a single accelerator can exploit both input and weight sparsity through a carefully designed two-stage pipeline, achieving better PE utilization than either pure IS or pure OS alone. The rank-swizzle is a software/hardware co-design trick that converts a discordant access pattern into a concordant one — a concrete example of the Format and Binding layers of the TeAAL pyramid working together.
+### 1-D convolution
 
----
+\[
+O[q] = \sum_s I[q+s]F[s].
+\]
+
+The equation says that output coordinate \(q\) accumulates products from filter coordinate \(s\) and input coordinate \(w=q+s\).
+
+### Projection equations
+
+\[
+w=q+s,\qquad q=w-s,\qquad s=w-q.
+\]
+
+These are the same convolution relation solved for different coordinates. Which one appears in hardware depends on dataflow.
+
+### Ideal two-sparse work
+
+\[
+N_\text{work}\approx d_I d_F N_\text{dense}.
+\]
+
+This approximation assumes independent sparse positions. It explains why exploiting both input and weight sparsity can be multiplicative. It is a teaching model, not a guaranteed workload statistic.
+
+## Hardware Implications
+
+- **Fibertree hardware:** each rank can be implemented with a position generator and a coordinate/payload extractor.
+- **CSR/CSC:** the rank order determines which traversal is cheap. Format conversion or rank swizzling may be required for a different consumer.
+- **Sparse weights:** compressed filter traversal is cheap, but input access becomes projected random access.
+- **Sparse inputs:** input traversal is cheap, but weight lookup and sliding-window restriction become important.
+- **Two-sparse:** intersection hardware determines whether the accelerator can actually realize product-of-densities work reduction.
+- **SCNN:** all-to-all multiplication improves useful work exposure, but scatter routing and dense accumulators cost area and energy.
+- **ISOSceles:** intermediate tensors can decouple IS and OS advantages, but rank swizzling and buffering become explicit costs.
+
+## Common Misconceptions
+
+### Misconception: A compressed tensor is always faster to traverse.
+
+Only concordant traversal is naturally fast. Random lookup into compressed metadata can be slower than dense access.
+
+### Misconception: Coordinate and position are interchangeable.
+
+They are equal only in uncompressed ranks. In compressed ranks, coordinate is the mathematical index and position is the storage offset.
+
+### Misconception: Projection is the same as intersection.
+
+Projection changes coordinate spaces. Intersection removes coordinates not present in both operands. Two-sparse convolution needs both.
+
+### Misconception: SCNN's Cartesian product means it multiplies everything densely.
+
+SCNN forms Cartesian products of compressed nonzero groups, not dense tensors. It avoids zero operands but still must scatter products to irregular output coordinates.
+
+### Misconception: Rank swizzling is just a software transpose.
+
+In sparse hardware, rank swizzling is a design choice that can trade one-time reordering/buffering for cheaper repeated traversal.
+
+## Connections to Previous and Later Lectures
+
+- **L04 Einsums:** the convolution equations are Einsums with index arithmetic.
+- **L05-L06 mapping/dataflow:** stationarity and loop order determine which tensor is traversed and which tensor is looked up.
+- **L08 sparse architectures:** gating, skipping, metadata, format, and intersection are the vocabulary used here.
+- **L10 sparse architectures part 3:** TeAAL formalizes these choices as mapped Einsum cascades, formats, bindings, and architecture specifications.
+- **Lab 4/SparseLoop:** the cost of gating, skipping, and sparse formats can be modeled only when traversal and format are specified together.
+
+## Paper Bridge: TeAAL
+
+### Bibliographic identity
+
+- **Title:** TeAAL: A Declarative Framework for Modeling Sparse Tensor Accelerators
+- **Authors:** N. Nayak et al.
+- **Year / venue:** MICRO 2023
+- **Local PDF:** `papers/TeAAL.pdf`
+
+### Problem addressed
+
+TeAAL provides a precise way to describe sparse tensor accelerators whose behavior depends on mapped Einsums, fibertree formats, rank transformations, and real sparse inputs.
+
+### Core idea
+
+The paper uses fibertrees as the tensor abstraction, mapped Einsums as the computation/mapping abstraction, and transformations such as flattening, partitioning, and swizzling to express sparse orchestration.
+
+### Relevance to this lecture
+
+Lecture 09's fibertree vocabulary, rank transformations, concordant traversal, and IS-OS rank swizzling are exactly the ideas TeAAL formalizes.
+
+### Key claims used in this chapter
+
+- TeAAL Section 2.1 defines ranks, coordinates, points, fibers, payloads, and fibertrees, and notes that sparse fibertrees omit empty payloads.
+- Section 2.2 states that Einsums specify computation but do not specify iteration order.
+- Section 2.3 explains mapping attributes such as loop order, partitioning, and work scheduling, and connects sparse compression to load imbalance and memory footprint variation.
+- Section 3.2 describes rank flattening, partitioning, sorting/merging, and rank swizzling as content-preserving transformations.
+
+### What students should remember
+
+1. Fibertrees are not just diagrams; they are an interface for sparse traversal.
+2. Mapping determines whether `getNext()` or `getPayload()` dominates.
+3. Rank transformations are architectural tools for making sparse traversal feasible.
+
+### Limitations and assumptions
+
+TeAAL models accelerators; it does not by itself decide which accelerator is best. This chapter uses it to ground the terminology.
+
+## Paper Bridge: Cnvlutin
+
+### Bibliographic identity
+
+- **Title:** Cnvlutin: Ineffectual-Neuron-Free Deep Neural Network Computing
+- **Authors:** J. Albericio et al.
+- **Year / venue:** ISCA 2016
+- **Local PDF:** `papers/L18_Cnvlutin_Albericio_ISCA2016.pdf`
+
+### Problem addressed
+
+Cnvlutin targets zero-valued input neurons in convolutional layers. Baseline wide-lane DNN accelerators process neurons in lockstep, so a zero neuron can waste multiplier slots and cycles.
+
+### Core idea
+
+Cnvlutin stores nonzero input neurons in a Zero-Free Neuron Array format with offsets. The offsets let each nonzero neuron find the correct synapse/weight location while lanes proceed independently, skipping zero neurons without changing the DNN result.
+
+### Relevance to this lecture
+
+Cnvlutin is the concrete paper bridge for sparse-input traversal. It shows why skipping activation zeros requires both a format and a dispatch mechanism, not just an if-statement.
+
+### Key claims used in this chapter
+
+- The abstract identifies zero-operand multiplications as intrinsically ineffectual and presents Cnvlutin as value-based acceleration that removes them.
+- Section III describes decoupling neuron lanes and using an encoded input format to remove zero-valued neurons from the critical path.
+- Section IV-B describes the Zero-Free Neuron Array format, including nonzero value/offset pairs grouped into bricks.
+- Section V reports speedup and energy improvements over the paper's baseline; this chapter does not reuse those exact numbers except as paper context.
+
+### What students should remember
+
+1. Activation sparsity is runtime data-dependent.
+2. Offsets are coordinate metadata; they let compressed activations still address the right weights.
+3. Lane decoupling is a utilization solution to irregular nonzero counts.
+
+### Limitations and assumptions
+
+Cnvlutin focuses on activation sparsity in convolutional layers and builds on a DaDianNao-like baseline. It does not exploit pruned weight sparsity in the same way SCNN does.
+
+## Paper Bridge: SCNN
+
+### Bibliographic identity
+
+- **Title:** SCNN: An Accelerator for Compressed-sparse Convolutional Neural Networks
+- **Authors:** A. Parashar et al.
+- **Year / venue:** ISCA 2017
+- **Local PDF:** `papers/L17_SCNN_Parashar_ISCA2017.pdf`
+
+### Problem addressed
+
+SCNN targets the combined sparsity of pruned weights and ReLU activations in CNN inference, while trying to keep both weights and activations compressed through the computation.
+
+### Core idea
+
+The PT-IS-CP-sparse dataflow is planar-tiled, input-stationary, and Cartesian-product based. It feeds compressed nonzero weight and activation groups to an all-to-all multiplier array, computes output coordinates from metadata, and scatters products into dense accumulators.
+
+### Relevance to this lecture
+
+SCNN is the main concrete example of two-sparse convolution. It demonstrates how projection and multiplication can be efficient while output accumulation becomes irregular.
+
+### Key claims used in this chapter
+
+- The abstract states that SCNN exploits zero-valued weights from pruning and zero-valued activations from ReLU.
+- Section II motivates multiplicative work reduction from the product of weight and activation densities.
+- Section III defines the PT-IS-CP-sparse dataflow and its input-stationary Cartesian-product structure.
+- Section IV describes the PE architecture with compressed buffers, \(F \times I\) multipliers, coordinate handling, and scatter accumulation.
+- Section VIII summarizes that SCNN keeps both weights and activations compressed and delivers only nonzero operands to multipliers.
+
+### What students should remember
+
+1. SCNN's work reduction comes from both operands being sparse.
+2. Cartesian-product multiplication is a way to keep multipliers busy with nonzero groups.
+3. Sparse output routing is the price of that freedom.
+
+### Limitations and assumptions
+
+The design is specialized to CNN-style convolution and relies on the paper's compressed block organization and accumulator banking. Its quantitative results should not be generalized without checking workload and baseline.
+
+## Paper Bridge: Eyeriss v2
+
+### Bibliographic identity
+
+- **Title:** Eyeriss v2: A Flexible Accelerator for Emerging Deep Neural Networks on Mobile Devices
+- **Authors:** Y.-H. Chen et al.
+- **Year / venue:** JETCAS 2019
+- **Local PDF:** `papers/L17_EyerissV2_Chen_JETCAS2019.pdf`
+
+### Problem addressed
+
+Eyeriss v2 addresses compact and sparse DNNs whose shapes make dense reuse and PE utilization difficult.
+
+### Core idea
+
+It uses a hierarchical mesh NoC and sparse PE architecture. In sparse PE mode, activations and weights use CSC-like compressed streams, with address and count metadata that allow zeros to be skipped in the compressed domain.
+
+### Relevance to this lecture
+
+Eyeriss v2 is a concrete implementation of the Lecture 08 to Lecture 09 transition: original Eyeriss gated zero activations; Eyeriss v2 uses compressed formats and skipping to improve throughput.
+
+### Key claims used in this chapter
+
+- Section IV explicitly distinguishes original Eyeriss gating from Eyeriss v2 sparse processing that skips zeros for throughput.
+- Section IV describes CSC compressed data, count/address metadata, and sparse PE pipeline support.
+- Section V reports implementation results and discusses workload imbalance and cases where sparse compression may not create skippable cycles.
+
+### What students should remember
+
+1. Sparse support changes the PE pipeline, not only the memory format.
+2. A flexible NoC matters because sparse and compact models stress bandwidth/reuse differently.
+3. Workload imbalance remains a limiting factor.
+
+### Limitations and assumptions
+
+The paper's reported improvements depend on implementation, workloads, and baselines. This chapter uses Eyeriss v2 for architectural mechanisms, not universal performance constants.
 
 ## Standalone Study Guide
 
-### What to master before moving on
+Study this lecture in five passes:
 
-- Use the fibertree abstraction to describe dense and sparse tensors uniformly.
-- Explain `getPayload()` versus `getNext()` and why concordant traversal is cheap.
-- Distinguish coordinate projection from fiber intersection.
-- Trace sparse-weight, sparse-input, and two-sparse convolution loop nests.
-- Compare Cambricon-X, CNVLUTIN, SCNN, and ISOSceles by which sparsity they exploit and what hardware they add.
+1. Draw a fibertree for a tiny sparse matrix.
+2. Label coordinate vs. position for every stored value.
+3. For each representation, ask whether `getPayload` or `getNext` is cheap.
+4. Rewrite \(O[q]=\sum_s I[q+s]F[s]\) in output-stationary, weight-stationary, and input-stationary forms.
+5. Explain SCNN and ISOSceles as two different answers to "where do sparse products accumulate?"
 
-### Self-check questions
+## Self-Check Questions
 
-1. Why does CSR make row-major traversal cheap but column-major traversal expensive?
-2. When both operands are sparse, why is projection alone insufficient?
-3. What problem does rank swizzling solve in ISOSceles?
+1. Why does CSR make row traversal cheap but column traversal expensive?
+2. What is the difference between coordinate and position in a compressed fiber?
+3. Why is `getNext()` cheap for coordinate/payload lists but `getPayload()` may be expensive?
+4. In sparse-weight convolution, why should the input often be uncompressed?
+5. In sparse-input convolution, what does the sliding-window condition do?
+6. Why does two-sparse convolution require projection and intersection?
+7. Why does SCNN need a scatter network?
+8. What problem does rank swizzling solve in the IS-OS pipeline?
 
-### Exercises
+## Exercises
 
-1. Draw a fibertree for a 3x3 matrix with three non-zero values, then label coordinates, positions, fibers, and payloads.
-2. For an output-stationary sparse-weight convolution, compute the projected input coordinate `w` for several `(q,s)` pairs.
-3. Given two sorted sparse fibers, manually perform their intersection and list the emitted matched payloads.
-
-### Common traps
-
-- Confusing coordinate with position. Coordinate is the mathematical index; position is where the item sits in storage.
-- Assuming compressed storage implies cheap random access. Many compressed formats are cheap only for concordant traversal.
-- Treating SCNN and ISOSceles as equivalent because both exploit two-sparse work. Their output-routing strategies are different.
-
----
+1. **Fibertree:** Draw the fibertree and CSR arrays for a \(4 \times 4\) matrix with nonzeros at \((0,1)\), \((2,0)\), and \((2,3)\).
+2. **Traversal:** For the same matrix, list the operations needed to traverse by row and by column if the format is CSR.
+3. **Projection:** Let \(Q=4\), \(S=3\), and filter nonzeros \(s=\{0,2\}\). List all projected \(w=q+s\) coordinates for each \(q\).
+4. **Intersection:** For \(q=2\), filter nonzeros \(s=\{0,1,4\}\), and input nonzeros \(w=\{2,3,5,7\}\), compute projection plus intersection.
+5. **Design tradeoff:** Compare Cnvlutin and SCNN. Which sparsity does each exploit, and what extra hardware does each need?
+6. **Paper reading:** In SCNN Section III, identify why input stationarity is attractive and why accumulation becomes harder.
 
 ## Key Terms
 
-| Term | Gloss |
+| Term | Definition |
 |---|---|
-| **Fibertree** | A tree-based abstraction for tensors: each level is a rank, each node holds a (coordinate, payload) pair, each child list is a fiber. |
-| **Fiber** | An ordered list of (coordinate, payload) tuples at one level of the fibertree. |
-| **Coordinate** | The index identifying an element within a rank (equivalent to the mathematical index). |
-| **Position** | The physical storage location (offset) in memory; equals coordinate only for uncompressed ranks. |
-| **Payload** | The data stored at a fiber node: a reference to the next-level fiber (for non-leaf ranks) or a numeric value (for leaf ranks). |
-| **`getPayload(c)`** | Random-access lookup of the payload at coordinate `c` in a fiber. |
-| **`getNext()`** | Iterator advancing to the next (coordinate, payload) pair in a fiber (concordant traversal). |
-| **Uncompressed (U)** | Fiber representation where every coordinate is stored and position = coordinate; O(1) for both `getPayload` and `getNext`. |
-| **Coordinate/payload list (C)** | Compressed fiber storing only non-zero (coordinate, value) pairs; O(log n) `getPayload`, O(1) concordant `getNext`. |
-| **CSR** | Compressed Sparse Row: `Tensor<U,C>(H,W)` — uncompressed H rank, compressed W rank. |
-| **CSC** | Compressed Sparse Column: `Tensor<U,C>(W,H)` — rank order swapped from CSR. |
-| **COO** | Coordinate List: `Tensor<C2>(H,W)` — two ranks merged into one flat list of (H,W) coordinate tuples. |
-| **Concordant traversal** | Iterating through a fiber in storage order (cheap: O(1) per step with a coordinate/payload list). |
-| **Discordant traversal** | Accessing a fiber out of storage order, e.g., looking up arbitrary coordinates (expensive: O(log n) with a C list). |
-| **Coordinate projection** | Deriving one operand's required coordinate from another's coordinate via arithmetic (e.g., `w = q + s`). |
-| **Fiber intersection** | Retaining only coordinate positions present in both of two fibers; the hardware primitive for two-sparse work reduction. |
-| **Fiber split (position space)** | Dividing a fiber into equal-sized chunks by position (non-zero count) for parallel processing. |
-| **Gating** | Suppressing reads and computes when an operand is zero; saves energy but not time. |
-| **Skipping** | Restructuring the loop to iterate only over non-zero coordinates; saves both time and energy. |
-| **Cambricon-X** | Sparse accelerator (Zhang et al., Micro 2016) exploiting weight sparsity via metadata-guided input loading. |
-| **SCNN** | Sparse CNN accelerator (Parashar et al., ISCA 2017) using input-stationary Cartesian-product multiplication and a scatter network for two-sparse reduction. |
-| **ISOSceles** | IS-OS pipelined accelerator (Yang et al., HPCA 2023) combining an IS frontend and OS backend with rank-swizzled intermediate tensor T; 7.5× latency speedup. |
-| **Rank swizzle** | Reordering (transposing) the rank order of a tensor to convert a discordant traversal into a concordant one. |
-
----
+| **Rank** | A tensor dimension, represented as one level of a fibertree. |
+| **Coordinate** | Mathematical index within a rank. |
+| **Point** | Tuple of coordinates identifying a tensor element. |
+| **Position** | Physical offset in a storage array; equals coordinate only in uncompressed ranks. |
+| **Payload** | Either a scalar value or a pointer/reference to a lower-rank fiber. |
+| **Fiber** | Ordered set of coordinate/payload pairs at one rank. |
+| **Fibertree** | Tree representation of a tensor where ranks are levels and fibers connect levels. |
+| **`getPayload(c)`** | Random lookup of the payload at coordinate \(c\). |
+| **`getNext()`** | Iterator returning the next coordinate/payload pair in traversal order. |
+| **CSR** | Compressed Sparse Row; `Tensor<U,C>(H,W)`, efficient for row-major traversal. |
+| **CSC** | Compressed Sparse Column; `Tensor<U,C>(W,H)`, efficient for column-major traversal. |
+| **COO** | Coordinate list format storing merged coordinate tuples. |
+| **Concordant traversal** | Traversal order matches storage/rank order, enabling cheap sequential reads. |
+| **Discordant traversal** | Traversal order conflicts with storage/rank order, often requiring random lookup. |
+| **Projection** | Coordinate arithmetic mapping one tensor's coordinate space into another, e.g., \(w=q+s\). |
+| **Intersection** | Operation that emits only coordinates present in both sparse operands. |
+| **Position-space split** | Splitting a fiber by stored nonzero count to balance work. |
+| **Coordinate-space split** | Splitting a fiber by coordinate ranges to preserve geometry. |
+| **Rank swizzle** | Reordering tensor ranks to make a later traversal concordant. |
+| **Cnvlutin** | Activation-sparsity accelerator using zero-free neuron encoding and lane decoupling. |
+| **SCNN** | Sparse CNN accelerator using input-stationary Cartesian-product sparse multiplication. |
+| **ISOSceles** | Slide-cited IS-OS sparse convolution dataflow using an intermediate tensor and rank swizzling. |
 
 ## Takeaways
 
-- **Fibertrees unify all tensor representations** under one abstraction: fibertrees with uncompressed, coordinate/payload, run-length, hash, or merged (CSR/CSC/COO) rank implementations all implement the same `getPayload`/`getNext` interface; hardware can be designed against the abstraction and then specialized to the representation.
-- **Concordant traversal is cheap; discordant is not.** The design of a sparse loop nest must ensure that the operand being iterated concordantly is compressed and the one being looked up is either uncompressed (O(1) random access) or small.
-- **Coordinate projection** is the arithmetic that maps between index spaces across operands in a convolution (e.g., `w = q+s`); it is cheap but must be explicitly computed by hardware.
-- **Fiber intersection** achieves multiplicative (product-of-densities) work reduction when both operands are sparse; it is the key primitive distinguishing "exploit one sparse operand" from "exploit both."
-- **Three real accelerators** embody three points on the design space: Cambricon-X (weight sparsity only, weight-stationary), SCNN (both sparse, input-stationary with Cartesian product), ISOSceles (both sparse, IS-OS pipelined with rank swizzle, best PE utilization).
-- **Data layout (Format) and loop order (Mapping) are tightly coupled** for sparse accelerators: changing which rank is compressed or which loop is outer can flip a concordant traversal to a discordant one, turning an O(1) per-step operation into O(log n). These are the Format and Mapping layers of the TeAAL pyramid in action.
+- Fibertrees give a common language for dense and sparse tensor layouts.
+- Coordinate and position must be separated whenever a rank is compressed.
+- Sparse formats are traversal-dependent: concordant `getNext()` can be cheap while discordant `getPayload()` can be expensive.
+- Convolution sparsity requires coordinate projection; two-sparse convolution additionally requires intersection.
+- Cnvlutin, SCNN, Eyeriss v2, and ISOSceles occupy different points in the design space: activation skipping, two-sparse Cartesian products, compressed-domain sparse PEs, and IS-OS pipelining.
+- Sparse dataflow design is a three-way negotiation among reuse, skipping, and output routing.
 
----
+## Connections
 
-## Connections to Later Lectures
-
-- **L08 (Sparse Architectures 1):** introduced the motivation for sparsity and basic gating/format concepts; this lecture (L09) extends those foundations to the full fibertree abstraction and loop-nest design for skipping.
-- **L10 (Sparse Architectures 3):** continues the sparse-accelerator story with further designs and the TeAAL framework for formally specifying sparse tensor algebra hardware, closing the three-lecture arc.
-- **Einsum formalism (L04 / L07):** the `Z[m,n] = A[m,k] × B[k,n]` and convolution Einsum notation used throughout this lecture was introduced earlier; here it is extended with intersection (`&`) and projection (`.project()`) operators for sparse operands.
-- **Fiber representations and the Format layer:** the CSR/CSC/COO/bitmask formats introduced here are the concrete instances of the **Format** layer of the TeAAL Pyramid of Concerns first seen in L01.
-
----
+- **L08:** introduced SAFs and metadata tradeoffs; L09 shows how metadata is traversed.
+- **L10:** continues toward formal sparse accelerator specification and TeAAL-style modeling.
+- **Mapping lectures:** stationarity determines whether a tensor is streamed, looked up, or accumulated.
+- **Einsum lectures:** projection and reduction are direct consequences of convolution index expressions.
+- **Paper bridges:** TeAAL provides the abstraction, Cnvlutin shows activation skipping, SCNN shows two-sparse Cartesian products, and Eyeriss v2 shows compressed-domain sparse PE design.
 
 ## Appendix — Slide-to-Section Map
 
-| Slides | Section |
-|---|---|
-| L09-1 | Title |
-| L09-2 … L09-5 | Ch.1 — Motivation: sparse tensors everywhere; three sparsity levers |
-| L09-6 … L09-17 | Ch.1 — Fibertree abstraction: ranks, coordinates, payloads, fibers |
-| L09-18 … L09-35 | Ch.2 — Fiber representation choices; CSR/CSC/COO notation |
-| L09-36 … L09-51 | Ch.2 — Traversal efficiency: concordant vs. discordant; hardware datapath |
-| L09-52 … L09-71 | Ch.2 — Merging/splitting ranks; sparsity specifications (channel, sub-kernel, 2:4, HSS); Einsum review |
-| L09-72 … L09-96 | Ch.3 — Sparse weights in CONV: output-stationary and weight-stationary loop nests; Cambricon-X |
-| L09-97 … L09-111 | Ch.4 — Sparse inputs: sliding-window traversal; CNVLUTIN |
-| L09-112 … L09-128 | Ch.4 — Two-sparse: projection + intersection; output-stationary hardware |
-| L09-112 … L09-124 | Ch.5 — SCNN: Cartesian product, scatter network, latency/energy vs. density |
-| L09-129 … L09-138 | Ch.6 — ISOSceles: IS-OS two-step dataflow, rank swizzle, 7.5× speedup |
+| Slide range | Chapter section | Notes |
+|---|---|---|
+| L09-1 to L09-5 | Motivation and SAF recap | Expanded as TL;DR, problem, and why it matters |
+| L09-6 to L09-18 | Tensor terminology and fibertree | Expanded with coordinate/position explanation |
+| L09-19 to L09-35 | Fiber representations, CSR/CSC | Rewritten as representation and storage examples |
+| L09-36 to L09-51 | Traversal efficiency | Expanded with `getPayload`/`getNext` cost model |
+| L09-52 to L09-60 | Merge, split, sparsity specs, HSS | Integrated into rank transformations |
+| L09-61 to L09-71 | Einsum review and convolution projection | Rewritten as coordinate projection |
+| L09-72 to L09-96 | Sparse weights in convolution | Expanded with loop nests and hardware blocks |
+| L09-97 to L09-111 | Sparse inputs and Cnvlutin | Expanded with sparse sliding window |
+| L09-112 to L09-128 | Sparse inputs and weights, SCNN, intersection | Expanded with projection-plus-intersection example |
+| L09-129 to L09-138 | ISOSceles IS-OS dataflow | Slide-derived explanation; no local ISOSceles PDF in Worker B input |
+
+## Source Notes
+
+- Fibertree terminology and traversal ordering follow Lecture 09 slides 6-51 and TeAAL Sections 2.1-2.3.
+- Rank merge/split/swizzle discussion follows Lecture 09 slides 51-60 and TeAAL Section 3.2.
+- Convolution projection and loop nests follow Lecture 09 slides 72-128.
+- Cnvlutin discussion uses `papers/L18_Cnvlutin_Albericio_ISCA2016.pdf`, especially Sections III, IV-B, and V.
+- SCNN discussion uses `papers/L17_SCNN_Parashar_ISCA2017.pdf`, especially Sections II-IV and VIII.
+- Eyeriss v2 discussion uses `papers/L17_EyerissV2_Chen_JETCAS2019.pdf`, especially Sections IV-V.
+- Cambricon-X and ISOSceles are discussed from Lecture 09 slide anchors only; local PDFs were not included in the Worker B input.
+- `papers/L08_FastAlgorithmsWinograd_Lavin_2015.pdf` was inspected but not used substantively because Winograd convolution is not central to Lecture 09's sparse traversal narrative.
+
+## Uncertainty Notes
+
+- This chapter reconstructs the likely lecture narration from slides and papers; live lecture emphasis may differ.
+- ISOSceles quantitative claims are slide-derived only.
+- Existing `assets/L09/` image files may be copyright-sensitive, but asset cleanup is outside Worker B's requested write scope.

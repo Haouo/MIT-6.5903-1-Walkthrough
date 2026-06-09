@@ -1,16 +1,49 @@
 # L11 — 進階技術（Advanced Technologies）
 
 > **課程：** 6.5930/1 — 深度學習硬體架構（Hardware Architectures for Deep Learning）
-> **講師：** Joel Emer 與 Vivienne Sze（MIT EECS）
+> **講師：** Joel Emer 與 Vivienne Sze
 > **講授日期：** 2026 年 3 月 9 日 · **投影片：** 81 頁 · **來源：** [`Lecture/L11-Advanced_Tech.pdf`](../../Lecture/L11-Advanced_Tech.pdf)
 >
-> *本文是以「概念」為單位重建講課脈絡的導讀（walkthrough），依主題而非逐頁編排。每一節都標註其對應的投影片範圍，方便你對照原始投影片閱讀。*
+> 本章依據投影片與本地論文 PDFs 重建 lecture narrative。為了 copyright safety，本章不重製投影片或論文圖，而用文字描述必要視覺內容。
 
 ---
 
 ## 一句話總結（TL;DR）
 
-DNN 加速器中最大的能耗不是算術運算——而是**搬移資料**。本課程至今介紹的每一種技術，本質上都是一種「讓資料靠近運算」的手段。本講把這個洞見推至邏輯的極端：如果讓運算直接移進記憶體本身呢？**記憶體內運算（Compute-in-Memory, CiM）** 利用記憶體元件的物理特性——電阻、電壓、電荷——在儲存陣列內部直接執行乘加（MAC）運算，從根本上消除最昂貴的資料搬移。本講依序涵蓋：(1) 從 SRAM 到 3D 疊層 DRAM 的記憶體技術全貌，說明為何 CiM 是必然的；(2) 類比交叉開關（analog crossbar）作為 CiM 核心原語及其設計取捨；(3) **Titanium Law**——量化類比數位轉換器（ADC）開銷為 CiM 能耗的根本瓶頸；(4) **RAELLA** 作為「免重新訓練逃脫瓶頸」的案例研究；(5) CiM 在 SRAM、DRAM 與非揮發性記憶體（NVM）上的不同實作；以及 (6) **CiMLoop** 作為能夠進行系統性設計空間探索的建模工具，並以光子運算（photonic computing）作為新興前沿。統一的教訓是：當計算基板的物理特性進入設計循環時，跨層（裝置 → 電路 → 架構 → 映射 → 工作負載）的協同設計（co-design）是不可迴避的。
+本課程多數時間都把 memory 視為 digital MAC array 周圍的 hierarchy。Lecture 11 問的是：當這條 compute-memory 邊界開始移動，會發生什麼？**鄰近記憶體運算（near-memory processing）** 仍然讓 compute 與 memory 分離，但縮短兩者距離，例如 eDRAM 與 3D-stacked DRAM。**記憶體內運算（compute-in-memory, CiM）** 更進一步：memory device 或 array 本身參與 computation。
+
+本講主線是：data movement 很昂貴，因此設計者先把 memory 移近 compute，再把簡單 compute 移近 memory，最後問 memory 本身能否做 MAC。Analog CiM crossbar 用 Ohm's Law 做 multiplication、用 Kirchhoff's Current Law 做 accumulation，但 practical systems 往往被 peripheral costs 主導，尤其是 ADC。**Titanium Law** 把 ADC energy 表達為 energy per conversion、conversions per MAC、MACs per DNN 與 utilization penalty 的乘積。Slides 中的 **RAELLA** 與 **CiMLoop** 展示為什麼 advanced technologies 必須跨 device、circuit、architecture、mapping 與 workload 做 co-design。
+
+---
+
+## 本講解決什麼問題
+
+本講問題不是「如何發明更快 multiplier？」而是：
+
+> 當 data movement 主導 energy 與 performance 時，compute-memory 邊界的哪些部分應該重畫？重畫之後，新瓶頸會在哪裡出現？
+
+Near-memory designs 會縮短 wire distance、增加 bandwidth。CiM designs 嘗試完全消除某些 reads。但兩者都不會讓 computation 免費。eDRAM 消耗 area 並有 refresh/circuit constraints；3D memory 有 thermal 與 logic-die area limits；analog CiM 需要 DAC、ADC、calibration、precision slicing 與可靠 modeling。這講是在教你如何評估這些技術，而不是被 peak TOPS 閃瞎。
+
+---
+
+## 為什麼本講重要
+
+Advanced technologies 很有誘惑力，因為它們聽起來像 memory wall 的逃生門。Hardware architect 需要問更冷靜的問題：哪個成本被移走了？它又在哪裡重現？
+
+例如 resistive crossbar 可以「就地」計算很多 products，但結果是 analog current。如果 accelerator 其餘部分是 digital，current 必須經過 ADC。省下的 weight reads 可能換成 conversion energy、limited precision 與 array utilization loss。這就是為什麼 L11 不是 device survey，而是**跨層 accounting** 的課。
+
+---
+
+## 先備知識與心智模型
+
+你應該熟悉：
+
+- L01-L03 的 energy hierarchy：off-chip memory 遠比 local arithmetic 昂貴。
+- L05 的 dataflow：讓某個 operand stationary 可以減少 movement。
+- L07-L10 的 sparsity：減少 MACs 只有在 overhead 被計入時才有意義。
+- Matrix-vector multiplication：$y_j = \sum_i x_i w_{ij}$。
+
+L11 的心智模型是一個 matrix-vector multiply。在 digital accelerator 中，weights 從 memory 讀出後送到 MACs。在 near-memory processing 中，weight memory 物理上更近或 bandwidth 更高。在 CiM 中，stored weight 本身幫忙產生 product。
 
 ---
 
@@ -18,369 +51,504 @@ DNN 加速器中最大的能耗不是算術運算——而是**搬移資料**。
 
 讀完本講後，你應該能夠：
 
-- 說明**記憶體技術分類**（SRAM、eDRAM、3D 疊層 DRAM、NVM），以及每一種如何從不同面向緩解資料搬移瓶頸。
-- 描述**類比交叉開關**如何利用歐姆定律與克希荷夫電流定律執行矩陣向量乘積。
-- 列出 **Titanium Law 的四個因子**，並說明各個旋鈕彼此之間的制衡關係。
-- 解釋為何 **ADC 開銷**（能耗與面積）在多數 CiM 設計中是主導成本，以及應對它的設計策略。
-- 描述 **RAELLA** 用來減少 ADC 輸入範圍的三種技術（免重新訓練）。
-- 闡明為何 **CiM 需要跨層協同設計**（裝置 ↔ 電路 ↔ 架構 ↔ 映射 ↔ 工作負載），以及 CiMLoop 如何對整個堆疊建模。
-- 舉出至少一種**超越 SRAM 的 CiM 基板**（DRAM、ReRAM/memristor、SRAM、光子學），並說明其區別特性。
+- 區分**鄰近記憶體運算（near-memory processing）**與**記憶體內運算（compute-in-memory）**。
+- 解釋 eDRAM 與 3D-stacked DRAM 分別降低 memory bottleneck 的哪一部分。
+- 描述 analog crossbar 如何用 voltage、conductance 與 current 計算 dot product。
+- 解釋為什麼 ADC 與 DAC 可能主導 practical CiM systems。
+- 讀懂 **Titanium Law**，並判斷某項技術改變了哪個 factor。
+- 解釋 pruning、low precision 與 array size 在 CiM 中為何與 digital accelerator 不同。
+- 描述 **RAELLA** 對 ADC input distribution 做了什麼改變。
+- 說明為什麼 **CiMLoop** 這類 modeling tool 對跨 devices 與 circuit styles 的公平比較不可或缺。
+- 用 DaDianNao、Neurocube、Tetris 與 TPU 作為 memory-centric design choices 的 anchored examples。
 
 ---
 
-## 第一章 — 為什麼要把運算帶向記憶體？
+## 主要教材式敘事
 
-> *投影片：L11-2 … L11-9*
+### 1. 從 Memory Cost 開始，而不是從 Device Hype 開始
 
-### 記憶體技術全貌
+Lecture 11 slide 5 重複 Horowitz, ISSCC 2014 的量化動機：8-bit add 是 0.03 pJ，32-bit SRAM read from 8 KB SRAM 是 5 pJ，32-bit DRAM read 是 640 pJ。這些是 slide-derived numbers。精確數值依 process 與 assumptions 而變，但排序是穩定教訓：從遠處搬資料通常比對資料做運算更昂貴。
 
-每一個實際的 DNN 系統都包含一個記憶體技術的階層（hierarchy），各技術在密度、成本與存取能耗之間佔據不同的位置：
+這解釋了本講順序：
 
-![進階儲存技術分類——近記憶體運算與記憶體內運算](../../assets/L11/L11-p02-storage-taxonomy.png)
+1. 用 eDRAM 把更多 memory 放到 chip 上。
+2. 用 3D stacking 把 DRAM 放進 package。
+3. 把簡單 compute 放在 logic layer 或 memory periphery。
+4. 讓 memory array 直接參與 computation。
 
-本講把這些技術組織成兩大策略，以攻克資料搬移問題：
+### 2. Near-Memory Processing：仍是 Digital，但更靠近
 
-- **鄰近記憶體的處理／運算（Processing/Compute Near Memory，近資料處理）：** 把運算*靠近*記憶體，但兩者仍物理分離。
-  - *嵌入式 DRAM（eDRAM）* ——密度比 SRAM 高（比六電晶體 SRAM 高 2.85 倍），可在晶片上放更多儲存，避免昂貴的片外 DRAM 存取。DaDianNao 用 36 MB eDRAM 存放全連接層的權重，能效比 DDR3 高 321 倍。
-  - *3D 疊層 DRAM* ——將多層 DRAM 堆疊在邏輯晶粒上方（混合記憶體立方體 HMC / 高頻寬記憶體 HBM）。NeuroCube 展示了比 DDR3 高 6.25 倍的頻寬；Tetris 將 HMC 與 Eyeriss 空間架構結合，達到比二維 DRAM 低 1.5 倍的能耗與高 4.1 倍的吞吐量。
+**eDRAM** 是 density move。Lecture 11 slides 6-8 說 eDRAM 比 SRAM dense，並以 DaDianNao 為例。DaDianNao 把大量 synaptic weights 存在 on-chip eDRAM，降低昂貴 off-chip memory traffic。Paper 報告在 28 nm 下 10 MB SRAM 需要 20.73 mm2，同容量 eDRAM 有 2.85x higher storage density；256-bit eDRAM read 為 0.0192 nJ，而 Micron DDR3 為 6.18 nJ，energy ratio 為 321x（DaDianNao Section V-A）。這些是 paper-derived claims。
 
-- **記憶體內的處理／運算（Processing/Compute In Memory，記憶體內運算）：** 將運算*整合進*記憶體陣列本身，或*使用*記憶體元件來執行計算。這是本講其餘部分的核心主題。
+**3D-stacked DRAM** 是 bandwidth 與 distance move。HMC/HBM 類堆疊把 DRAM dies 放在 logic die 附近或上方，用 TSVs 連接。Tetris 報告 3D memory 提供 160-250 GB/s bandwidth，且 access energy 比 DDR3 低 3-5x，接著用這個 substrate 重新平衡 accelerator area 並把 accumulation 移近 memory（Tetris Section 2.4 and Section 3）。Neurocube 使用 HMC-style memory，讓 vault controllers 中的 programmable sequence generators 驅動 neural-network data movement（Neurocube Sections III-V）。
 
-### 片外 DRAM 存取成本是根本驅動力
+教學解讀：eDRAM 問「足夠多 weights 能不能放近 compute？」3D memory 問「memory bandwidth 能不能跟 PE count 一起 scale？」兩者大多仍保留 digital arithmetic，還沒有讓 memory cells 成為 multipliers。
 
-記憶體存取成本的量化數據，是後續一切討論的基礎：
+### 3. Compute-In-Memory：讓 Array 成為 Datapath
 
-![記憶體存取成本階層——32 位元 DRAM 讀取 640 pJ vs. 8 位元加法 0.03 pJ](../../assets/L11/L11-p05-memory-cost-hierarchy.png)
+在 analog resistive crossbar 中，每個 weight 存為 conductance $G$，每個 input 以 voltage $V$ 施加，device current 是：
 
-這些數字（來自 Horowitz, ISSCC 2014）觸目驚心：一次 32 位元 DRAM 讀取耗費 **640 pJ**，而一次 8 位元整數加法僅需 **0.03 pJ**，兩者比值超過 **20,000:1**。就算是片上 32 位元 SRAM 讀取（8 KB），也需要約 5 pJ，是 8b 加法的 167 倍。結論不可迴避：資料搬移是瓶頸，任何能降低其成本的方法都有巨大的價值。
+$$
+I = V G.
+$$
 
-> **為什麼重要：** L01 建立的能耗階層（RF 1× → DRAM 200×）如今有了實測矽晶片數據的支撐。CiM 是直接的架構回應：既然對權重陣列的讀取是最大的成本，如果那次讀取根本不發生——因為運算在陣列內部完成了——又如何？
+對一個 column 而言，多個 rows 的 currents 會相加：
+
+$$
+I_{\text{col}} = \sum_i V_i G_i.
+$$
+
+這就是 dot product。Ohm's Law 提供 multiplication；Kirchhoff's Current Law 提供 addition。Crossbar 天然是 **weight-stationary**：weights 留在 memory array，input vectors 重複施加。
+
+理想圖像很強，但不完整。Digital DNN accelerator 仍需要 digital activations 與 outputs，因此 practical CiM systems 需要：
+
+- DACs 或 pulse encoders，把 inputs 呈現給 array。
+- ADCs，把 column currents 轉回 digital values。
+- Bit slicing，因為 device 可存 bits 少於 model weight 精度。
+- Calibration 與 margins，以處理 nonlinearity、device variation、temperature、voltage 與 noise。
+- Mapping decisions，讓 arrays 保持 utilized。
+
+### 4. ADC 是 CiM 的稅吏
+
+Lecture 11 slides 29-52 聚焦 ADC bottleneck，並介紹 **Titanium Law**：
+
+$$
+\frac{E_{\text{ADC}}}{\text{DNN}}
+=
+\frac{E_{\text{convert}}}{\text{convert}}
+\cdot
+\frac{\text{converts}}{\text{MAC}}
+\cdot
+\frac{\text{MACs}}{\text{DNN}}
+\cdot
+\frac{1}{\text{utilization}}.
+$$
+
+每個 factor 都是一個 lever：
+
+- $E_{\text{convert}}/\text{convert}$ 會隨 ADC resolution 急遽上升。
+- $\text{converts}/\text{MAC}$ 會在 weights 或 inputs 被切成多個 cycles/devices 時上升。
+- $\text{MACs}/\text{DNN}$ 由 smaller models、pruning 或 algorithmic changes 降低。
+- $1/\text{utilization}$ 在 array 部分空著時上升。
+
+痛點在於 levers 彼此打架。降低 ADC resolution 可能需要更多 slices，使 conversions per MAC 上升。增加 array rows 可能改善某些 shapes 的 utilization，但也提高 analog summation range 與所需 ADC resolution。Pruning 降低 MACs，卻可能讓 CiM arrays 填不滿。
+
+### 5. RAELLA：改變 ADC 看見的 Distribution
+
+Lecture 11 slides 43-52 以 RAELLA 作為 Titanium Law 的回應。Slide-derived explanation 是：RAELLA 在不 retrain DNN 的情況下，降低 ADC 看到的 analog input range。它使用：
+
+- **Center + offset encoding：** 減去 column center，讓 analog array 計算較小 residuals。
+- **Adaptive weight slicing：** 只對可能超過 ADC range 的 computations 花額外 conversions。
+- **Dynamic input slicing：** 先用粗 input slices speculate，只有需要時才 recover。
+
+Lecture 11 slide 52 報告 input to ADC 降低 1024x，energy efficiency 相對 iso-area ISAAC 提升 3.9x，throughput 提升 1.8x。由於 RAELLA PDF 不在本 worker 指定 local paper list 中，這些 claims 在本章標記為 slide-derived。
+
+### 6. CiM 橫跨 SRAM、DRAM、NVM 與 Photonics
+
+接著本講把 substrate 視野打開：
+
+- **SRAM CiM** 可用 current-mode 或 charge-sharing circuits。它 process-compatible，但受 SRAM cell area 與 circuit nonidealities 限制。
+- **DRAM CiM** 可利用 charge sharing 做 in-array bitwise operations。它有 density 優勢，但面對 refresh、timing 與 peripheral constraints。
+- **NVM / ReRAM / memristor CiM** 天然以 resistance/conductance 存 weights，dense 且 nonvolatile，但 precision 與 variation 是大問題。
+- **Photonics** 用 light propagation、modulation 與 interference 實作 linear algebra primitives。Lecture 11 用它作為 emerging example，展示 data-movement physics 如何不同於 CMOS wires。
+
+重要教訓是：這些不是可互換的「更快 MAC」技術。每一種都改變 cost model，因此也改變最佳 mapping 與 model design。
+
+### 7. CiMLoop：對整個 Stack 建模
+
+Lecture 11 slides 62-75 將 CiMLoop 呈現為 Timeloop/Accelergy-style tool 的 CiM 延伸。關鍵 modeling requirement 是 **data-value dependence**：analog energy 可能取決於實際被處理的 values，而不只是 operation count。高 conductance device 在高 input voltage 下耗散的 energy，比低 conductance device 在低 voltage 下更多。
+
+Slide-derived claims 是：CiMLoop 可捕捉 cross-stack interactions，error within 8%；用 statistical models 比 prior accurate simulation 快超過 1000x；並可把 designs normalize 到相同 technology/device/ADC assumptions 比較。教學解讀是：advanced technologies 讓 modeling 更重要，而不是更不重要。當 device physics 進入 datapath，單純 MAC count 不再是安全 proxy。
 
 ---
 
-## 第二章 — 類比交叉開關：CiM 的核心原語
+## Worked Examples
 
-> *投影片：L11-10 … L11-27*
+### 範例 1：為什麼移動 Weights 很重要
 
-### 傳統處理 vs. 記憶體內運算
+假設某 layer 做 1 million 次 8-bit additions，並需要 1 million 次 32-bit DRAM reads。用 slide-derived Horowitz numbers，adds 約花 $1{,}000{,}000 \times 0.03$ pJ = 30,000 pJ，而 DRAM reads 約花 $1{,}000{,}000 \times 640$ pJ = 640,000,000 pJ。Reads 主導。
 
-在系統層級，對比最為鮮明：
+精確數字不應過度泛化，但 design lesson 穩定：能減少遠端 memory reads 的 technology，可能比稍微更有效率的 arithmetic unit 更重要。
 
-![傳統處理 vs. 記憶體內運算——資料流比較](../../assets/L11/L11-p10-cim-vs-conventional.png)
+### 範例 2：Crossbar Dot Product
 
-在*傳統*加速器中，權重存放在記憶體陣列中，必須透過高頻寬匯流排讀出到獨立的 MAC 單元。讀取匯流排是瓶頸：大量位元組必須走過漫長的導線，在每一跳都付出電容充放電能耗。在 *CiM* 加速器中，權重留在陣列中，輸入激活值以電壓（透過 DAC）送至陣列周邊電路，運算在陣列內部進行，只有一個低頻寬的電流加總輸出，再由 ADC 轉換為數位訊號。晶片內部的讀取頻寬大幅降低。
+令三個 inputs voltages 為 $V = [1, 2, 1]$，三個 stored conductances 為 $G = [3, 0.5, 2]$，使用任意 normalized units。Column current 是：
 
-### 歐姆定律做乘法，克希荷夫定律做累加
+$$
+I_{\text{col}} = 1 \cdot 3 + 2 \cdot 0.5 + 1 \cdot 2 = 6.
+$$
 
-物理機制簡潔優雅：
+這與 dot product 是同一個 computation。硬體意義是 array 沒有把三個 weights 讀出送到 digital multiplier；但 output current 仍需要 sensing、range control，通常也需要 ADC conversion。
 
-![類比 MAC 原理——電壓 × 電導 = 電流，電流在位元線上相加](../../assets/L11/L11-p11-analog-mac-principle.png)
+### 範例 3：讀 Titanium Law
 
-- 每個**權重**以元件的*電導*（conductance）G 來儲存（電導 = 1 / 電阻）。
-- 每個**輸入激活值**以字線（word line）上的*電壓* V 來傳遞。
-- 由歐姆定律，流過元件的電流為 I = V × G。這就是一次**乘法**。
-- 同一位元線上的所有電流依克希荷夫電流定律自動相加：I_total = Σ Vᵢ × Gᵢ。這就是一次**累加**（點積）。
+假設某 design 用 lower-resolution ADC 讓每次 ADC conversion energy 降低 4x，但因為 extra slicing，現在每個 MAC 需要 3x conversions。忽略其他 factors，ADC energy 變化為：
 
-因此，一整列交叉開關可以在*一個時步*內完成整個點積——使用電路的物理特性，無需任何數位加法器樹。這是 CiM 倡導者稱之為「根本性不同的運算典範」的原因。
+$$
+\frac{1}{4} \times 3 = 0.75.
+$$
 
-### CiM 陣列中的權重駐留資料流（weight-stationary dataflow）
-
-CiM 陣列的自然資料流是**權重駐留（weight-stationary）**：權重寫入陣列一次後保持不動，輸入向量流串流通過。
-
-![權重駐留 CiM 資料流——迴圈巢狀與陣列組織](../../assets/L11/L11-p14-weight-stationary-cim.png)
-
-這個映射完美嵌入早先講次中引入的迴圈巢狀（loop nest）視角：M（輸出通道，對應權重矩陣的列）與 CHW（輸入通道—高度—寬度，對應權重矩陣的行）維度分別映射到陣列的列與行。好處包括：減少權重資料搬移（權重程式化後不再移動）、更高的記憶體讀取頻寬（一行同時並行讀取多個權重）、更高的吞吐量（多個點積運算同步執行），以及更低的輸入激活值傳遞成本（激活值一次同時傳遞給多列）。
-
-### 設計考量與實際限制
-
-類比運算引入了一系列會*削減*理想增益的實際限制：
-
-1. **非線性與元件變異（製程/電壓/溫度 PVT）：** 類比數值對製程、電壓與溫度的變化非常敏感，限制了可達到的精度。
-2. **每個權重所需的儲存元件數（權重切片 weight slicing）：** 每個元件通常只能儲存 1–4 位元的精度。一個完整的 8 位元權重需要多個元件（「位元切片 bit slices」），使陣列面積和 ADC 轉換次數倍增。
-3. **陣列大小限制：** 字線與位元線的電阻和電容隨陣列尺寸增大。大型陣列降低穩健性與感測餘裕。當工作負載無法填滿整個陣列時，利用率下降。
-4. **可並行激活的列數：** 受限於 ADC 可解析的範圍。更多並行列 → 更大的類比加總 → 需要更高解析度的 ADC → 指數級更高的能耗。
-5. **可並行激活的行數：** 受限於 ADC 面積（每行一個 ADC 代價高昂）。
-6. **輸入傳遞時間：** DAC 非線性迫使採用時間編碼的輸入（脈衝寬度調變 PWM），每個輸入需要多個週期，降低吞吐量。
-7. **時域累加（temporal accumulation）：** 元件的一位元或兩位元操作需要多個週期的時域累加來建立多位元結果，進一步降低吞吐量。
-
-這些限制意味著，類比運算的原始物理加速，會被陣列兩側數位介面的大量開銷顯著侵蝕。
-
-> **為什麼重要：** 任何 CiM 所宣稱的增益，都必須對照這些開銷加以評估。其中的 ADC——它必須把類比位元線電流轉換回數位數字——最終是主導成本。下一章會精確量化這一點。
+這只有 1.33x ADC-energy improvement，不是 4x。Titanium Law 的價值就是防止某個 knob 被單獨宣傳，而其 coupled cost 被藏起來。
 
 ---
 
-## 第三章 — Titanium Law 與 ADC 瓶頸
+## 關鍵方程式與讀法
 
-> *投影片：L11-29 … L11-52*
+Analog multiplication：
 
-### CiM 加速器的能耗分解
+$$
+I = V G.
+$$
 
-當你把整個系統的能耗納入考量，能耗分布令人驚訝：
+Input activation 由 voltage $V$ 表示，weight 由 conductance $G$ 表示，product 由 current $I$ 表示。
 
-![CiM 加速器能耗分解——ADC 主導](../../assets/L11/L11-p29-cim-energy-breakdown.png)
+Analog accumulation：
 
-ADC（類比數位轉換器）消耗了系統總能耗的相當大一部分——在許多設計中，甚至超過類比交叉開關計算本身的能耗。DAC 能耗與其他類比處理的開銷更加劇了這一問題。CiM 所承諾的效率確實存在，但大部分被轉換介面的開銷所消耗。
+$$
+I_{\text{col}} = \sum_i V_i G_i.
+$$
 
-### Titanium Law：ADC 能耗的封閉解析式
+同一 bitline 上的 currents 物理相加，形成 dot product。
 
-本講介紹了 Andrulis, ISCA 2023 提出的一個關鍵分析結果：
+Titanium Law：
 
-![Titanium Law——ADC 能耗為四個因子之積](../../assets/L11/L11-p30-titanium-law.png)
+$$
+\frac{E_{\text{ADC}}}{\text{DNN}}
+=
+\frac{E_{\text{convert}}}{\text{convert}}
+\cdot
+\frac{\text{converts}}{\text{MAC}}
+\cdot
+\frac{\text{MACs}}{\text{DNN}}
+\cdot
+\frac{1}{\text{utilization}}.
+$$
 
-每次 DNN 推論的總 ADC 能耗是四個因子的乘積：
-
-```
-ADC 能耗        每次轉換     轉換次數      MAC 次數       1
-────────── = ──────────── × ────────── × ────────── × ──────────
-    DNN        的能耗         / MAC          / DNN        利用率
-```
-
-- **Energy/Convert（每次轉換能耗）：** 每次 ADC 轉換的能耗——隨 ADC 解析度（位元數）*指數級*增加。這是最陡峭的項。
-- **Converts/MAC（每 MAC 轉換次數）：** 每次 MAC 所需的 ADC 轉換次數——由權重切片與輸入切片決定（表示所需精度的位元切片數量）。
-- **MACs/DNN（每次 DNN 推論的 MAC 總次數）：** 由工作負載而非硬體決定。
-- **1/Utilization（利用率倒數）：** 陣列利用率的懲罰項——恆大於等於 1，當工作負載無法填滿陣列維度時惡化。
-
-這條定律揭示了根本的張力：降低 ADC 解析度（節省 Energy/Convert）需要更多切片（提高 Converts/MAC）；增大陣列（降低 1/Utilization）會增加類比加總範圍（提高所需 ADC 解析度）。每個旋鈕都會收緊另一個限制。
-
-### 套用定律：為何 ISAAC 的取捨難以逃脫
-
-ISAAC 設計（Shafiee, ISCA 2016）使用 128 列的 2 位元 memristor。套用 Titanium Law：
-
-- 將列數增至 1024 列（降低 1/Utilization）但迫使 ADC 升至 11 位元解析度，ADC 能耗更加主導。
-- 將每個 memristor 的位元數降至 1 位元（降低 Energy/Convert），但增加了 Converts/MAC——ADC 能耗再次上升。
-
-兩個方向都使 ADC 能耗相對於交叉開關運算能耗更加惡化。這不是 ISAAC 的缺陷，而是設計空間中的基本張力。
-
-### 兩種先前的逃脫路線及其代價
-
-已有兩種策略被用來繞過 Titanium Law，各自付出代價：
-
-1. **權重剪枝（weight-count-limited 設計）：** 透過剪枝網路來降低 MACs/DNN。這降低了「MACs/DNN」因子。代價：剪枝後的網路可能犧牲精度；更少的權重可能導致 CiM 陣列的利用率下降。
-2. **低解析度 ADC（sum-fidelity-limited 設計）：** 使用更低解析度的 ADC，降低 Energy/Convert。代價：ADC 無法精確表示所有輸出值；必須透過重新訓練 DNN 來使其容忍低解析度讀出。
-
-兩種方法都**需要重新訓練 DNN**才能保持精度——這耗費高昂，並將硬體設計與模型直接耦合在一起。
-
-### RAELLA：免重新訓練地重塑分布
-
-RAELLA（Andrulis, ISCA 2023）透過三種在*推論時*套用的互補技術，在不修改 DNN 的情況下逃脫瓶頸：
-
-![RAELLA 分布重塑——三種技術降低 ADC 輸入範圍](../../assets/L11/L11-p43-raella-reshape.png)
-
-**技術一 — 中心 + 偏移量編碼（Center + Offset Encoding，平移分布均值）：**
-每一行的權重被分解為*中心值*（均值）與*偏移量*（殘差）。中心值以高精度數位計算（代價低，因為它是純量乘法）。類比陣列只計算偏移量，其數值聚集在零附近——所需的 ADC 動態範圍遠小於原始計算。這使類比結果的分布向零偏移，降低了所需的 ADC 動態範圍。
-
-**技術二 — 自適應權重切片（Adaptive Weight Slicing，只切分大結果的運算）：**
-RAELLA 不是對所有權重都使用固定精度的切片，而是監控特定運算的結果是否超出 ADC 範圍。只有超範圍的行才會以更細的權重切片重新執行。這使大多數運算的 Converts/MAC 保持在低水平，同時妥善處理離群值。
-
-**技術三 — 動態輸入切片（Dynamic Input Slicing，推測並恢復）：**
-RAELLA 先以粗粒度輸入切片*推測*執行。若結果在範圍內，無需進一步動作。若超出範圍，再以更細的輸入切片重新執行恢復。這將額外 ADC 轉換的代價只攤分到需要的那部分輸入上。
-
-三種技術合計達到 **ADC 輸入的 1024 倍縮減**，使更低解析度的 ADC 成為可能，且無精度損失：
-
-![RAELLA 結果——對比等面積 ISAAC 達到 3.9× 能效提升與 1.8× 吞吐量提升](../../assets/L11/L11-p52-raella-results.png)
-
-與等面積的 ISAAC 基準相比，RAELLA 達到 **3.9× 能效提升**與 **1.8× 吞吐量提升**，同時**在不修改或重新訓練 DNN 的情況下保持精度**。
-
-> **為什麼重要：** Titanium Law 不只是一個描述性公式——它是一個設計指南針。RAELLA 展示了：只要對這條定律有足夠精確的理解，你就能重塑*輸入到瓶頸項*（透過降低 ADC 解析度來降低 Energy/Convert），而非只是調整彼此制衡的旋鈕。這是最具體形式的跨層協同設計。
+這不只是 ADC equation，而是檢查 CiM claims 的 checklist：哪個 term 改善？哪個 term 變差？End-to-end accuracy 與 throughput 如何？
 
 ---
 
-## 第四章 — 跨基板的 CiM 技術
+## 硬體含義
 
-> *投影片：L11-53 … L11-60*
-
-### 為 CiM 設計 DNN——不同的最佳化景觀
-
-一個重要洞見：適合數位加速器的*最佳* DNN，在 CiM 加速器上未必是最佳的。取捨關係不同：
-
-- **權重數量 vs. 利用率：** 剪枝權重在數位硬體上很理想（更少的 MAC），但在 CiM 上可能損害陣列利用率（更少的列被填充）。CiM 陣列在權重矩陣稠密時表現最好。
-- **濾波器形狀：** 由於 CiM 是權重駐留的，它偏好*較少的激活值*相對於權重，因此較淺但濾波器較大的網路可能比較深但濾波器很小的網路更適合 CiM。
-- **對非理想性的魯棒性：** 量化感知訓練（quantization-aware training）對 CiM 更重要，因為元件變異引入的雜訊需要 DNN 能夠容忍。
-
-### 使用 SRAM 位元格的 CiM
-
-基於 SRAM 的 CiM 利用存取電晶體的 I-V 關係來執行乘法。兩種實作：
-
-- **電流模式（current-mode）：** 字線電壓調變電晶體電流；二進制權重存在位元格的狀態中。位元線電流相加得到部分和。受限於電晶體非線性。
-- **電荷共享（charge-sharing）：** 使用顯式電容儲存電荷。位元格上的 XNOR 邏輯執行二進制乘法；位元線上的電荷共享執行加法（Vf = ½(V1 + V2)，是加總的縮放值）。比電流模式有更好的線性度與匹配性。
-
-SRAM CiM 的吸引力在於它使用標準 SRAM 製程——無需特殊元件或製程修改。
-
-### 使用 DRAM 的 CiM
-
-基於 DRAM 的 CiM（Ambit, MICRO 2017）利用電荷共享執行**位元邏輯 AND 與 OR** 運算，資料完全不離開陣列：
-
-- 同時激活三列會引發電荷共享，根據預充電電壓（AND: VDD/2 − δ，OR: VDD/2 + δ）解析為 AND 或 OR 結果。
-- 多位元乘法需要多個週期的時域累加，但運算以完整的 DRAM 匯流排寬度並行執行——帶來跨列的大規模平行性。
-
-### 使用非揮發性記憶體（memristor）的 CiM
-
-非揮發性記憶體（ReRAM/RRAM、相變記憶體 PCM、自旋轉移力矩 STT-RAM）以無需供電也能保持的電阻狀態儲存資料。Memristor 尤其具有吸引力，因為：
-
-- **電阻可直接程式化** ——權重以電導值編碼，這正是 CiM 的自然表示形式。
-- **比 SRAM 密度更高** ——無需六電晶體位元格。
-- **非揮發性** ——權重在斷電後仍存在，使推論可以不重新載入而即時開始。
-
-挑戰在於每個元件的有限精度（通常 1–4 位元）和元件間的變異性，這使得權重切片和仔細校正變得更加必要。
-
-> **為什麼重要：** 沒有哪一種基板在所有應用中都占主導地位。正確的選擇取決於目標應用（功耗、面積、延遲、精度）、DNN 架構與可取得的製造製程。這種多樣性正是需要一個能夠跨所有基板進行比較的建模框架的原因。
+- **Bandwidth：** 3D memory 可比 conventional off-chip DRAM 提供更高 bandwidth，但 logic die area 與 thermal envelope 限制可放置的 nearby compute。
+- **Area：** eDRAM 與 SRAM 在 density、latency、refresh 與 integration complexity 間取捨。Large buffers 可能主導 accelerator area。
+- **ADC/DAC overhead：** CiM 的 analog compute core 可很有效率，但 peripheral conversion 可能主導 total energy。
+- **Precision：** Device precision、ADC resolution、weight slicing、input slicing 與 model accuracy 是一個 coupled design space。
+- **Utilization：** 巨大 CiM array 若 layer shapes 無法填滿 rows/columns，就會低效。
+- **Programmability：** Near-memory 與 CiM designs 常把不尋常 mapping constraints 暴露給 compilers 與 modeling tools。
+- **Correctness：** Analog nonidealities 不只是 performance issues；它們會改變 numerical results，進而影響 model accuracy。
 
 ---
 
-## 第五章 — CiMLoop：對整個堆疊建模
+## 常見誤解
 
-> *投影片：L11-60 … L11-75*
+### 誤解：Compute-in-memory 讓 MACs 免費。
 
-### CiM 的設計空間極為龐大
+Array-level multiply-accumulate 可能很便宜，但 DACs、ADCs、sense amplifiers、calibration、slicing 與 digital accumulation 可能主導成本。
 
-本講列舉了 CiM 堆疊每一層的設計選擇：
+### 誤解：Crossbar rows 越多永遠越好。
 
-![CiM 堆疊——裝置、電路、架構、映射、工作負載](../../assets/L11/L11-p62-cim-stack.png)
+更多 rows 可能增加 parallelism，但也會增加 analog summation range、所需 ADC resolution、wire parasitics 與 utilization risk。
 
-每一層都有多個選項：
+### 誤解：Pruning 永遠幫助 CiM。
 
-- **裝置（Devices）：** SRAM、DRAM、ReRAM、STT-RAM、光子元件、超導電路。
-- **電路（Circuits）：** DAC 類型（R-2R、脈衝列 pulse-train、電容式）、ADC 類型（Flash、SAR、積分式）、MAC 電路（電流模式、電荷共享、數位 XNOR）、稀疏性/AND 邏輯控制器。
-- **架構（Architecture）：** 陣列維度、陣列數量、記憶體分行（banking）、周邊電路組織。
-- **映射（Mapping）：** 哪些維度映射到列/行、迴圈順序、權重駐留 vs. 輸出駐留、批次大小。
-- **工作負載（Workload）：** DNN 層的類型、形狀、稀疏性、精度。
+Pruning 降低 MACs/DNN，但 sparse weights 可能讓 dense CiM arrays 填不滿。Titanium Law 透過 utilization factor 讓這件事可見。
 
-面對如此眾多的相互作用選擇，手工分析無法系統性地探索這個空間。跨層的相依性（資料值影響元件能耗，而能耗依賴於編碼方式，編碼依賴於映射，映射依賴於架構……）使任何解耦分析都不夠精確。
+### 誤解：TOPS 足以比較 advanced technologies。
 
-### CiMLoop：靈活、精確、快速
-
-![CiMLoop 總覽——靈活、精確、快速的 CiM 建模工具](../../assets/L11/L11-p65-cimloop-overview.png)
-
-CiMLoop（Andrulis, ISPASS 2024，**最佳論文獎**）是基於 Timeloop+Accelergy 的工具，擴展以處理 CiM 的跨堆疊交互。其三個區別特性：
-
-1. **靈活性（Flexibility）：** 使用者自訂規格描述任何裝置、電路或架構元件。函式庫包含 6T SRAM、8T SRAM、DRAM、ReRAM、多種 ADC 架構、DAC 架構以及光子元件的模型。使用者可透過外掛介面新增模型。
-
-2. **精確性（Accuracy，資料值相關建模）：** 多數先前工具（Timeloop、NeuroSim）假設每次操作的能耗固定。CiMLoop 認識到在類比電路中，能耗取決於*實際被處理的數值*：電導更高的 memristor 在相同輸入電壓下耗散更多功率。CiMLoop 捕捉整條鏈：數值 → 二進制表示 → 編碼 → 位元指派到元件 → 每個元件的能耗。結果誤差在 **8% 以內**（相對於逐值模擬）。
-
-3. **速度（Speed，統計建模）：** 精確的逐值模擬需要評估超過 10¹² 個數值組合。CiMLoop 改為計算*資料分布*（直方圖）並套用統計模型——與 NeuroSim 精度相近，但速度快 **>1000 倍**。與 Timeloop（快但不精確）相比，CiMLoop 速度相當但精確度高 10 倍。
-
-### 蘋果對蘋果的比較與設計空間探索
-
-有了共同的建模框架，來自不同論文的設計（不同技術節點、ADC 類型、記憶體元件）可以透過標準化至相同技術、ADC 與元件來公平比較：
-
-![以 CiMLoop 進行設計空間探索——陣列大小 vs. DNN 形狀](../../assets/L11/L11-p74-design-space-exploration.png)
-
-CiMLoop 也能探索陣列大小（架構決策）如何與 DNN 層形狀（工作負載屬性）交互作用——這是解耦工具無法回答的問題。這種聯合最佳化，正是課程期末專題所提議探索的方向。
-
-### CiMLoop 促成的合作——以及光子運算
-
-CiMLoop 已在 MIT 被用來為不只是傳統 CiM 建模，還包括：
-
-- **電阻式記憶體 CiM**（與 Jesus del Alamo 團隊的合作）
-- **超導電子學 CiM**（與 Karl Berggren 和 Neil Gershenfeld 的合作——起源於一個 6.5930/1 的期末專題！）
-- **光學／光子運算**（與 Dirk Englund 團隊的合作）
-
-光子學（photonics）前沿值得暫停一下：
-
-![用光計算——光學矩陣乘積](../../assets/L11/L11-p77-compute-with-light.png)
-
-光子具備使其對 DNN 運算極具吸引力的特性：
-
-- **與距離無關的能耗：** 在晶片上移動一個光子所消耗的能量幾乎與距離無關——與電子不同，電子傳輸時導線電阻造成的歐姆損耗與導線長度成正比。
-- **被動乘法（passive multiplication）：** 光學調製器根據權重值縮放光信號強度，無需主動放大。
-- **無電磁干擾：** 光子在線性介質中不相互作用，使得波長多工的密集互連成為可能。
-
-2017 年的 Nature Photonics 論文（Shen 等人）展示了使用馬赫-曾德干涉儀（Mach-Zehnder interferometer）網路在光域執行矩陣乘積。Lightmatter 的 Envise 晶片基於此原理，據報告在執行 BERT 推論時比 NVIDIA A100 快 5 倍，功耗僅 1/6。
-
-CiMLoop 的函式庫包含光子元件的模型（波導、微環諧振器、光電二極體、調製器驅動器），使相同的系統性協同設計方法論可以應用於光子 DNN 加速器。
-
-> **為什麼重要：** 建模框架不是某一個設計點的產物——它是使整個 CiM DNN 加速領域更具可重現性與可比性的基礎設施。沒有它，每篇新論文都與不同技術節點、不同假設的基準做比較，難以衡量真正的進步。
+TOPS 忽略 precision、accuracy、conversion overhead、memory traffic、array utilization、batching assumptions 與 technology normalization。
 
 ---
 
-## 獨立學習指南（Standalone Study Guide）
+## 與前後講次的連結
+
+- **L01-L03：** L11 是早期 energy hierarchy 的 physical-technology answer。
+- **L05 Dataflow：** Weight-stationary mapping 再次出現，因為 CiM arrays 天然把 weights 留在原地。
+- **L07-L10 Sparsity：** Sparse models 降低 MAC count，但在 array-based CiM 中可能傷害 utilization。Sparsity benefits 是 technology-dependent。
+- **L12 Reduced Precision：** Precision 是 CiM 中央議題，因為 ADC bits、device bits 與 model accuracy 耦合。
+- **Labs and final projects：** CiMLoop 是從 lecture concepts 走向 design-space exploration 的 modeling bridge。
+
+---
+
+## Paper Bridge: DaDianNao
+
+### Bibliographic Identity
+
+- **Title:** DaDianNao: A Machine-Learning Supercomputer
+- **Authors:** Yunji Chen et al.
+- **Year / venue:** MICRO 2014
+- **Local PDF:** [`papers/L15_DaDianNao_Chen_MICRO2014.pdf`](../../papers/L15_DaDianNao_Chen_MICRO2014.pdf)
+- **Used in lecture:** Lecture 11 eDRAM and near-memory motivation
+
+### Problem Addressed
+
+DaDianNao 處理大型 neural networks 的 memory bandwidth 與 energy cost，尤其是具有大量 synaptic weights 的 layers。它觀察到若 weights 留在 external memory，就需要 high-bandwidth、high-energy transfers。
+
+### Core Idea
+
+把 large eDRAM banks 放在 neural functional units 附近，並移動 neuron values，而不是反覆移動 synaptic weights。Node 包含多個 tiles，每個 tile 有 local eDRAM 與 compute，另有 central eDRAM 與 interconnect。
+
+### Relevance to This Lecture
+
+DaDianNao 是 eDRAM near-memory design 的例子。它讓 computation 保持 digital，但改變 memory hierarchy，使 weights 儲存在 compute 附近。
+
+### Key Claims Used in This Chapter
+
+- Off-chip memory bandwidth 會成為大型 neural-network layers 的瓶頸；見 DaDianNao Sections I and IV。
+- Paper 指出在其討論情境中 off-chip memory accesses 可讓 total energy 增加約 10x；見 Section IV。
+- Paper 報告 eDRAM density 比 SRAM 高 2.85x，且在 28 nm assumptions 下 256-bit eDRAM read 與 Micron DDR3 的 energy ratio 為 321x；見 Section V-A。
+- 一個 node 包含 36 MB eDRAM；見 Table II 附近 architecture parameter discussion。
+- Paper 報告 64-chip system 相對 evaluated baseline 有 150.31x average energy reduction；見 abstract 與 evaluation discussion。
+
+### What Students Should Remember
+
+1. DaDianNao 是 near-memory，不是 compute-in-memory。
+2. 主要動作是讓大量 weights 足夠靠近 compute，以降低 external memory traffic。
+3. eDRAM density 有幫助，但設計仍付 area、wire 與 integration costs。
+
+### Limitations and Assumptions
+
+該 paper 針對其時代的 neural networks 與 technology assumptions。量化 ratios 應當作 historical anchored evidence，而非 universal constants。
+
+### Suggested Insertion Points
+
+解釋 eDRAM，以及從 ordinary memory hierarchy 走向 memory-centric accelerator design 的第一步時引用 DaDianNao。
+
+---
+
+## Paper Bridge: Neurocube
+
+### Bibliographic Identity
+
+- **Title:** Neurocube: A Programmable Digital Neuromorphic Architecture with High-Density 3D Memory
+- **Authors:** Donghyuk Kim et al.
+- **Year / venue:** ISCA 2016
+- **Local PDF:** [`papers/L15_Neurocube_Kim_ISCA2016.pdf`](../../papers/L15_Neurocube_Kim_ISCA2016.pdf)
+- **Used in lecture:** Lecture 11 3D-stacked memory / HMC discussion
+
+### Problem Addressed
+
+Neurocube 用 3D high-density memory 與 logic tier integration 處理 neural networks 的 memory capacity 與 bandwidth limits。
+
+### Core Idea
+
+在 HMC logic layer 中整合 processing elements 與 programmable neurosequence generators（PNGs）。Memory system 透過 programmable state machines 驅動已知的 neural-network data movement patterns。
+
+### Relevance to This Lecture
+
+Neurocube 展示 3D memory stack 中的 near-memory processing。它不是 analog CiM，而是使用 memory organization 與 programmable controllers 降低 movement overhead 的 digital memory-centric architecture。
+
+### Key Claims Used in This Chapter
+
+- HMC 提供多個 vaults 與 highly parallel access；見 Neurocube Section II-B and Table I。
+- Architecture 使用與 vault controllers 相關的 programmable neurosequence generators；見 Sections III-V。
+- General neural-network nested loops 可映射到 PNG 中的 finite-state machines；見 Figure 8 及其周邊文字。
+- Paper 報告 28 nm 與 15 nm designs 在 scene-labeling inference 的 example throughput；見 Section VI。
+
+### What Students Should Remember
+
+1. 3D memory 提供 bandwidth 與 capacity，但 useful performance 需要 mapping 與 scheduling。
+2. Programmable memory-side controllers 可利用 neural-network static access patterns。
+3. Near-memory processing 可以維持 fully digital，同時改變 architecture。
+
+### Limitations and Assumptions
+
+Neurocube 以 neuromorphic/neural-network workloads 與 HMC assumptions 為背景。它適合作為 memory-centric design example，而不是 analog CiM 證據。
+
+### Suggested Insertion Points
+
+解釋 3D memory 為什麼不只是更寬的 DRAM bus，而是 logic layer 可參與 scheduling 與 data movement 時引用 Neurocube。
+
+---
+
+## Paper Bridge: Tetris
+
+### Bibliographic Identity
+
+- **Title:** Tetris: Scalable and Efficient Neural Network Acceleration with 3D Memory
+- **Authors:** Mingyu Gao et al.
+- **Year / venue:** ASPLOS 2017
+- **Local PDF:** [`papers/L15_TETRIS_Gao_ASPLOS2017.pdf`](../../papers/L15_TETRIS_Gao_ASPLOS2017.pdf)
+- **Used in lecture:** Lecture 11 3D memory and near-memory accumulation
+
+### Problem Addressed
+
+Tetris 問的是：當 3D memory 提供比 conventional off-chip DRAM 更高 bandwidth 與更低 access energy 時，neural-network accelerator 應該如何重新設計？
+
+### Core Idea
+
+使用 3D memory 將 accelerator area 從 large on-chip SRAM buffers 重新平衡到 PE arrays，並把 simple accumulation operations 移近 DRAM banks，以降低 output-feature-map traffic。
+
+### Relevance to This Lecture
+
+Tetris 是 near-memory bandwidth 與 near-memory computation 之間的橋樑。它說明單純接上 3D DRAM 不夠；dataflow scheduling、buffer sizing 與 accumulation location 都必須重新思考。
+
+### Key Claims Used in This Chapter
+
+- Abstract 報告相對 conventional low-power DRAM systems 有 4.1x performance improvement 與 1.5x energy reduction。
+- Section 2.4 指出 3D memory 可提供 160-250 GB/s bandwidth，access energy 比 DDR3 低 3-5x。
+- Section 3 討論 PE/buffer area rebalancing 與 per-vault engines。
+- Section 4 討論 dataflow scheduling 與 in-memory accumulation 以降低 ofmap traffic。
+
+### What Students Should Remember
+
+1. 3D memory 改變 buffers 與 PEs 之間的最佳 accelerator balance。
+2. Near-memory accumulation 只有在 dataflow scheduling 也配合時才省 traffic。
+3. Bandwidth alone 不會解決 utilization、area 或 scheduling。
+
+### Limitations and Assumptions
+
+Tetris 是 digital 3D-memory accelerator，不是 analog CiM design。Speedup 依賴 evaluated networks、area budgets、vault organization 與 dataflow schedules。
+
+### Suggested Insertion Points
+
+解釋 advanced memory technology 為什麼必須搭配 architecture 與 mapping changes 時引用 Tetris。
+
+---
+
+## Paper Bridge: TPU as a Digital Baseline
+
+### Bibliographic Identity
+
+- **Title:** In-Datacenter Performance Analysis of a Tensor Processing Unit
+- **Authors:** Norman P. Jouppi et al.
+- **Year / venue:** ISCA 2017
+- **Local PDF:** [`papers/L12_TPU_Jouppi_ISCA2017.pdf`](../../papers/L12_TPU_Jouppi_ISCA2017.pdf)
+- **Used in lecture:** Memory-aware digital acceleration 的 contextual baseline
+
+### Problem Addressed
+
+TPU paper 分析已部署 digital inference accelerator，展示 matrix units、on-chip memory 與 weight-memory bandwidth 如何決定 datacenter inference performance。
+
+### Core Idea
+
+TPU 使用 256 x 256 systolic matrix unit，含 65,536 個 8-bit MACs、大型 software-managed on-chip memory，以及 deterministic execution model。它不是 advanced memory device，但很適合當對照：它以 digital systolic array 與 explicit memory management 攻擊 data movement。
+
+### Relevance to This Lecture
+
+TPU 提供 advanced technologies 要競爭的 baseline。CiM design 需要打敗的不是 naive MAC array，而是具備 locality、systolic data reuse 與 roofline-aware performance constraints 的成熟 digital accelerator。
+
+### Key Claims Used in This Chapter
+
+- Abstract 指出 TPU 有 65,536 8-bit MAC matrix unit、92 TOPS peak 與 28 MiB on-chip memory。
+- Section 2 描述 matrix unit、unified buffer、weight FIFO 與 systolic execution。
+- Section 4 使用 roofline model，並指出 weight memory fetched 的 ridge point 約 1350 operations per byte。
+- Paper 報告在 evaluated datacenter workloads 中相對 contemporary GPU/CPU inference systems 有 15x-30x speedup 與顯著更高 TOPS/Watt；見 abstract。
+
+### What Students Should Remember
+
+1. Digital accelerators 已經非常積極利用 locality。
+2. Roofline reasoning 在比較 advanced technologies 時仍有用。
+3. Advanced technology claims 應該與 strong digital baselines 比較。
+
+### Limitations and Assumptions
+
+TPU paper 評估特定時代的 Google datacenter workloads。它是 baseline 與 modeling contrast，不是 CiM device behavior 的證據。
+
+### Suggested Insertion Points
+
+當學生需要 systolic arrays、memory bandwidth 與 roofline limits 的 grounded digital reference point 時引用 TPU。
+
+---
+
+## 獨立學習指南
 
 ### 進入下一講前必須掌握
 
-- 說明 compute-in-memory 如何透過把 MAC 移向 storage 來攻擊資料搬移成本。
-- 描述 analog crossbar 的 multiply-accumulate 原語，以及 ADC/DAC overhead 為什麼重要。
-- 說出 Titanium Law：隨 resolution 與 array size 增加，ADC cost 可能主導 analog CiM 能耗。
-- 將 RAELLA 理解為 arithmetic reform，而不只是更好的 memory cell。
-- 把 CiMLoop 視為跨 devices、circuits、architectures、mappings、workloads 的 modeling bridge。
+- 解釋 moving memory closer 與 computing inside memory 的差異。
+- 從 $I=VG$ 與 current summation 推導 crossbar dot product。
+- 用 Titanium Law 判斷某 CiM 技術改變哪個 cost。
+- 解釋 ADCs 如何把優雅的 analog primitive 變成 system-level tradeoff。
+- 依 cost model 而不是 hype 比較 eDRAM、3D DRAM、analog CiM 與 photonics。
 
 ### 自我檢核問題
 
-1. Crossbar 中哪個部分執行乘法？哪個部分執行累加？
-2. 為什麼把 ADC 納入後，analog CiM 可能失去能耗優勢？
-3. 比較 CiM designs 時，為什麼需要 apples-to-apples modeling framework？
+1. 為什麼 DaDianNao 是 near-memory 而不是 compute-in-memory？
+2. 3D memory 改善什麼？又引入哪些 constraints？
+3. 在 resistive crossbar 中，什麼代表 input？什麼代表 weight？
+4. 為什麼降低 ADC resolution 可能增加 conversions per MAC？
+5. 為什麼 pruning 可能傷害 CiM utilization？
+6. 為什麼 CiMLoop 需要 data-value-dependent modeling？
 
 ### 練習
 
-1. 追蹤一次 vector-matrix multiply 如何通過 resistive crossbar，包含 input delivery 與 output conversion。
-2. 列出三種 device-level nonidealities，並說明每一種如何表現為 model accuracy loss。
-3. 依 precision、density、programmability 比較 SRAM CiM、DRAM CiM、ReRAM CiM 與 photonic computing。
-
-### 常見誤區
-
-- 把 analog CiM 當成「免費 MAC」。Data conversion、input drivers 與 peripheral circuits 往往才是主成本。
-- 用 peak TOPS 比較論文，卻沒有 normalize precision、accuracy、technology node 與 array size。
-- 忘記 advanced technologies 只是移動限制，而不是消除限制。
+1. 用 Titanium Law 比較兩個 designs：Design A 每次 conversion energy 降低 2x，但 conversions per MAC 增加 2x；Design B 保持 conversions 不變，但 utilization 從 50% 提升到 80%。
+2. 對一個 $4 \times 4$ crossbar，寫出其中一個 column 計算的 dot product，並標出 DAC 與 ADC conversion 發生在哪裡。
+3. 選本章一個 near-memory paper bridge，說明它降低哪種 memory movement：weights、activations、partial sums，或 off-chip transfers。
+4. 解釋為什麼 sparse、heavily pruned model 可能適合 digital sparse accelerator，卻不適合 dense analog crossbar。
+5. Paper-reading bridge：閱讀 Tetris Section 2.4，總結 3D memory 為什麼改變 PE/buffer area allocation。
 
 ---
 
 ## 關鍵詞彙（Key Terms）
 
-| 詞彙 | 說明 |
+| 詞彙 | 意義 |
 |---|---|
-| **記憶體內運算（Compute-in-Memory, CiM）** | 使用記憶體元件的物理特性在儲存陣列內部執行算術（如 MAC），消除讀取資料的搬移。 |
-| **鄰近資料處理（near-data processing）** | 把運算物理上靠近記憶體（但不在其內部），以縮短導線長度、降低電容能耗。包含 eDRAM 與 3D 疊層 DRAM。 |
-| **eDRAM（嵌入式 DRAM）** | 整合在邏輯晶粒上的 DRAM；密度比 SRAM 高 2.85 倍，但比片外 DRAM 更昂貴。 |
-| **HMC / HBM（混合記憶體立方體 / 高頻寬記憶體）** | 3D 疊層 DRAM 技術，將記憶體晶粒直接堆疊在邏輯晶粒上方，倍增頻寬並降低存取能耗。 |
-| **類比交叉開關（analog crossbar）** | 由可程式化電阻（權重）組成的二維陣列，字線電壓（輸入）透過歐姆定律在位元線上產生電流（部分和）。 |
-| **Memristor / ReRAM / RRAM** | 非揮發性電阻式記憶體元件，其電阻可程式化；用作類比 CiM 交叉開關中的權重元件。 |
-| **DAC（數位類比轉換器）** | 將數位輸入激活值轉換為類比電壓/電流，傳遞至交叉開關字線。 |
-| **ADC（類比數位轉換器）** | 將類比位元線電流轉換回數位部分和。多數 CiM 設計中的主導能耗與面積開銷。 |
-| **權重切片（weight slicing）** | 將多位元權重分散在多個元件（位元切片）上，每個元件儲存較少位元；增加 ADC 轉換次數。 |
-| **輸入切片（input slicing）** | 將多位元輸入激活值分解為位元串列週期；增加運算時間。 |
-| **Titanium Law** | 表達 ADC 總能耗為四個因子之積的公式：Energy/Convert × Converts/MAC × MACs/DNN × 1/Utilization；各因子彼此制衡。 |
-| **RAELLA** | 一種推論時技術（中心+偏移編碼、自適應權重切片、動態輸入切片），將 ADC 輸入縮減 1024 倍，且不需重新訓練 DNN。 |
-| **CiMLoop** | MIT 的 Timeloop+Accelergy 延伸 CiM 建模工具；靈活的使用者自訂規格、資料值相關能耗精確度（誤差在 8% 以內）、比先前精確工具快 1000 倍以上。 |
-| **脈衝寬度調變（Pulse-Width Modulation, PWM）** | 以脈衝時間長度編碼類比數值；當電壓調變不實際時用於 CiM 的輸入傳遞。 |
-| **電荷共享（charge sharing）** | DRAM/SRAM CiM 中的技術：同時激活多列位元線，引發電荷平均，不需數位邏輯閘即可執行位元邏輯運算。 |
-| **資料值相依性（data-value-dependence）** | 類比元件能耗取決於*被處理的實際數值*而非僅僅是操作次數的特性。 |
-| **光子運算（photonic computing）** | 使用波導與調製器中的光學信號（光子）執行矩陣乘積，具備與距離無關的能耗且無電磁串擾。 |
-| **CiM 堆疊（CiM stack）** | 跨層協同設計的五個層級：裝置 → 電路 → 架構 → 映射 → 工作負載。 |
+| **鄰近記憶體運算（Near-memory processing）** | 讓 compute 保持 digital，但物理上靠近 memory，或使用 high-bandwidth memory packaging。 |
+| **記憶體內運算（Compute-in-memory, CiM）** | 使用 memory array 或 memory device 本身作為 computation 的一部分。 |
+| **eDRAM** | Embedded DRAM；比 SRAM dense，適合較大 on-chip storage，但有 integration 與 refresh tradeoffs。 |
+| **3D-stacked DRAM** | DRAM dies 與 logic die 堆疊並用 TSVs 連接，提高 bandwidth 並縮短距離。 |
+| **HMC / HBM** | 用於降低 memory bottleneck 的 3D 或 2.5D high-bandwidth memory technologies。 |
+| **Analog crossbar** | 由 programmable conductances 組成的 grid，用 voltages 與 currents 計算 dot products。 |
+| **Conductance（電導）** | Resistance 的倒數；在 resistive CiM 中代表 stored weight。 |
+| **DAC** | Digital-to-analog converter；把 digital inputs 轉成 analog signals。 |
+| **ADC** | Analog-to-digital converter；把 analog sums 轉回 digital values。 |
+| **Weight slicing** | 將 multi-bit weight 分散到多個 devices 或 cycles 表示。 |
+| **Input slicing** | 將 multi-bit input 分散到多個 temporal 或 analog steps 表示。 |
+| **Titanium Law** | ADC energy per DNN inference 的乘積式：conversion energy、conversions per MAC、MACs per DNN 與 utilization penalty。 |
+| **RAELLA** | Slides 中介紹的 CiM technique，用不需 retraining 的方式重塑進入 ADC 的 analog values。 |
+| **CiMLoop** | Slides 中介紹的 cross-stack CiM design exploration modeling framework。 |
+| **Data-value dependence** | Analog energy 取決於實際處理 values，而不只是 operation count 的特性。 |
+| **Photonic computing** | 使用 optical signals 進行 computation，常用 modulation/interference 實作 linear algebra。 |
 
 ---
 
 ## 重點回顧（Takeaways）
 
-- **CiM 的根本動機**與 L01 建立的能耗階層相同：DRAM 存取的能耗約為一次 ALU 運算的 200 倍。CiM 讓讀取根本不發生——因為運算在陣列內部完成了。
-- **類比交叉開關**利用歐姆定律（權重 = 電導，輸入 = 電壓，積 = 電流）與克希荷夫電流定律（累加 = 電流加總）實現乘加運算。這在物理上很優雅，但同時引入了對元件變異、非線性與有限精度的敏感性。
-- **ADC 是實際 CiM 設計的主導成本**，而非交叉開關運算本身。ADC 能耗隨解析度指數增加；這由 **Titanium Law**（四因子乘積：Energy/Convert、Converts/MAC、MACs/DNN、1/Utilization）精確量化。
-- Titanium Law 揭示了**根本的張力**：降低 ADC 解析度需要更多位元切片（更多轉換）；增大陣列列數降低利用率懲罰但提高了 ADC 解析度需求。先前的逃脫路線（剪枝、低解析度 ADC）都需要重新訓練。
-- **RAELLA** 無需重新訓練，透過重塑進入 ADC 的*類比數值分布*來逃脫瓶頸——中心+偏移編碼、自適應權重切片、動態輸入切片——對比等面積 ISAAC 達到 3.9× 能效提升與 1.8× 吞吐量提升。
-- **CiM 橫跨多種基板**：SRAM（製程相容，增益適中）、DRAM（電荷共享位元邏輯）、NVM/memristor（密度與非揮發性，但精度挑戰）。**沒有哪一種基板在所有應用中都占主導**。
-- **跨層協同設計是必要的**：裝置物理、電路拓樸、陣列架構、資料流映射與 DNN 工作負載形狀彼此交互。**CiMLoop** 建模工具捕捉這些交互（資料值相關能耗，誤差在 8% 以內，比先前精確工具快 1000 倍），使跨設計的公平比較與設計空間探索成為可能。
-- **光子運算**是一種新興基板，其中乘法是被動的、PE 間能耗與距離無關——這是與 CMOS 能耗縮放的潛在根本性轉變，由 CiMLoop 的光子元件函式庫建模。
+- Advanced technologies 是 data movement 問題的回應，不是 architecture 的魔法替代品。
+- eDRAM 與 3D memory 讓 computation 保持 digital，但降低 storage distance 或增加 bandwidth。
+- Analog CiM 優雅地計算 dot products，但 ADC/DAC、slicing、variation 與 utilization 主導 practical design。
+- Titanium Law 是檢查 CiM proposal 是否一邊改善、一邊惡化另一項成本的簡潔工具。
+- RAELLA 的 slide-level lesson 是 distribution reshaping：降低 ADC 必須解析的 analog range。
+- CiMLoop 的 slide-level lesson 是 modeling discipline：advanced substrates 需要 value-aware、cross-layer evaluation。
+- TPU 這類 strong digital baseline 很重要；advanced technology 應該與 memory-aware architectures 比較，而非 naive MAC arrays。
 
 ---
 
-## 與後續講次的連結（Connections）
+## 連結（Connections）
 
-- **L01 能耗階層（DRAM 200×）：** CiM 是對該階層最激進的架構回應——它完全消除了權重讀取成本。L11 是從第一天開始的能耗降低弧線的高潮。
-- **L05–L06 資料流：** 早先講次介紹的權重駐留資料流，直接映射到 CiM 的權重駐留陣列。迴圈巢狀視角（M 列 × CHW 行）是相同的形式主義應用到新基板。
-- **L07–L10 稀疏性：** 稀疏的權重降低了 MACs/DNN（Titanium Law 的一個因子），但也降低了陣列利用率（另一個因子）。這個交互作用並不簡單——稀疏性對 CiM 的效益不如對數位架構那麼直接。
-- **L12 — 降低精度（Reduced Precision）：** 權重/輸入量化（TeAAL 金字塔的 Format 層）直接決定每個元件切片的精度、Converts/MAC 與 ADC 解析度——全都是 Titanium Law 的因子。精度與 CiM 的協同設計是一個自然的聯合問題。
-- **Lab 5：** 課程的 CiM 實驗直接使用 CiMLoop 探索本講介紹的設計空間。這裡的概念（陣列大小、位元切片、ADC 成本）是學生將要調整的參數。
-- **期末專題：** 跨陣列大小與 DNN 形狀的設計空間探索（CiMLoop 投影片中展示的內容）被明確提議為期末專題主題。以 CiMLoop 建模光子學也是一個可選的延伸方向。
+L11 把整門課連到 physical implementation choices。L01-L03 說 memory movement 主導成本；L05 說 dataflow 決定什麼會移動；L07-L10 說 sparsity 改變 dynamic work 與 metadata traffic；L11 問如果 storage device、circuit interface 與 package 被重新設計會如何。L12 接著回到 precision，因為 CiM device bits 與 ADC bits 會直接塑造 accuracy、energy 與 throughput。
 
 ---
 
-## 附錄 — 投影片對照表（Slide-to-Section Map）
+## 附錄 — 投影片對照表
 
-| 投影片 | 章節 |
-|---|---|
-| L11-1 | 標題 |
-| L11-2 … L11-9 | 第一章 — 記憶體技術全貌；近資料處理（eDRAM、3D DRAM）；記憶體成本量化 |
-| L11-10 … L11-27 | 第二章 — 類比交叉開關原理；權重駐留 CiM 資料流；實際設計限制（元件精度、陣列大小、ADC、輸入傳遞） |
-| L11-28 … L11-52 | 第三章 — ISAAC 案例研究；CiM 能耗分解；Titanium Law；先前逃脫路線；RAELLA 技術與結果 |
-| L11-53 … L11-59 | 第四章 — DNN/CiM 協同設計；SRAM CiM（電流模式、電荷共享）；DRAM CiM（Ambit 電荷共享 AND/OR）；研究全景 |
-| L11-60 … L11-75 | 第五章 — CiM 堆疊；CiMLoop（靈活性、精確性、速度）；蘋果對蘋果比較；設計空間探索 |
-| L11-75 … L11-80 | 第五章 — CiMLoop 促成的合作；光子運算前沿 |
-| L11-81 | 總結與參考文獻 |
+| Slides | 章節 | Notes |
+|---|---|---|
+| 1 | Title | Lecture framing。 |
+| 2-9 | Memory cost and near-memory | eDRAM、3D DRAM、DaDianNao、Neurocube、Tetris。 |
+| 10-27 | Analog crossbar | Conventional processing vs. CiM、Ohm/Kirchhoff MAC、weight-stationary mapping、practical limits。 |
+| 28-52 | ADC bottleneck | ISAAC context、Titanium Law、RAELLA techniques 與 slide-reported results。 |
+| 53-60 | CiM substrates | SRAM、DRAM、NVM/memristor discussion。 |
+| 60-75 | CiMLoop | Device/circuit/architecture/mapping/workload stack 與 modeling claims。 |
+| 75-80 | Photonics | Emerging substrate 與 CiMLoop photonics modeling。 |
+| 81 | Summary/references | 用於 source attribution。 |
+
+---
+
+## Source Notes
+
+- Lecture flow follows `Lecture/L11-Advanced_Tech.pdf`, slides 1-81。
+- Add/SRAM/DRAM 的 memory energy numbers 是 Lecture 11 slide 5 的 slide-derived claims，該 slide attribution 為 Horowitz, ISSCC 2014。
+- RAELLA、Titanium Law、CiMLoop 與 photonics discussion 來自 Lecture 11 slides 29-80。RAELLA 與 CiMLoop 的 local paper PDFs 不在本 worker 指定 inputs 中，因此本章沒有獨立驗證其 paper details。
+- DaDianNao claims derived from `papers/L15_DaDianNao_Chen_MICRO2014.pdf`，尤其 Sections IV-V 與 evaluation discussion。
+- Neurocube claims derived from `papers/L15_Neurocube_Kim_ISCA2016.pdf`，尤其 Sections II-VI。
+- Tetris claims derived from `papers/L15_TETRIS_Gao_ASPLOS2017.pdf`，尤其 Sections 2-4 and 6。
+- TPU baseline claims derived from `papers/L12_TPU_Jouppi_ISCA2017.pdf`，尤其 abstract、Sections 2 and 4。
+- Worked examples 是根據 slide-stated concepts 建立的 original teaching examples。
+
+## Uncertainty Notes
+
+- Live lecture 可能對 RAELLA、CiMLoop 與 photonics 有投影片文字無法恢復的額外細節。
+- Numerical technology ratios 依 process 與 assumptions 而變。本章將它們視為 slides 或 papers 中的 anchored evidence，而非 universal constants。
+- Repository 既有 `assets/L11/` 可能包含 copyright-sensitive slide captures。本章不再 embed 它們，但 Worker C 未刪除 owned walkthrough files 以外的 assets。

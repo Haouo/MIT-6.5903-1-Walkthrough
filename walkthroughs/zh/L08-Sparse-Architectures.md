@@ -1,459 +1,605 @@
 # L08 — 稀疏架構（Sparse Architectures）
 
-> **課程：** 6.5930/1 — 深度學習硬體架構（Hardware Architectures for Deep Learning）
-> **講師：** Joel Emer 與 Vivienne Sze（MIT EECS）
-> **講授日期：** 2026 年 3 月 2 日 · **投影片：** 96 頁 · **來源：** [`Lecture/L08 - Sparse Architectures.pdf`](../../Lecture/L08%20-%20Sparse%20Architectures.pdf)
->
-> *本文是以「概念」為單位重建講課脈絡的導讀（walkthrough），依主題而非逐頁編排。每一節都標註其對應的投影片範圍，方便你對照原始投影片閱讀。*
+> **課程：** 6.5930/1 — Hardware Architectures for Deep Learning
+> **授課教師：** Joel Emer and Vivienne Sze
+> **日期：** 2026-03-02
+> **主要來源：** [`Lecture/L08 - Sparse Architectures.pdf`](../../Lecture/L08%20-%20Sparse%20Architectures.pdf)
+
+本章根據公開投影片與本地 paper PDF 重建教學敘事。為了避免直接複製投影片或論文圖，本章以文字、小型原創例子與 ASCII 圖表說明概念。
 
 ---
 
-## 一句話總結（TL;DR）
+## TL;DR
 
-現代 DNN 具有**稀疏性（sparsity）**：大量的權重與激活值為零，因此約一半（甚至更多）的乘加運算是*無效（ineffectual）*的——它們對最終結果毫無貢獻。問題不在於要不要利用稀疏性，而在於*如何*利用、*代價*是多少。本講介紹三種硬體策略——**閘控（gating）**、**跳過（skipping）**，以及**壓縮格式表示（compressed-format representation）**——合稱**稀疏加速特性（Sparse Acceleration Feature, SAF）**。講義透過一個具體的一維點積（dot product）範例精確推算各策略節省了多少次讀取與週期，推導四種**表示格式（representation format）**（未壓縮、位元遮罩、座標載荷、遊程編碼）之間的取捨，接著探討**結構化稀疏性（structured sparsity）**、**階層化結構稀疏性（Hierarchical Structured Sparsity, HSS）**，以及**稀疏張量分塊（tiling sparse tensors）**的棘手問題——後者需要**超額預訂（overbooking）**策略（如 Tailors + Swiftiles）才能最大化緩衝區（buffer）利用率。全程以 Eyeriss、SCNN、ExTensor、HighLight 等具體加速器設計說明學術理論如何化為矽晶片實作。
+稀疏性（sparsity）吸引人，是因為零值 operand 會產生**無效工作（ineffectual work）**：不會改變輸出的 compute、read、write 與 interconnect traffic。困難在於，零值不只是「缺少的數值」；它們會帶來不規則控制流、可變 tile occupancy、metadata、intersection logic 與 load imbalance。
 
----
+Lecture 08 介紹三種 sparse acceleration features：
+
+- **閘控（gating）：** 偵測到零值後，讓相關硬體在該 cycle idle。省 energy，但 dense schedule 的 cycle 仍然存在。
+- **跳過（skipping）：** 直接移到下一個有用 coordinate。省 energy 和 time，但需要 metadata 與 traversal hardware。
+- **格式（format）：** 用 sparse representation 讓零值不被儲存與搬移。省 capacity 與 bandwidth，但 metadata 可能變成瓶頸。
+
+接著本講從 unstructured formats 擴展到 structured sparsity、hierarchical structured sparsity（HSS）與 sparse tiling。架構上的核心教訓是：只有當省下的工作大於找出、表示、路由與平衡 nonzeros 的代價時，稀疏性才真正有幫助。
+
+## 本講解決什麼問題
+
+Dense DNN accelerator 假設規則陣列：每個 loop iteration 取 operands、做 MAC、更新 partial sum，然後前往下一個 coordinate。Sparse tensor 打破這個假設。activation 或 weight 若為零，對應乘法可以省掉，但 accelerator 必須在花費 energy 或 time 前知道這件事。
+
+本講處理 sparse architecture 的第一半：
+
+1. 如何定義哪些 operation 是有用的？
+2. 硬體如何避免讀取或計算 zero operands？
+3. Sparse data 應如何表示？
+4. 為何 structured sparsity 讓硬體更簡單？
+5. 當每個 tile 的 nonzero 數量不同時，tiling 為何變困難？
+
+Lecture 09 會把這些概念落到具體 sparse convolution dataflows。
+
+## 為什麼本講重要
+
+Sparse acceleration 不是 dataflow 設計之後的小優化。它會改變 memory layout、loop order、PE utilization 與 tile sizing 的意義。Dense dataflow 問：「哪個 operand 應該留在 PE 附近？」Sparse dataflow 還要問：「哪個 operand 能便宜地告訴我下一個有用 coordinate 在哪裡？」
+
+對硬體架構師而言，稀疏性影響：
+
+- **Energy：** 減少 value reads、metadata-dependent reads、MACs 與 partial-sum updates。
+- **Latency：** skipping 可以減少 cycle count，但 gating 不行。
+- **Bandwidth：** compression 可降低 DRAM/SRAM traffic，但 metadata 也必須搬移。
+- **Area：** sparse decoders、intersection units、metadata buffers 與 flexible routers 都吃面積。
+- **Utilization：** nonzero 數量不同，PE 可能拿到不等量工作。
+- **Programmability：** 同一個數學 tensor 會因 loop order 不同而需要不同 format。
+
+Source note：上述動機主要來自 Lecture 08 slides 2-7 與 25-26；關於 sparse accelerator modeling 的說法與 TeAAL Section 2.3 一致。
+
+## 先備知識與心智模型
+
+你需要熟悉：
+
+- MAC：\(o \leftarrow o + a \times b\)。
+- Dot product：\(Z = \sum_k A_k B_k\)。
+- Density \(d\)：儲存座標中非零值的比例。
+- Dataflow：weights、activations、partial sums 在 memory 與 PEs 之間的 loop order 與放置方式。
+
+核心心智模型是：
+
+> Sparse accelerator 是 dense accelerator 加上一台**座標機器（coordinate machine）**。
+
+Dense 部分仍然負責乘值。Coordinate machine 決定要拜訪哪些 coordinate、payload 在哪裡、結果要送到哪個 output coordinate。
 
 ## 學習目標（Learning Objectives）
 
 讀完本講後，你應該能夠：
 
-- 說明 DNN 中稀疏性的兩大根源（**激活值稀疏性（activation sparsity）** 來自 ReLU；**權重稀疏性（weight sparsity）** 來自剪枝），並定義*有效（effectual）*與*無效（ineffectual）*運算。
-- 區分**閘控（gating）**與**跳過（skipping）**，並準確說明各自節省了什麼（僅節省能量 vs. 同時節省能量與時間）。
-- 解釋**單邊（single-sided）**與**雙邊（dual-sided）**交集運算，並推導各情況下的讀取次數與週期數。
-- 說出四種標準表示格式（未壓縮、位元遮罩、座標載荷、遊程編碼）並在密度（density）全域上比較其**壓縮效率（compression efficiency）**與**存取效率（access efficiency）**。
-- 對比**非結構化（unstructured）**與**結構化（structured）**稀疏性，並解釋 **G:H 稀疏**（例如 NVIDIA 的 2:4）及 **HSS** 如何在保持硬體簡單的前提下拓展稀疏度範圍。
-- 描述**均勻佔用率（uniform occupancy）vs. 均勻形狀（uniform shape）**的分塊困境，並說明 **Tailors + Swiftiles 超額預訂**如何為 ExTensor 式稀疏加速器解決此問題。
+- 定義 effectual operation 與 ineffectual operation。
+- 區分 total operations 與 total operations performed。
+- 解釋 gating、skipping、format 作為三種不同 sparse acceleration features。
+- 比較 single-sided 與 dual-sided intersection。
+- 為小型 sparse dot product 計算 read/cycle counts。
+- 以 compression efficiency 與 access efficiency 比較 uncompressed、bitmask、coordinate-payload、run-length formats。
+- 解釋 metadata 為什麼可能主導 unstructured sparse storage。
+- 解釋 structured sparsity 中 flexibility/efficiency 的取捨。
+- 計算 hierarchical structured sparsity pattern 的 effective density。
+- 概念性說明 sparse tiling、tile occupancy、overbooking、Tailors 與 Swiftiles。
+- 把 sparse formats 連到後續 fibertree 與 sparse dataflow 講次。
 
----
+## 教科書式主敘事
 
-## 第一章 — 稀疏性為何重要（以及為何它很難處理）
+### 1. 從零值到無效工作
 
-> *投影片：L08-1 … L08-8*
+Lecture 08 從兩種 sparsity 來源開始：
 
-### 零值的兩大來源
+- **Activation sparsity：** ReLU、input correlation、graph-like representations 與其他 input-dependent effects 會讓 activations 變成零。
+- **Weight sparsity：** pruning 可以把訓練後的 weights 設為零。
 
-稀疏性源自兩個大致獨立的現象：
+真正有用的區分不是「零值 vs. 非零值」，而是 **effectual vs. ineffectual operation**。
 
-- **激活值（輸入）稀疏性（activation sparsity）** ——ReLU 非線性將所有負值截斷為零，常使 50–80% 的特徵圖（feature map）值為零。輸入資料中的相關性與某些表示形式的結構（例如圖鄰接矩陣）可使激活值稀疏性更高。
-- **權重稀疏性（weight sparsity）** ——網路剪枝（Han 等人，NeurIPS 2015）移除小幅度權重，可在不顯著損失精度的情況下生成 50–90% 參數為結構性零值的模型。
+對乘法而言，只有兩個 operands 都非零時，operation 才是 effectual。若任一 operand 為零，\(a \times b = 0\)，乘法不會改變 partial sum。對加法而言，加上零也 ineffectual，因為 \(x+0=x\)。
 
-兩種類型互相疊加：一個被剪枝的零權重乘以一個零激活值，是雙重無效的運算。
+Lecture 08 使用兩個 count：
 
-### 無效運算的算術
+- \(N_\text{total}=N_\text{effectual}+N_\text{ineffectual}\)。
+- \(N_\text{performed}=N_\text{effectual}+N_\text{unexploited ineffectual}\)。
 
-本講定義了兩個計數量：
+目標不只是讓 tensor 稀疏，而是在不讓每個剩餘 operation 變太貴的前提下，降低 \(N_\text{unexploited ineffectual}\)。
 
-- **總運算數（total operations）** = 有效運算數 + **無效運算數（ineffectual operations）**
-- **實際執行運算數（total operations performed）** = 有效運算數 + **未利用的無效運算數（unexploited ineffectual operations）**
+### 2. 利用稀疏性的代價是不規則性
 
-任何涉及零值的運算都是無效的：`任何值 × 0 = 0`，`任何值 + 0 = 任何值`。若硬體無法偵測並壓制這些運算，它們雖對最終輸出毫無貢獻，卻仍會消耗儲存頻寬、PE 週期與能量。稀疏加速的目標就是將*未利用的無效運算數*趨近於零——但這並不是免費的。
+Dense tensor 很規則：第 \(k\) 個 loop iteration 通常對應到第 \(k\) 個 stored value。Sparse tensor 破壞了這件事：
 
-### 不規則性（irregularity）問題
+- nonzero 數量會在 vectors、rows、channels、tiles、layers 之間變動。
+- nonzero 位置可能要 decode metadata 後才知道。
+- 分到 dense sparse tile 的 PE 可能比拿到 empty tile 的 PE 跑更久。
+- Compressed tensor 可能必須先讀 metadata，才能讀 value。
 
-利用稀疏性會使處理流程**不規則（irregular）**。非零值計數在張量內部與張量之間不一致，造成：
+這就是投影片說 exploiting sparsity makes processing irregular 的意思。Accelerator 只有在支付 metadata、decoding、coordinate arithmetic、intersection 與 scheduling 的成本後，才省得到工作。
 
-- **週期數的變化** ——不同的分塊（tile）在不同時刻完成，導致 PE 閒置。
-- **儲存需求的波動** ——壓縮後的分塊大小各異，使緩衝區管理複雜化。
-- **非零位置未知** ——硬體必須事先探索或預計算非零值的所在位置。
+### 3. Sparse Acceleration Features：gating、skipping、format
 
-不規則性問題是本講所有設計選擇的根本動機。
+本講把 sparse hardware mechanisms 分成 **Sparse Acceleration Features（SAFs）**：
 
-![稀疏加速特性（SAF）分類——閘控、跳過、格式](../../assets/L08/L08-p07-saf-overview.png)
+| SAF | 做什麼 | 省 energy？ | 省 cycles？ | cycle 前需要 sparse metadata？ |
+|---|---|---:|---:|---:|
+| Gating | 偵測零值，讓部分硬體 idle | 是 | 否 | 通常不需要 |
+| Skipping | 直接跳到有用 nonzero coordinate | 是 | 是 | 需要 |
+| Format | 儲存與搬移 payload 加 metadata，而非所有零值 | 是 | 有時 | 若要 skipping 則需要 |
 
-> **為什麼重要：** 訓練端（剪枝）與推論端（ReLU）都會產生充滿零值的張量。忽視這一點的硬體設計至少浪費了一半的記憶體頻寬與運算週期——而 DRAM 存取的能耗約為 ALU 運算的 200 倍，這直接轉化為浪費的能量與時間。
+關鍵轉折是：gating 可以在 dense schedule 中即時發現零值；skipping 必須事先知道要跳去哪裡。因此 representation format 不再只是軟體資料結構，而是架構設計的一部分。
 
----
+### 4. Dot-product 範例
 
-## 第二章 — 閘控與跳過：稀疏加速的兩種模式
+本講使用一維 dot product：
 
-> *投影片：L08-9 … L08-22*
-
-### 貫穿本章的範例
-
-本講以兩個 6 元素向量的一維點積作為直觀建立的基礎：
-
+```text
+A = [0, 0, c, d, 0, f]
+B = [g, h, 0, j, k, l]
+Z = A dot B = d*j + f*l
 ```
-A = [ 0  0  c  d  0  f ]
-B = [ g  h  0  j  k  l ]
-Z = A · B = c·0 + d·j + f·l = dj + fl
+
+共有六個 algorithmic multiply positions，但只有 coordinates \(3\) 與 \(5\) 是 effectual。Nonzero coordinate sets 為 \(A_\text{nz}=\{2,3,5\}\) 與 \(B_\text{nz}=\{0,1,3,4,5\}\)，intersection 是 \(\{3,5\}\)。
+
+| 策略 | Cycles | A value reads | B value reads | Computes performed | 說明 |
+|---|---:|---:|---:|---:|---|
+| Dense baseline | 6 | 6 | 6 | 6 | 拜訪每個 coordinate |
+| Gate \(B \leftarrow A\) | 6 | 6 | 3 | 3 | A 是 leader；A 非零時才讀 B |
+| Skip \(B \leftarrow A\) | 3 | 3 | 3 | 3 | 只拜訪 A 的 nonzero coordinates |
+| Dual-sided skip \(A \cap B\) | 至少 2 | 2 | 2 | 2 | 只拜訪兩者皆非零的 coordinate |
+
+Source note：這些 counts 來自 Lecture 08 slides 9-20。與投影片一致，表格不把 metadata reads 算入 value reads。
+
+常見誤解是「跳過 A 的零值就最佳了」。不是。若 A 在 coordinate 2 非零但 B 為零，\(c \times 0\) 仍然是 ineffectual。完整 work reduction 需要找出兩個 operands 的 intersection。
+
+### 5. Single-sided 與 dual-sided intersection
+
+**Single-sided intersection** 選一個 leader。若 A 是 leader，硬體拜訪 A 的 nonzero coordinates，然後在同座標詢問 B。這較簡單，但收益取決於 leader 是否能預測 useful work。
+
+**Dual-sided intersection** 把兩個 operands 都當 sparse lists，只輸出 matching coordinates。簡單 merge-style intersection 如下：
+
+```text
+A coordinates: 2, 3, 5
+B coordinates: 0, 1, 3, 4, 5
+
+compare 2 and 0 -> advance B
+compare 2 and 1 -> advance B
+compare 2 and 3 -> advance A
+compare 3 and 3 -> emit 3
+compare 5 and 4 -> advance B
+compare 5 and 5 -> emit 5
 ```
 
-總運算數 = 6；有效運算數 = 2；無效運算數 = 4。
+Dual-sided skipping 很強，但比較次數取決於資料。硬體常會限制每個 cycle 能走幾步 metadata；若沒有很快找到 match，PE 可能 idle。Lecture 08 提到 ExTensor 使用 binary search over remaining coordinates，當下一個 match 很遠時可能有效。
 
-![一維點積範例——6 次總運算，2 次有效，4 次無效](../../assets/L08/L08-p09-dot-product-example.png)
+### 6. Format：compression efficiency 與 access efficiency
 
-### 尋找交集（intersection）
+Sparse format 必須回答兩個問題：
 
-為了知道哪些運算是有效的，硬體必須確定 A 和 B 中哪些位置同時為非零——這就是**交集（intersection）**問題。設計空間有兩個正交的維度：
+1. **Compression efficiency：** 相對 dense storage 需要多少 bits？
+2. **Access efficiency：** 硬體能多便宜地找下一個 nonzero coordinate，或測試某 coordinate 是否存在？
 
-1. **單邊 vs. 雙邊**：硬體檢查一個運算元（*領導者 leader*）還是兩個？
-   - *單邊（leader → follower）*：掃描領導者的非零值；只有在領導者非零時才讀取跟隨者（follower）。
-   - *雙邊（dual-sided）*：掃描兩個運算元並計算其非零座標集合的交集。
+本講四種 formats：
 
-2. **閘控 vs. 跳過**：當領導者讀取到零值時，硬體*怎麼做*？
-   - **閘控（gating）**：週期仍然執行，但硬體壓制對跟隨者的記憶體讀取與乘法運算，在該週期保持閒置——**節省能量，但不節省週期**。
-   - **跳過（skipping）**：硬體直接跳到領導者（或交集）中的*下一個非零座標*，完全省略該週期——**同時節省能量與時間**。
-
-### 週期與讀取次數的量化
-
-本講以 A-B 範例推導了所有四種組合的結果，整理成表格：
-
-| 策略 | 週期數 | A 讀取次數 | B 讀取次數 | 實際執行運算數 |
-|---|---|---|---|---|
-| 無（基準） | 6 | 6 | 6 | 6 |
-| 閘控（Gate B ← A） | 6 | 6 | 3 | 3 |
-| 跳過（Skip B ← A） | 3 | 3 | 3 | 3 |
-| 雙邊跳過（A ⋂ B） | 2 | 2 | 2 | 2 |
-
-閘控能減少讀取次數與運算次數，但週期數不變——因為即使領導者為零，硬體仍須在每個週期*檢查*它。跳過則要求下一個非零座標的資訊在週期開始**之前**就已知——這正是**表示格式（representation format）**的工作。
-
-![不同 SAF 方案的影響——週期數、讀取次數與運算次數](../../assets/L08/L08-p12-impact-approaches-detail.png)
-
-### 閘控 vs. 跳過——實際意義
-
-因為閘控不減少週期數，硬體可以**即時（in real time）**發現零值，無需預計算。跳過則要求非零座標的位置*事先*可得——這就是為何本講立即轉向壓縮張量格式的討論。
-
-真實加速器所採用的 SAF 策略（投影片 11）：
-
-| 加速器 | SAF 策略 |
-|---|---|
-| Eyeriss [JSSC 2017] | 單邊閘控：Gate W ← I，Gate O ← I |
-| Eyeriss v2 [JETCAS 2019] | 單邊跳過：Skip W ← I，Skip O ← I & W |
-| SCNN [ISCA 2017] | 單邊跳過：Skip W ← I，Skip O ← I & W |
-| ExTensor [MICRO 2019] | 雙邊跳過：Skip A ⋂ B，Skip Z ← A & B |
-| DSTC [ISCA 2021] | 雙邊跳過：Skip A ⋂ B，Skip Z ← A & B |
-
-![SAF 分類表——各加速器採用的策略](../../assets/L08/L08-p11-saf-table.png)
-
-### 雙邊交集的機制
-
-雙邊跳過需要同時在 A 和 B 中找到*配對的*非零座標——這是個更困難的問題。本講描述了一種串行合併掃描的方法：比較兩個運算元當前最前端的座標；將座標較小的那個前進；重複直到找到匹配或其中一個列表耗盡。ExTensor [MICRO 2019] 改用對剩餘座標的**二分搜尋（binary search）**，在下一個匹配座標很遠時特別有效。設計選擇之一是設定**最大迭代次數（maximum iteration count）**：若在該次數內找不到匹配，則發射一個閒置週期並繼續。
-
-![閘控：雙邊存取模式——兩個運算元均循序掃描](../../assets/L08/L08-p17-gating-dual-sided.png)
-
-> **為什麼重要：** 閘控容易實作，但僅節省能量；跳過同時節省能量與時間，可提供與*有效密度（effectual density）*相當的加速比，但需要壓縮元資料（metadata）來定位非零值。壓縮格式的選擇因此成為整個系統的關鍵承重構件。
-
----
-
-## 第三章 — 表示格式：壓縮稀疏張量
-
-> *投影片：L08-23 … L08-48*
-
-### 兩個目標：壓縮與存取
-
-TeAAL 金字塔中的 **Format（格式）** 層同時服務兩個目的：
-
-1. **壓縮效率（compression efficiency）** ——減少儲存張量所需的位元數。記憶體中位元數更少，意味著緩衝區更小（更便宜、更省電），或在同樣大小的緩衝區中存放更大的分塊，從而增加資料重用並減少 DRAM 流量。
-2. **存取效率（access efficiency）** ——快速且低代價地定位下一個非零值。這正是*跳過*操作所需的能力。
-
-這兩個目標存在張力：在高稀疏度時壓縮效果好的格式（例如座標載荷，CP），每個非零值的元資料位元較少，但在密度變化時定位下一個非零值可能需要更多計算。本講評估四種標準格式。
-
-### 四種格式
-
-![四種標準表示格式：未壓縮、位元遮罩、座標載荷、遊程編碼](../../assets/L08/L08-p27-compression-formats.png)
-
-**未壓縮（Uncompressed, U）：** 儲存每個值，包括零。無元資料。壓縮比（compression ratio）始終為 1。
-- 最適合：稠密（dense）資料。
-
-**位元遮罩（Bitmask, B）：** 每個座標一個位元，指示該位置是零（0）還是非零（1）；非零值另行儲存。
-- 元資料開銷：完整向量中每個座標佔 1 位元。
-- 最適合：中等稀疏度。最大壓縮比為 1 /（每個非零值的位元數）——例如 8 位元值最多壓縮到未壓縮大小的 1/8。
-- 定位下一個非零值：循序掃描位元遮罩（每個座標讀取 1 位元）。
-
-**座標載荷（Coordinate Payload, CP）：** 每個非零值與其 n 位元座標索引配對儲存。
-- 元資料開銷：每個非零值 n 位元，n = ⌈log₂(向量長度)⌉。
-- 最適合：極高稀疏度。
-- 定位下一個非零值：直接讀取下一個（座標, 值）配對，無需計算。
-- 注意：在低稀疏度時，CP 的儲存量*大於*未壓縮（每個非零值的元資料增長速度超過節省量）。
-
-**遊程編碼（Run-Length Encoding, RLE）：** 儲存連續非零值之間的*遊程長度（run length，即零值個數）*，以 r 位元欄位表示。
-- 元資料開銷：每個遊程段 r 位元。當連續零值超過 2^r − 1 時，需要多個元資料條目。
-- 最適合：極高稀疏度且有長連續零值段（structured data）。
-- 定位下一個非零值：累積遊程長度——需要加法器與累計計數器。當 r = 1 時，RLE 退化為位元遮罩。
-- 設計選擇：r 的值應根據預期遊程長度分佈決定。
-
-### 壓縮效率與密度的關係
-
-本講提供了一個具體例子（K=16，8 位元值）：
-
-| 格式 | 1 個非零（6.25% 密度） | 8 個非零（50%） | 16 個非零（100%） |
+| Format | Metadata 想法 | 適合 density | Access behavior |
 |---|---|---|---|
-| 未壓縮 | 128 位元 | 128 位元 | 128 位元 |
-| 位元遮罩（每座標 1 位元） | 24 位元 | 80 位元 | 144 位元 |
-| CP（每座標 4 位元） | 12 位元 | 96 位元 | 192 位元 |
-| RLE（每遊程 4 位元） | 12 位元 | 96 位元 | 192 位元 |
+| Uncompressed | 無 metadata；每個 value 都存 | Dense | 直接 coordinate access，但不壓縮 |
+| Bitmask | 每個 coordinate 一個 bit | 中度稀疏 | 掃描 bits 或做 bit operations |
+| Coordinate payload | 每個 nonzero 存 coordinate | 高稀疏 | 直接讀下一個 nonzero |
+| Run-length encoding | 存 nonzeros 之間的零值數量 | 高稀疏且 zero runs 長 | 累加 run lengths |
 
-關鍵洞見：**位元遮罩在 100% 密度時比未壓縮更大**（因為元資料本身也佔用空間）；**CP 和 RLE 在 50% 密度時比位元遮罩差**。沒有哪種格式在所有情況下都優勝——正確的選擇取決於張量的預期密度。
+對 \(A=[0,0,c,d,0,f]\)，value 為 8-bit：
 
-![壓縮效率表——K=16、8 位元值下各格式對不同密度的表現](../../assets/L08/L08-p34-compression-efficiency-table.png)
+- Uncompressed：\(6 \times 8 = 48\) bits。
+- Bitmask：\(6 \times 1 + 3 \times 8 = 30\) bits。
+- Coordinate payload 使用 3-bit coordinates：\(3 \times 3 + 3 \times 8 = 33\) bits。
+- RLE 使用 3-bit runs：\(3 \times 3 + 3 \times 8 = 33\) bits。
 
-一個重要的實踐觀點（投影片 35）：對於*非結構化*稀疏性，用來編碼座標的元資料約佔壓縮後總儲存量的**一半**（來自 Han, ICLR 2016）。因此，最小化元資料開銷與最小化零值儲存同樣重要。
+對長度 16、8-bit values、4-bit coordinates 的 vector：
 
-### Eyeriss：實際應用中的遊程編碼
+| Nonzeros | Density | Uncompressed | Bitmask | Coordinate payload | 4-bit RLE |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 6.25% | 128 bits | 24 bits | 12 bits | 12 bits |
+| 8 | 50% | 128 bits | 80 bits | 96 bits | 96 bits |
+| 16 | 100% | 128 bits | 144 bits | 192 bits | 192 bits |
 
-Eyeriss（Chen, ISSCC 2016）對輸入激活值和輸出特徵圖的片外 DRAM 鏈路實施 RLE 壓縮。編碼使用 5 位元遊程長度欄位與 16 位元值，透過 64 位元寬的 DRAM 匯流排傳輸。結果顯示，RLE 壓縮在 AlexNet 各卷積層中實現了 **1.2× 至 1.9× 的 DRAM 存取量縮減**——在理論熵限的 5–10% 以內。
+教訓不是「compressed 一定比較好」。在 100% density 下，此例所有 compressed formats 都比 uncompressed 更差，因為 metadata 是額外成本。
 
-![Eyeriss RLE 壓縮——架構圖與 DRAM 存取縮減結果](../../assets/L08/L08-p33-eyeriss-rle.png)
+### 7. Metadata 的硬體意義
 
-### 存取效率與「協調遍歷（concordant traversal）」的要求
+Metadata 不是靜態描述，它會改變 datapath：
 
-對於跳過操作，硬體必須快速找到*下一個非零值的座標*。存取效率總結：
+- Bitmask 需要 bit reads，常搭配 popcount 或 bit-scan logic。
+- Coordinate payload 需要 coordinate storage、coordinate comparison，有時還要在另一個 operand 中 random lookup。
+- RLE 需要 accumulation state 來重建 absolute coordinates。
+- Dual-sided skipping 需要 intersection unit。
 
-| 格式 | 定位下一個非零值的步驟 | 隨何者擴展 |
-|---|---|---|
-| 未壓縮 | 逐個座標比較直到找到非零值 | 向量大小 |
-| 位元遮罩 | 逐個座標讀取 1 位元元資料 | 向量大小 |
-| RLE | 累積遊程長度 | 遊程數量 |
-| CP | 直接讀取下一個（座標, 值）配對 | 非零值數量 |
+Slide 35 引用 Han et al. 的重點是：對 unstructured sparsity，index metadata 可能約佔 storage 的一半。這是警訊，不是普世常數；它取決於 value precision、coordinate width 與 sparsity pattern。
 
-重要注意事項：以上分析均假設**協調遍歷（concordant traversal）**——即硬體以資料壓縮的同一順序遍歷張量。若資料流需要不同的遍歷順序（**非協調遍歷，discordant traversal**），壓縮資料必須重新索引或解壓縮，代價極高。因此，表示格式的選擇與資料流（迴圈順序）密切相關。
+### 8. Structured sparsity
 
-> **為什麼重要：** 壓縮不是免費的。編碼座標的元資料代價可能抵消大部分收益。正確的格式應同時匹配預期的密度分佈與硬體的遍歷順序——而這種耦合關係一路向上影響到 TeAAL 金字塔的映射（Mapping）層。
+Unstructured sparsity 允許 nonzeros 出現在任何位置。對 model design 很彈性，但硬體昂貴，因為每個 nonzero 可能都要 coordinate metadata。
 
----
+**Structured sparsity** 限制 nonzero 的合法位置。硬體好處是 search space 更小，metadata 更精簡。
 
-## 第四章 — 結構化稀疏性與階層化結構稀疏性（HSS）
+常見 \(G:H\) pattern 表示：每 \(H\) 個值中恰好有 \(G\) 個非零。NVIDIA 2:4 是本講標準例子：每四個值恰好兩個非零，也就是 50% density。
 
-> *投影片：L08-49 … L08-66*
+好處是 decode 簡單。限制也很直接：一種 \(G:H\) ratio 只支援一種 sparsity degree。若 layer 想要 30% 或 80% sparsity，固定 2:4 hardware 無法平滑地轉成等比例 savings。
 
-### 取捨：靈活性 vs. 硬體簡單性
+### 9. Hierarchical Structured Sparsity
 
-**非結構化稀疏性（unstructured sparsity）** 允許非零值出現在任何座標。這讓模型設計具有最大靈活性（通常精度最高），但硬體代價高：找到非零值需要搜尋完整座標範圍，且元資料開銷大。
+Hierarchical Structured Sparsity（HSS）在多個巢狀粒度上組合簡單 \(G:H\) rules。假設使用 \(3:4 \rightarrow 2:4\)：
 
-**結構化稀疏性（structured sparsity）** 限制非零值可出現的位置，縮小搜尋空間並減少元資料開銷，代價是模型設計靈活性降低（可能損失精度）。本講展示了粒度（granularity）的光譜：
+- 外層規則：4 個 blocks 中保留 3 個 non-empty blocks。
+- 內層規則：每個 surviving block 中保留 4 個值中的 2 個。
 
-![稀疏性的粒度光譜——從權重剪枝到通道剪枝](../../assets/L08/L08-p51-granularity-sparsity.png)
+結果 density 是 \((3/4)(2/4)=3/8=37.5\%\)，sparsity 是 \(62.5\%\)。
 
-從細粒度到粗粒度：*權重剪枝（weight pruning）* → *濾波器剪枝（filter pruning）* → *行剪枝（row pruning）* → *通道剪枝（channel pruning）*。粒度越粗，硬體越簡單（非零位置可預測），但模型在維持精度方面的自由度越少。
+Lecture 08 的 HSS 例子把外層 \(\{4:4,4:5,4:6,4:7\}\) 與內層 \(\{4:4,2:4,1:4\}\) 組合，得到 \(4 \times 3 = 12\) 種 sparsity degrees。硬體不需要十二種獨立 decoder，而是組合簡單的 per-rank decoders。
 
-### G:H 結構化稀疏性（NVIDIA 稀疏張量核心）
+這是一個 format-level 技巧，但有 architecture-level 後果：model 可選更多 sparsity degrees，而硬體仍接近少數簡單 structured primitives。
 
-NVIDIA 的 2:4 結構化稀疏性（亦稱**稀疏張量核心（Sparse Tensor Core）**模式）規定：在每組連續的 4 個值中，恰好有 2 個非零值（精確的 50% 稀疏度）。這是 G=2、H=4 的典型 **G:H 模式**。
+### 10. Sparse tiling 與 overbooking
 
-硬體收益顯著：每個 H 元素組內非零值的位置只需 ⌈log₂(C(H,G))⌉ 位元的元資料——對於 2:4，每對非零值僅需 2 位元。與非結構化稀疏性相比，元資料開銷極小，能夠實現非常高效的跳過操作。
+Dense tiling 問：「哪個矩形 tile 放得進 buffer？」Sparse tiling 問：「這個 tile 會有多少 nonzeros？」
 
-![NVIDIA 2:4 稀疏張量核心——按行的結構化稀疏模式](../../assets/L08/L08-p52-structured-2-4.png)
+兩個形狀相同的 sparse tiles 可能有很不同的 occupancy。若 buffer 依最 dense tile 設計，平均 tile 會浪費容量。若依 equal nonzero count 切 tile，coordinate ranges 會不規則，使另一個 operand 難以 tile。
 
-其局限性在於：設計鎖定在 50% 稀疏度。若模型僅有 30% 稀疏度，沒有加速；若有 80% 稀疏度，硬體仍只能以 50% 的利用率運行。單一 G:H 值不夠靈活。
+本講比較：
 
-### 靈活性問題
+- **Uniform occupancy：** nonzero count 平衡，但 shape 不規則。
+- **Uniform shape：** shape 規則，但 nonzero count 變動大。
 
-現代 DNN 使用各種操作的混合：
-- **剪枝（Han, NeurIPS 2015）** → 稀疏權重，程度可變。
-- **激活函數（ReLU 等）** → 視輸入而定的稀疏或稠密激活值。
-- **注意力模組（Vaswani, NeurIPS 2017）** → 稠密或可變稀疏注意力映射。
-- **深度可分離層（Howard, CVPR 2017）** → 稠密權重，但參數更少。
+**Overbooking** 選擇比 worst-case buffer capacity 更大的 nominal tile，賭大多 tiles 因為稀疏而實際放得下。若某 tile nonzeros 太多，溢出的部分是 **bumped data**。Tailors 會把 bumped data streaming，而不是放入 buffer。Swiftiles 透過 random sampling 估計 tile occupancy，決定 overbooking 程度。
 
-單一 G:H 值無法高效服務所有這些情況。幼稚的解決方案——在硬體中支援多個 G:H 比率（2:4、2:6、2:8 ...）——難以擴展：硬體複雜度大約與支援的稀疏度數量成正比增長。
+硬體含義很微妙：overbooking 增大 average tile size，提升 reuse，同時接受偶發 streamed overflow。它是對 worst-case dense tiling 假設的一種受控違反。
 
-### 階層化結構稀疏性（HSS）
+## Worked Examples
 
-Wu 等人 [MICRO 2023] 提出 **HSS** 作為可組合（composable）的解決方案。HSS 不是為每個 G:H 比率分別設計硬體，而是**階層式地組合簡單的 G:H 模式**：
+### 範例 1：Density 與預期 useful work
 
-N 階（N-rank）HSS 模式在 N 個嵌套粒度上分別應用 G:H 規則。例如 **3:4 → 2:4** 模式：
-- **第 1 階（Rank 1，外層）**：在每 4 個塊（block）中選擇 3 個非空塊。
-- **第 0 階（Rank 0，內層）**：在每個塊內，從 4 個元素中保留 2 個非零值（標準 2:4）。
+若 weight density \(d_W=0.4\)，activation density \(d_A=0.5\)，並在 toy estimate 中假設 nonzero locations 獨立，dual-sided skipping 大約會拜訪 dense multiply positions 的 \(d_W d_A = 0.2\)。
 
-3:4→2:4 模式的有效稀疏度為 1 − (3/4)(2/4) = 1 − 6/16 = 62.5%。
+Dense loop 有 1000 次乘法時，idealized effectual count 是 \(1000 \times 0.2 = 200\)。只用 activations 當 leader 的 single-sided scheme 會拜訪 \(1000 \times 0.5 = 500\) 個 positions。它有省工作，但仍會做許多對應 weight 為零的乘法。
 
-![階層化結構稀疏性——組合 3:4 與 2:4 模式](../../assets/L08/L08-p58-hss-pattern.png)
+Teaching interpretation：independence 只是教學簡化。真實 DNN sparsity 可能依 layer、channel、input 而相關。
 
-因為稀疏度分數相乘，一個 2 階 HSS（有 m 個第 1 階選項和 n 個第 0 階選項）能覆蓋 m×n 個不同的稀疏度——遠多於 m+n 個比率的情況。投影片 64 的具體例子：將第 1 階選項 {4:4, 4:5, 4:6, 4:7} 與第 0 階選項 {4:4, 2:4, 1:4} 組合，可產生**跨越 0% 到 86% 的 12 個不同稀疏度**。
+### 範例 2：Metadata 可能打敗 compression
 
-![HSS 稀疏度覆蓋——兩個三選項層級帶來 12 個稀疏度](../../assets/L08/L08-p64-hss-sparsity-degrees.png)
+假設 values 8 bits、vector length 16、coordinate 需要 4 bits。Coordinate payload size 是 \(n_\text{nz}(8+4)\)。Dense size 是 \(16 \times 8=128\) bits。
 
-關鍵硬體優勢：**硬體只需在每個階層獨立實作簡單的 G:H 加速**——階層式組合是表示格式的選擇，而非額外的硬體模式。這使稀疏加速的開銷保持在低水準。
+Coordinate payload 只有在 \(12n_\text{nz}<128\)，也就是 \(n_\text{nz}<10.67\) 時比 dense 小。如果 vector 有 11 個以上 nonzeros，coordinate payload 反而更大。
 
-### HighLight：HSS 落地為矽晶片
+硬體意義：若 layer density 很高，sparse decoding 會花 area 與 bandwidth 搬 metadata，卻沒有移除多少工作。
 
-**HighLight** 加速器 [Wu, MICRO 2023] 在 16×16 PE 陣列上實作 HSS，具有兩個層次的跳過（skipping）階層：
-- **第 1 階加速（Rank-1 acceleration）**：透過跳過整個空塊來降低儲存需求與能耗。
-- **第 0 階加速（Rank-0 acceleration，PE 內部）**：透過跳過塊內的零元素來降低延遲與能耗。
+### 範例 3：HSS effective sparsity
 
-壓縮表示採用基於 HSS 的格式，硬體解碼效率高。HighLight 在 ResNet50 和 Transformer-Big 上以多種剪枝稀疏度評估，達到了在 STC 和 DSTC 基準上的**精度—能量延遲積（accuracy–EDP）帕雷托前沿（Pareto frontier）**——意即在稀疏度全域上都取得了模型精度與硬體效率之間的最佳折衷。
+對 \(4:6 \rightarrow 1:4\)：
 
-![HighLight 加速器架構——16×16 PE 陣列與階層式跳過](../../assets/L08/L08-p65-highlight-accelerator.png)
+- Outer density 是 \(4/6\)。
+- Inner density 是 \(1/4\)。
+- Effective density 是 \((4/6)(1/4)=1/6\)。
+- Effective sparsity 是 \(1-1/6=5/6\approx 83.3\%\)。
 
-> **為什麼重要：** 部署模型的稀疏度並非固定——它因層、因剪枝方法、因輸入資料而異。能在稀疏度全域高效利用稀疏性（而非鎖定在單一 G:H 比率）的硬體，對於在多樣模型與工作負載上的實際部署至關重要。
+重點不是這個 pattern 一定最好，而是 nested ratios 會相乘，讓少量硬體模式覆蓋許多 sparsity degrees。
 
----
+## 關鍵方程式與讀法
 
-## 第五章 — 稀疏張量的分塊：超額預訂問題
+### Effectual work
 
-> *投影片：L08-67 … L08-94*
+\[
+N_\text{performed}=N_\text{effectual}+N_\text{unexploited ineffectual}.
+\]
 
-### 為什麼稀疏性讓分塊變難
+這是 accounting identity。Sparse hardware 只有在降低第二項，且剩餘 operation 的 overhead 合理時，才改善效能。
 
-前幾講的基本原則：為了最大化能效，你希望選擇**能放入片上緩衝區（on-chip buffer）的最大分塊**，因為更大的分塊能實現更多的資料重用，並減少 DRAM 流量。對於稠密張量，分塊大小由張量維度和一個簡單的容量限制決定。
+### 理想獨立 two-sided work
 
-對於稀疏張量，一個分塊中的非零值數量（其**佔用率，occupancy**）是不可預測的。形狀相同的兩個分塊可能有截然不同的非零值數量。稀疏度不僅在不同工作負載之間有差異，即使在同一個張量內也會變化，就如投影片 68 中針對圖計算、科學模擬和推薦系統的展示。
+\[
+N_\text{effectual}\approx d_A d_B N_\text{dense}.
+\]
 
-挑戰在於：若你按**最大佔用率**分塊來規劃緩衝區大小，大多數分塊將只有部分填滿——浪費緩衝區空間，並減少有效分塊大小（進而降低資料重用）。
+這是教學近似。若 operand A 非零機率是 \(d_A\)，operand B 非零機率是 \(d_B\)，兩者同時非零機率是 \(d_A d_B\)。它說明 dual-sided intersection 為何可能遠優於只利用單邊 sparsity。
 
-### 兩種不完美的分塊策略
+### HSS density
 
-**均勻佔用率（uniform occupancy）**（按非零值計數均等化選擇分塊大小）：
-- 佔用率變化小——所有分塊的非零值數量大致相同。
-- 問題：不均勻的形狀使伴隨運算元難以分塊（不規則尋址）。
+\[
+d_\text{HSS}=\prod_i \frac{G_i}{H_i}.
+\]
 
-**均勻形狀（uniform shape）**（按張量維度選擇分塊大小，與稀疏度無關）：
-- 兩個運算元都容易同時分塊（規則尋址）。
-- 問題：佔用率變化大——有些分塊稠密，有些幾乎為空。若為最壞情況（最大佔用率）分塊規劃緩衝區，平均利用率極低。
+每個 hierarchy level 保留 \(G_i/H_i\) 的 entries；一個 value 必須通過所有層，所以 kept fractions 相乘。
 
-這兩種策略單獨使用都不令人滿意。
+## 硬體意涵（Hardware Implications）
 
-### 超額預訂（overbooking）：航班座位的類比
+- **Gating：** 需要 zero detection 與 enable signals；保留 dense timing，控制簡單但 latency 不變。
+- **Skipping：** 需要 metadata 提早產生 next coordinates；會改變 cycle count，也可能造成 pipeline bubbles。
+- **Dual-sided intersection：** 需要 coordinate comparison/search logic；performance 取決於 sparsity pattern 與 metadata format。
+- **Compression：** 只有 metadata 小於省下的 zero payloads 時，才省 capacity 與 bandwidth。
+- **Structured sparsity：** 降低 decoder complexity 與 metadata width，但限制 model。
+- **HSS：** 擴大 sparsity-degree 選單，而不需為每個 degree 做完全獨立 decoder。
+- **Sparse tiling：** buffer sizing 必須考慮 occupancy distributions，而不是只有 tensor shape。
+- **Parallel sparse execution：** 不同 tiles nonzero 數量不同，PEs 會 load imbalance。
 
-本講引入**超額預訂（overbooking）**作為解決方案，並以航班座位做類比：
-- 航空公司超額預訂航班，因為平均來說並非所有持票乘客都會出現。實際登機的乘客數量接近座位數。
-- 類似地：若分塊超額預訂（名義上大於緩衝區），*平均來看*，實際落入緩衝區的非零值數量將接近緩衝區容量——因為大多數分塊是稀疏的。
+## 常見誤區（Common Misconceptions）
 
-當某個分塊的非零值超出緩衝區容量（**「被擠出的資料（bumped data）」**）時，超出的部分被**串流（stream）**直接送往計算端，而不放入緩衝區（失去這些值的重用機會，但不阻塞進度）。
+### 誤區：Sparsity 自動帶來 speedup。
 
-![超額預訂概念——分塊佔用率 vs. 緩衝區容量，含被擠出資料](../../assets/L08/L08-p84-overbooking-concept.png)
+Sparsity 只提供機會。Speedup 需要 skipping cycles。Gating 可以省 energy，但不降低 latency。
 
-### Tailors：處理被擠出的資料
+### 誤區：最會壓縮的 format 一定最好。
 
-**Tailors** 機制 [Xue, MICRO 2023] 管理兩種資料串流：
-- **未被擠出資料（unbumped data）**：正常載入緩衝區，並在遍歷迴圈的多次遍歷中重複使用。
-- **被擠出資料（bumped data）**：在單獨的流程中從 DRAM 串流——這些資料失去重用機會，但遍歷繼續不中斷。
+Compression 很好的 format 可能 access efficiency 很差。若硬體每個有用 value 都得掃描、累加或 random probe metadata，省下的 payload bits 不一定變成 throughput。
 
-被擠出資料的遍歷順序被調整，以在串流限制下盡可能維持重用。
+### 誤區：Single-sided skipping 等於 dual-sided skipping。
 
-### Swiftiles：預測分塊佔用率
+Single-sided skipping 只避開 leader 的 zeros。若 follower 在 leader nonzero coordinate 為零，operation 仍然 ineffectual。
 
-為了確定*超額預訂多少*，硬體需要估計分塊的佔用率分佈。對整個張量進行完整遍歷（計算每個分塊中的所有非零值）代價太高。**Swiftiles** [Xue, MICRO 2023] 使用**隨機採樣（random sampling）**：採樣一小部分分塊，建立近似的佔用率分佈，然後按緩衝區大小縮放。目標是設定超額預訂比率，使選定百分位數（例如第 90 百分位）的分塊能放入緩衝區。
+### 誤區：Structured sparsity 只是為了簡化硬體而犧牲 model quality。
 
-在 ExTensor [Hegde, MICRO 2019] 上的評估：
-- **ExTensor-Naive（天真）**：無稀疏感知分塊；分塊大小按稠密情況計算（最壞情況）。第 90 百分位佔用率僅為緩衝區的 6%；分塊大小嚴重低估。
-- **ExTensor-Overbooking**（Tailors + Swiftiles，目標第 90 百分位）：相較 ExTensor-Naive 實現了 **52.7× 的加速**和 **22.5× 的能效提升**。
-- **ExTensor-Prescient**（先知型：事先知道每個分塊的精確佔用率）：超額預訂即使相對於這個理想基準，仍實現了 **2.3× 加速**和 **2.5× 能效提升**——因為 Swiftiles 的預測已足夠準確，大多數分塊都能放入，而更大分塊（更多重用）的收益超過了偶發被擠出資料串流的代價。
+這個 tradeoff 的確存在，但 structured sparsity 也讓 savings 更可預測。HSS 嘗試透過組合簡單結構追回一些 flexibility。
 
-> **為什麼重要：** 為稀疏資料選擇正確的分塊大小與選擇正確的壓縮格式同樣重要。天真地確定分塊大小幾乎浪費了所有的緩衝區容量；配合輕量佔用率預測的超額預訂則能在不需要完整預掃描的情況下，恢復大部分理論最大效率。
+### 誤區：Sparse tiles 應該依 worst case sizing。
 
----
+Worst-case sizing 在 occupancy 高度變動時會浪費大多 buffer capacity。Overbooking 的價值就在於 average occupancy 可能遠低於 maximum occupancy。
 
-## 第六章 — 與資料流的交互作用及總結
+## 與前後講次的連結（Connections）
 
-> *投影片：L08-94 … L08-96*
+- **L05-L06 mapping/dataflows：** sparse formats 只有在 loop order 對齊 storage order 時才有效。這仍是 mapping 問題，只是 metadata 也進入 loop。
+- **L07 sparsity/pruning：** pruning 產生 weight sparsity；L08 問硬體要如何利用它。
+- **L09 sparse architectures part 2：** fibertrees、CSR/CSC、projection 與 intersection 會形式化本講概念。
+- **L10 sparse architectures part 3：** TeAAL 與 sparse accelerator specifications 會提供描述這些設計選擇的語言。
+- **Lab 4/SparseLoop：** 本講的 SAF 詞彙會成為分析 sparse accelerator tradeoffs 的 modeling vocabulary。
 
-### 資料流影響稀疏性利用
+## Paper Bridge: TeAAL
 
-本講最後將稀疏性與 TeAAL 金字塔的 **Mapping（映射）** 層相連。迴圈順序（資料流，dataflow）必須與表示格式的儲存順序對齊，以實現**協調遍歷（concordant traversal）**——即硬體按資料在記憶體中儲存的順序存取非零值。非協調遍歷（discordant traversal）需要對元資料進行隨機存取，代價高昂。
+### Bibliographic identity
 
-額外的資料流考量：
-- **增加某種資料類型的駐留性（stationarity）**（將其迴圈移至最外層/空間維度）可將每次存取的元資料解碼代價分攤到更多計算上。
-- **平行性與工作負載平衡（workload balance）**：當迴圈跨 PE 並行化（spatial_for）時，稀疏性造成*工作負載不平衡*——某些 PE 獲得稠密分塊，需要執行更多週期，而其他 PE 很快完成。應考慮預期的稀疏度變化來選擇要並行化哪個迴圈。
+- **Title:** TeAAL: A Declarative Framework for Modeling Sparse Tensor Accelerators
+- **Authors:** N. Nayak et al.
+- **Year / venue:** MICRO 2023
+- **Used in lecture(s):** L01, L08, L09, L10
+- **Local PDF:** `papers/TeAAL.pdf`
 
-這些交互作用在 Lab 4（SparseLoop 工具）和期末專題（教科書第 8.3 章）中深入探討。
+### Problem addressed
 
-### 本講總結
+TeAAL 處理 sparse tensor accelerators 難以規格化與比較的問題。Sparse accelerators 不只 PE array 不同，loop order、tensor formats、partitioning、rank transformations、sparse orchestration 都不同；若只用非正式描述，很難比較。
 
-本講以對挑戰與代價的精確陳述作結：
+### Core idea
 
-**稀疏性帶來的不規則性**導致：緩衝區與 PE 的未充分利用；PE 陣列間的工作負載不平衡；不規則的資料存取模式。
+論文用 cascades of mapped Einsums 加上 fibertrees 的 content-preserving transformations 表示 sparse accelerators。它把 computation 與 mapping/format 分開，對應本講把 skipping、format、dataflow 分開討論。
 
-**不得超過稀疏性收益的開銷**：座標元資料的儲存；用於檢查運算元是否為零的交集邏輯。
+### Relevance to this lecture
 
-本講中的每個設計——Eyeriss、SCNN、ExTensor、HighLight、Swiftiles——都代表**利用稀疏性**與**為找到、壓縮和求交集稀疏資料而付出硬體複雜度代價**之間折衷曲線上的一個點。
+Lecture 08 用 TeAAL concern stack 說明 **Format** 與 **Mapping** 分離但耦合。Compressed format 只有在 mapping 能 concordantly traverse 時才有用。Sparse tiling 也是 mapping/format 問題，因為 shape-based partitioning 與 occupancy-based partitioning 會暴露不同取捨。
 
-> **為什麼重要：** 稀疏性不是小的最佳化——它是生產 DNN 加速器中能效與吞吐量的一階決定因素。但正確利用它的硬體代價（交集邏輯、元資料解碼器、分塊控制器）需要在金字塔的格式（Format）、映射（Mapping）和架構（Architecture）三層之間進行仔細的協同設計。後兩講（L09–L10）將更深入地研究具體的稀疏加速器架構。
+### Key claims used in this chapter
 
----
+- Sparse tensors 可自然表示為帶有 missing coordinate/payload pairs 的 fibertrees；見 TeAAL Section 2.1。
+- Einsums 指定 computation 但不指定 iteration order；mapping 選 loop order 並影響 locality 與 load balance；見 Sections 2.2 與 2.3。
+- Sparse tensors 通常被 compression 移除 zero elements，但 sparse execution 會引入 memory footprint variation、transfer imbalance 與 compute load imbalance；見 Section 2.3。
+- Rank flattening、rank partitioning、rank swizzling 捕捉常見 sparse data orchestration；見 Section 3.2。
+
+### What students should remember
+
+1. Sparse architecture 不只是 PE microarchitecture 問題。
+2. Format、mapping、binding、architecture 必須一起規格化。
+3. Fibertree transformations 是討論 sparse layout 與 tiling 的精確語言。
+4. Load imbalance 是 sparse design 的一等問題。
+
+### Limitations and assumptions
+
+TeAAL 是 modeling/specification framework，不是單一 accelerator。本章用它支撐概念，不把它當成某個 SAF 最佳的證明。
+
+### Suggested insertion points
+
+在解釋 format choice 為何耦合 traversal order、sparse tiling 為何需要 occupancy-aware partitioning、後續為何引入 fibertrees 時使用 TeAAL。
+
+## Paper Bridge: SCNN
+
+### Bibliographic identity
+
+- **Title:** SCNN: An Accelerator for Compressed-sparse Convolutional Neural Networks
+- **Authors:** A. Parashar et al.
+- **Year / venue:** ISCA 2017
+- **Local PDF:** `papers/L17_SCNN_Parashar_ISCA2017.pdf`
+
+### Problem addressed
+
+SCNN 問：如何在 convolution layers 中同時利用 pruned weights 與 ReLU-induced activation sparsity，並讓 activations/weights 在大部分 computation 中保持 compressed？
+
+### Core idea
+
+SCNN 使用 planar-tiled input-stationary Cartesian-product sparse dataflow。它把 nonzero weights 與 nonzero activations 的向量送入 multiplier array，做 Cartesian product，並把 products scatter 到 output accumulators。
+
+### Relevance to this lecture
+
+Lecture 08 把 SCNN 當成 single-sided skipping 的例子，也用它說明 sparsity benefits 並非免費。SCNN 的 scatter network、compressed buffers 與 metadata handling 正是本講警告的 overheads。
+
+### Key claims used in this chapter
+
+- Abstract 說 SCNN 利用 pruning 造成的 zero-valued weights 與 ReLU 造成的 zero-valued activations，並用 compressed encoding 降低 transfers 與 storage。
+- Section II 報告，在論文量測的 density products 下，typical layers 可把 work 降低約 4 倍，最高可到約 10 倍。
+- Section III 介紹 PT-IS-CP-sparse dataflow，說明 input-stationary Cartesian-product computation 為何匹配 sparse weights/activations。
+- Section IV 描述含 compressed storage、all-to-all multiplication 與 scatter accumulation 的 PE。
+- Conclusion 說 SCNN 同時利用 weight 與 activation sparsity，且當 weights 與 activations 各自低於約 85% density 時，比 dense architectures 更有效率。
+
+### What students should remember
+
+1. Dual-sparse work reduction 需要 values 與 coordinates。
+2. Cartesian products 增加 useful multiply opportunities，但 output addresses 會 scattered。
+3. Compression 只有在 decoders 與 routers 跟得上時才省 bandwidth。
+
+### Limitations and assumptions
+
+SCNN 針對 CNN inference，依賴 compressed sparse blocks 與 PE 中足夠 nonzero work；它不是通用 sparse tensor accelerator。
+
+### Suggested insertion points
+
+討論避免 zero work 為何需要額外 routing/metadata machinery 時使用 SCNN，也可作為 Lecture 09 sparse convolution dataflows 的預告。
+
+## Paper Bridge: Eyeriss v2
+
+### Bibliographic identity
+
+- **Title:** Eyeriss v2: A Flexible Accelerator for Emerging Deep Neural Networks on Mobile Devices
+- **Authors:** Y.-H. Chen et al.
+- **Year / venue:** JETCAS 2019
+- **Local PDF:** `papers/L17_EyerissV2_Chen_JETCAS2019.pdf`
+
+### Problem addressed
+
+Eyeriss v2 處理 compact and sparse DNNs 中 layer shapes 與 sparsity patterns 變化大的問題。目標是在 dense reuse assumptions 不再成立時，仍維持 throughput 與 energy efficiency。
+
+### Core idea
+
+它結合 hierarchical mesh NoC 與 sparse PE support。Sparse PE 以類 CSC compressed format 儲存 activations 與 weights，在 compressed domain 直接 skipping zeros，並用 SIMD support 恢復 utilization。
+
+### Relevance to this lecture
+
+Eyeriss v2 展示 gating 與 skipping 的差異。Original Eyeriss 對 zero activations 使用 gating；Eyeriss v2 讓資料在 on-chip 保持 compressed 並 skipping zeros 來提升 throughput。
+
+### Key claims used in this chapter
+
+- Section IV 說 original Eyeriss 透過 gating logic/data accesses 利用 input-activation zeros，而 Eyeriss v2 進一步 skipping zeros 以改善 throughput 與 energy。
+- Section IV 描述 activations/weights 的 CSC encoding，並指出 compressed-domain processing 可以不花額外 cycles 地跳過 zeros。
+- Section V 報告在該 paper 評估設定下，sparse AlexNet 與 sparse MobileNet 有大幅改善，同時也指出 workload imbalance 與 layer-shape limitations。
+
+### What students should remember
+
+1. 從 gating 到 skipping 會改變 PE pipeline 與 storage format。
+2. Sparse support 增加 control 與 storage overhead。
+3. 即使設計細緻，workload imbalance 仍存在。
+
+### Limitations and assumptions
+
+量化結果綁定 Eyeriss v2 的 65 nm implementation、benchmark models、batch size 與 baselines。本章把它當成 design tradeoffs 的證據，不把其 speedup 當成普世常數。
+
+### Suggested insertion points
+
+用於 gating/skipping 區分，以及 compressed formats 如何影響 throughput 的討論。
+
+## Paper Bridge: The State of Sparsity in Deep Neural Networks
+
+### Bibliographic identity
+
+- **Title:** The State of Sparsity in Deep Neural Networks
+- **Authors:** D. Blalock et al.
+- **Year / venue:** MLSys 2020
+- **Local PDF:** `papers/L16_StateOfPruning_Blalock_MLSys2020.pdf`
+
+### Problem addressed
+
+該 paper 調查 pruning methods，指出 pruning research 常有 comparison 與 metrics 不一致的問題。
+
+### Core idea
+
+它區分 unstructured pruning 與 structured pruning，並主張 pruning 應作為 efficiency/quality tradeoff curve 評估，而不是單一 compression number。
+
+### Relevance to this lecture
+
+Lecture 08 的 structured sparsity 段落依賴一個 model-side 事實：sparsity pattern 是設計選擇。Hardware-friendly pattern 可簡化 metadata 與 traversal，但可能改變模型 accuracy/efficiency frontier。
+
+### Key claims used in this chapter
+
+- Section 2 將 pruning 定義為產生 masked 或 removed parameters 的 model，並區分 unstructured/structured pruning。
+- Section 2 強調 model efficiency 與 quality 的 tradeoff。
+- 文獻回顧警告 reported compression 與 speedup metrics 不能互換。
+
+### What students should remember
+
+1. Sparsity 由 model decisions 與 hardware decisions 共同塑造。
+2. Structured sparsity 只有在 model 能承受限制時才有價值。
+3. Theoretical speedup 與 realized hardware speedup 是不同 metrics。
+
+### Limitations and assumptions
+
+該 paper 是 pruning evaluation，不是 sparse accelerator design。本章用它說明 hardware-friendly sparsity patterns 為何仍需 accuracy tradeoff 評估。
 
 ## 獨立學習指南（Standalone Study Guide）
 
-### 進入下一講前必須掌握
+建議順序：
 
-- 區分 gating、skipping 與 compressed-format representation 這三種 sparse acceleration features。
-- 依 compression efficiency 與 access efficiency 比較 uncompressed、bitmask、coordinate-payload、run-length formats。
-- 說明 structured sparsity 為何降低 metadata 與 decoder cost。
-- 說明 sparse tiling 問題：occupancy 會變動，因此固定形狀的 dense-style tile 會浪費 buffer。
-- 描述 Tailors 與 Swiftiles 如何以 overbooking 處理 sparse tiles。
+1. 不看答案重做 dot-product accounting table。
+2. 解釋為何 skipping 需要 format metadata，而 gating 不一定需要。
+3. 對每個 sparse format 問：「我要如何找下一個 nonzero？」
+4. 用 kept fractions 相乘計算一個 HSS density。
+5. 把 overbooking 解釋成 average-case buffer-utilization strategy。
 
-### 自我檢核問題
+## 自我檢核問題
 
-1. 哪一種 sparse acceleration feature 省能但不省 cycles？
-2. 為什麼高密度時 compressed format 可能比 uncompressed storage 更大？
-3. Tailors 中 bumped tile 與 unbumped tile 的差異是什麼？
+1. 為何 gating 省 energy 但不省 cycles？
+2. Dot-product 例子中，為何 \(A\)-leader skipping 做三次 computes，但 effectual 只有兩次？
+3. 為何 bitmask compression 在 100% density 時可能比 uncompressed storage 更差？
+4. RLE 需要什麼 coordinate state，而 coordinate payload 不需要？
+5. 固定 2:4 accelerator 為何無法任意利用 80% sparsity？
+6. HSS 為何能用少量硬體模式產生更多 sparsity degrees？
+7. Sparse tiling 為何讓「最大可放入 tile」變困難？
+8. Overbooking 中 bumped data 是什麼？
 
-### 練習
+## 練習
 
-1. 對一個長度 16、含 4 個非零值的向量，分別用 bitmask 與 coordinate-payload 編碼，並分開計算 metadata bits 與 payload bits。
-2. 選一組 2:4 sparse group，計算需要多少 bits 來編碼非零位置。
-3. 說明為什麼用 maximum occupancy 選 tile size 會破壞 average tile 的重用。
-
-### 常見誤區
-
-- 把 compression ratio 當成唯一格式指標。Access efficiency 可能主導 runtime。
-- 假設 structured sparsity 永遠較好。它可能降低模型彈性或準確度。
-- 忽略 workload balance：skipping 可能讓不同 PE 在不同時間完成。
-
----
+1. **Format calculation：** 長度 32 vector 有六個 nonzeros、8-bit values、5-bit coordinates。計算 uncompressed、bitmask、coordinate-payload 與 5-bit RLE 的 storage size。
+2. **Intersection trace：** 用 merge-style algorithm 交集 \(A=\{1,4,9,10\}\) 與 \(B=\{0,4,5,10,11\}\)。計算 metadata comparisons。
+3. **Leader choice：** 若 \(A\) density 0.2、\(B\) density 0.8，single-sided skipping 應選哪個 operand 當 leader？為什麼？
+4. **HSS design：** 選兩層 \(G:H\) 產生 75% sparsity。說明硬體與 model-flexibility tradeoff。
+5. **Tiling reasoning：** 描述一個 uniform-shape tiling 會浪費 buffer capacity 的 sparse tensor distribution，再說明 overbooking 如何改變 average tile size。
+6. **Paper bridge：** 用 SCNN 解釋為何 sparse accelerator 即使少做乘法，也可能需要 scatter network。
 
 ## 關鍵詞彙（Key Terms）
 
-| 詞彙 | 說明 |
+| Term | Definition |
 |---|---|
-| **有效運算（effectual operation）** | 兩個運算元均非零的運算；對輸出有貢獻。 |
-| **無效運算（ineffectual operation）** | 至少一個運算元為零的運算；`任何值 × 0 = 0`。 |
-| **閘控（gating）** | 一種 SAF：壓制對零值運算元的記憶體讀取和乘法，節省能量但不節省週期。週期仍然發生。 |
-| **跳過（skipping）** | 一種 SAF：完全省略零值或非交集運算元配對的整個週期，同時節省能量和時間。需要預計算的非零座標。 |
-| **SAF（稀疏加速特性，Sparse Acceleration Feature）** | 閘控、跳過和壓縮格式策略的總稱（Wu, MICRO 2022）。 |
-| **單邊交集（single-sided intersection）** | 一個運算元（領導者）驅動存取模式；另一個（跟隨者）僅在領導者非零時讀取。 |
-| **雙邊交集（dual-sided intersection）** | 搜尋兩個運算元的非零座標集合以找到配對；只處理配對的非零值。 |
-| **表示格式（representation format）** | 稀疏張量在記憶體中的編碼方式，包括值和座標元資料。 |
-| **未壓縮（Uncompressed, U）** | 儲存每個值，包括零；無元資料開銷；最適合稠密資料。 |
-| **位元遮罩（Bitmask, B）** | 每個座標一個位元；最適合中等稀疏度。 |
-| **座標載荷（Coordinate Payload, CP）** | 每個非零值儲存顯式座標；最適合高稀疏度；存取直接。 |
-| **遊程編碼（Run-Length Encoding, RLE）** | 儲存非零值之間的零值計數；最適合高稀疏度與長零值段；需要累加才能找到下一個座標。 |
-| **壓縮效率（compression efficiency）** | 壓縮後表示大小與未壓縮大小之比；取決於密度和元資料開銷。 |
-| **存取效率（access efficiency）** | 從元資料定位下一個非零值的計算代價；決定跳過硬體的複雜度。 |
-| **協調遍歷（concordant traversal）** | 以資料儲存的相同順序存取非零值——高效的預設方式。 |
-| **非協調遍歷（discordant traversal）** | 以不同於儲存順序的方式存取資料——代價高昂；需要對元資料進行隨機存取。 |
-| **結構化稀疏性（structured sparsity）** | 非零值僅出現在可預測位置的稀疏模式；降低硬體複雜度。 |
-| **非結構化稀疏性（unstructured sparsity）** | 對非零位置無限制；模型靈活性最大，但硬體代價較高。 |
-| **G:H 稀疏性** | 在每組連續 H 個值中恰好有 G 個非零值。NVIDIA 的 2:4 是典型例子。 |
-| **HSS（階層化結構稀疏性，Hierarchical Structured Sparsity）** | 在巢狀粒度上組合多個 G:H 模式，以簡單硬體覆蓋廣泛的稀疏度範圍（Wu, MICRO 2023）。 |
-| **分塊佔用率（tile occupancy）** | 給定分塊中的非零值數量；在非結構化稀疏性下不可預測地變化。 |
-| **超額預訂（overbooking）** | 提名比緩衝區容量更大的分塊；有效，因為大多數分塊是稀疏的，其實際佔用率平均而言能放入緩衝區。 |
-| **Tailors** | 處理「被擠出（bumped）」分塊資料的硬體機制——以串流而非緩衝方式處理，不阻塞計算 [Xue, MICRO 2023]。 |
-| **Swiftiles** | 使用隨機採樣預測分塊佔用率分佈並設定超額預訂比率的輕量分塊演算法 [Xue, MICRO 2023]。 |
-| **工作負載不平衡（workload imbalance）** | 分配給不同 PE 的分塊之間非零值計數的差異，導致部分 PE 提前完成並閒置。 |
-
----
+| **Activation sparsity（激活稀疏性）** | Activations 中的零值，常與 input 有關；硬體需 runtime detect 或 encode。 |
+| **Weight sparsity（權重稀疏性）** | Trained weights 中的零值，常由 pruning 產生；inference 前通常已知。 |
+| **Effectual operation** | 會改變 output 的 operation，例如兩個 nonzero operands 相乘。 |
+| **Ineffectual operation** | 含 zero operand 或 zero addend、無法影響最終值的 operation。 |
+| **Gating（閘控）** | 偵測零值後在該 cycle suppress reads 或 compute；省 energy 不省 time。 |
+| **Skipping（跳過）** | 直接前進到有用 coordinates；省 time 與 energy，但需要 metadata/traversal logic。 |
+| **Format（格式）** | Values 與 coordinates 在記憶體中的表示法。 |
+| **Metadata（後設資料）** | bitmasks、coordinates、run lengths、segment pointers、offsets 等非 payload 資訊。 |
+| **Single-sided intersection** | 一個 operand 的 nonzeros 驅動 traversal；另一個 operand 作 follower 被檢查或讀取。 |
+| **Dual-sided intersection** | 兩個 operands 的 coordinate streams 被求交，只處理 matching nonzero coordinates。 |
+| **Bitmask** | 每個 coordinate 一個 bit，表示 payload 是否 nonzero。 |
+| **Coordinate payload** | 每個 nonzero value 與其 coordinate 一起儲存。 |
+| **Run-length encoding（RLE）** | 儲存每個 nonzero 前方有幾個 zeros。 |
+| **Structured sparsity** | 限制 sparsity 形成可預測 pattern，以降低 metadata/decoder cost。 |
+| **\(G:H\) sparsity** | 每 \(H\) 個 values 中恰好有 \(G\) 個 nonzeros。 |
+| **HSS** | Hierarchical Structured Sparsity；巢狀 \(G:H\) patterns，其 densities 相乘。 |
+| **Tile occupancy** | Sparse tile 中 nonzeros 的數量。 |
+| **Overbooking** | 選擇比 worst-case buffer capacity 更大的 nominal tile，因為大多 sparse tiles 平均可放入。 |
+| **Bumped data** | Overbooked buffer 放不下而必須 streaming、不能在 buffer 中重用的 nonzeros。 |
+| **Workload imbalance** | 不同 PEs 因 nonzero count 不同而工作量不均。 |
 
 ## 重點回顧（Takeaways）
 
-- 每次 DNN 推論運算都可分類為**有效（effectual）**或**無效（ineffectual）**；利用無效運算是稀疏加速的全部目標。
-- **閘控（gating）**僅節省能量；**跳過（skipping）**同時節省能量和時間，但需要預計算的非零位置元資料——使**表示格式（representation format）**成為一等架構關注點。
-- 四種標準格式（未壓縮、位元遮罩、CP、RLE）各有其最優的密度範圍；沒有單一格式在所有稀疏度下都占優勢。
-- **結構化稀疏性**（G:H、HSS）以模型靈活性為代價降低硬體複雜度；**HSS** 透過階層式組合簡單模式，拓展了對廣泛稀疏度的覆蓋。
-- **稀疏張量分塊**與稠密張量分塊有根本差異：分塊佔用率不可預測地變化，天真的最壞情況規劃幾乎浪費所有緩衝區容量。**Tailors + Swiftiles 超額預訂**在 ExTensor 案例中相比天真分塊實現了 52.7× 的加速。
-- 稀疏性、資料流（迴圈順序）和表示格式緊密耦合：格式必須匹配遍歷順序，平行性選擇必須考量工作負載不平衡。
-
----
-
-## 與後續講次的連結（Connections）
-
-- **L07（稀疏性）** ——前一講建立了 DNN 中*為什麼*以及*有多少*稀疏性的基礎；L08 接著探討硬體*如何*利用它。
-- **L09–L10（稀疏架構 II & III）** ——更深入地研究具體稀疏加速器架構，涵蓋 SCNN、ExTensor 及更進階的交集硬體。
-- **Format 層（TeAAL 金字塔，L01）** ——此處介紹的表示格式是導論講次中首次提及之 *Format* 層的具體實現。
-- **Mapping 層（L05–L06，資料流）** ——此處的協調/非協調遍歷討論表明，資料流（迴圈順序）的選擇不能獨立於稀疏表示格式的選擇。
-- **Lab 4（SparseLoop）** ——使用 SparseLoop 工具（sparseloop.mit.edu）在真實工作負載上評估 SAF 策略和壓縮格式；本講的理論在此直接操作化。
-- **教科書** ——*Efficient Processing of Deep Neural Networks*（Sze & Emer）第 8.2 節（壓縮）和第 8.3 節（稀疏資料流）。
-
----
+- Sparsity 只有在硬體能減少 unexploited ineffectual work 時才有價值。
+- Gating 省 energy；skipping 省 energy 與 time，但需要 format metadata。
+- Compression efficiency 與 access efficiency 必須一起看。
+- Metadata 是硬體成本，不只是註解。
+- Structured sparsity 用 model flexibility 換 decoder simplicity；HSS 嘗試兼顧更多 sparsity degrees。
+- Sparse tiling 的核心難題是 occupancy variation；overbooking 用 average case 提高 buffer utilization。
 
 ## 附錄 — 投影片對照表（Slide-to-Section Map）
 
-| 投影片 | 章節 |
-|---|---|
-| L08-1 | 標題 |
-| L08-2 … L08-8 | 第一章 — 稀疏性為何重要（來源、算術、不規則性） |
-| L08-9 … L08-22 | 第二章 — 閘控 vs. 跳過（交集、單邊/雙邊、量化） |
-| L08-23 … L08-48 | 第三章 — 表示格式（U、B、CP、RLE；壓縮/存取效率；Eyeriss RLE） |
-| L08-49 … L08-66 | 第四章 — 結構化稀疏性與 HSS（G:H、2:4 STC、HSS、HighLight） |
-| L08-67 … L08-93 | 第五章 — 稀疏張量分塊（均勻佔用率/形狀困境、超額預訂、Tailors、Swiftiles、ExTensor 評估） |
-| L08-94 … L08-96 | 第六章 — 資料流交互作用、總結、推薦閱讀 |
+| Slide range | Chapter section | Notes |
+|---|---|---|
+| L08-1 | Title | 行政資訊 |
+| L08-2 to L08-8 | 本講問題、TL;DR、SAF overview | 擴充定義與 irregularity |
+| L08-9 to L08-22 | Dot-product；gating vs. skipping | 重寫為 worked examples 與 accounting table |
+| L08-23 to L08-48 | Representation formats | 擴充 bit-count calculations 與 access-efficiency |
+| L08-49 to L08-66 | Structured sparsity and HSS | 擴充 \(G:H\) 與 HSS density equations |
+| L08-67 to L08-93 | Sparse tiling and overbooking | 重寫為 buffer-utilization 敘事 |
+| L08-94 to L08-96 | Dataflow interplay, summary, reading | 整合進 hardware implications、connections、source notes |
+
+## Source Notes
+
+- Lecture ordering 與 SAF definitions 依 Lecture 08 slides 2-7。
+- Dot-product counts 依 Lecture 08 slides 9-22。
+- Format bit-count examples 依 Lecture 08 slides 27-36 與 37-47。
+- Structured sparsity 與 HSS 依 Lecture 08 slides 50-66。
+- Sparse tiling、Tailors、Swiftiles 依 Lecture 08 slides 68-93。Worker B input 未提供 Tailors/Swiftiles 與 HighLight 的 local PDFs，因此該部分 paper-specific claims 保持 slide-anchored。
+- TeAAL discussion 使用 `papers/TeAAL.pdf`，尤其 Sections 2.1、2.2、2.3、3.2。
+- SCNN discussion 使用 `papers/L17_SCNN_Parashar_ISCA2017.pdf`，尤其 Sections II-IV 與 VIII。
+- Eyeriss v2 discussion 使用 `papers/L17_EyerissV2_Chen_JETCAS2019.pdf`，尤其 Sections IV-V。
+- Pruning context 使用 `papers/L16_StateOfPruning_Blalock_MLSys2020.pdf`，尤其 Sections 2 與 3。
+
+## Uncertainty Notes
+
+- 本章根據 slides 與 papers 重建可能的口頭講解；live lecture 的例子重點可能不同。
+- 本章避免 embedded slide images。`assets/L08/` 下既有檔案可能仍有 copyright sensitivity，但它們不在 Worker B 要求的 write scope。
+- Quantitative claims 若未由 local PDFs 獨立確認，均標為 slide-derived。

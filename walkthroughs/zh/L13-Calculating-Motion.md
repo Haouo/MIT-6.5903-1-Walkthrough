@@ -16,6 +16,36 @@
 
 ---
 
+## 本講要解決的問題
+
+前面的 mapping lectures 教了定性的 dataflow labels：output-stationary 讓 partial sums 靠近 PE，weight-stationary 讓 weights 靠近 PE，row-stationary 嘗試平衡多種 reuse。這些名稱很有用，但還不足以設計硬體。硬體架構師最後需要的是數字：
+
+- 有多少 input values 進入 L1？
+- 有多少 weights 可以跨 tiles 保留？
+- Output partial sum 什麼時候可以被 evict？
+- Buffer 的 minimum live set 多大？
+- 換一個 loop order 後，bandwidth 需求如何改變？
+
+天真的作法是模擬 loop nest 並計數 accesses。這對小例子可行，但不適合 design-space exploration。L13 教的是 symbolic method：把 computation、data access、schedule、fill 與 eviction 都表示成 integer sets 與 relations。這樣 memory traffic 就變成 set algebra。
+
+## 為什麼本講重要
+
+Data movement 是整門課的主成本主題，但「資料搬移很貴」容易說、難以精準計算。這一講補上 quantitative layer。只要能寫出 iteration space、projection maps 與 timestamp map，你就可以不用只靠 stationarity 直覺，而是直接問「哪些資料真的跨過這個 memory boundary？」
+
+這很重要，因為 buffer capacity 與 bandwidth 都是 architecture contracts。如果 L1 buffer 必須同時容納 \(S\) 個 weights、\(S\) 個 sliding-window inputs 與一個 output accumulator，那 PE design、SRAM banking、NoC pressure 與 compiler schedule 都必須尊重這個 live set。錯估 data motion 會讓設計在紙上看起來很有效率，實作時卻碰到 timing、bandwidth 或 energy 目標。
+
+## 先備知識與心智模型
+
+你需要前幾講的三個觀念：
+
+1. **Einsum / loop-nest thinking：** 每個 DNN layer 都能描述成一組 loop indices 與 tensor accesses。
+2. **Dataflow thinking：** Mapping 決定哪些 loop dimensions 是 temporal、哪些是 spatial，以及每個 level reuse 什麼 data。
+3. **Memory-hierarchy thinking：** RF、L1、global buffer、DRAM 的 access cost 不同。
+
+這一講的心智模型是一張行事曆。Iteration space 說明有哪些工作項目；projection maps 說明每個工作需要哪些資料；timestamp map 把工作排進時間；delta 與 shrink 則比較相鄰時間格，判斷什麼資料必須進房間、什麼資料可以離開。
+
+---
+
 ## 學習目標（Learning Objectives）
 
 讀完本講後，你應該能夠：
@@ -34,8 +64,6 @@
 
 本講將所有抽象概念紮根於一個具體的運算：**一維卷積**，這是 DNN 核心原語中最簡單的一種。
 
-![標題投影片——Calculating Data Motion，2026 年 3 月 18 日](../../assets/L13/L13-p01-title.png)
-
 運算定義為：
 
 ```
@@ -50,9 +78,7 @@ for q in [0, Q):
         o[q] += i[q + s] * f[s]
 ```
 
-![一維卷積——輸出駐留（output-stationary）traversal，Q × S 迭代空間](../../assets/L13/L13-p02-output-stationary-1d-conv.png)
-
-投影片將這個 traversal 標記為**輸出駐留（Output Stationary, OS）**：內層迴圈遍歷 `s`，外層迴圈走 `q`，使得每個輸出在排程移往下一個 `q` 之前就累積完所有的部份和。這是後續所有分析的*參考映射*。
+本講來源將這個 traversal 標記為**輸出駐留（Output Stationary, OS）**：內層迴圈遍歷 `s`，外層迴圈走 `q`，使得每個輸出在排程移往下一個 `q` 之前就累積完所有的部份和。這是後續所有分析的*參考映射*。
 
 > **為什麼重要：** 一維卷積簡單到可以用手追蹤，卻包含了完整 DNN 核心的所有結構——輸入、權重、輸出、歸約維度（reduction dimension）以及資料的重複使用。這裡推導出的每一個公式都直接適用於二維卷積和其他 Einsum 形式。
 
@@ -76,8 +102,6 @@ for q in [0, Q):
 ispace = isl.Set('{ IterationSpace[q, s] : 0 <= q < Q and 0 <= s < S }')
 ```
 
-![一維卷積的迭代空間——Q × S 網格，每個點對應一次 MAC](../../assets/L13/L13-p14-iteration-space.png)
-
 迭代空間純粹是一個組合物件，不帶有時間或記憶體位置的概念。這些概念由「投影映射」和「時間戳映射」引入。
 
 ### 投影映射（Projection Maps）
@@ -85,8 +109,6 @@ ispace = isl.Set('{ IterationSpace[q, s] : 0 <= q < Q and 0 <= s < S }')
 ISL **映射（map）** 是形如 `Domain[...] -> Range[...]` 的關係，由仿射等式（affine equalities）約束。三個投影映射將迭代空間中的點連接到資料元素：
 
 - **權重投影**（`is2weight`）：`IterationSpace[q, s] -> Weight[s]` ——同一列 `s` 中的每個點都映射到同一個權重元素。
-
-![權重投影——多對一（many-to-one）：給定 s 值的所有 q 共享同一個權重](../../assets/L13/L13-p21-weight-projection-manytoone.png)
 
   這個多對一的關係正是**權重駐留性（weight stationarity）** 所利用的：權重 `F[s]` 在所有 `q` 位置上被*重複使用*。
 
@@ -119,8 +141,6 @@ df_is2ts = isl.Map('{ IterationSpace[q, s] -> Timestamp[t1, t0] : t1 = q and t0 
 df_ts2is = df_is2ts.reverse()
 ```
 
-![迭代空間 traversal 視覺化——輸出駐留迴圈順序：q（慢）、s（快）](../../assets/L13/L13-p25-iteration-space-traversal.png)
-
 ### 合成映射以連接資料
 
 通過 `apply_range` 合成映射，時間戳可以直接與任何資料元素相連接：
@@ -142,8 +162,6 @@ df_ts2output = df_ts2is.apply_range(is2output)   # Timestamp -> Output
 > *投影片：L13-35 … L13-43*
 
 在將每個時步映射到資料元素之後，本講介紹**計算資料搬移**的核心步驟。
-
-![計算資料搬移——五步驟方案](../../assets/L13/L13-p35-calculating-data-movement.png)
 
 方案如下：
 
@@ -192,8 +210,6 @@ df_ts2weight_delta = df_ts2weight_current.subtract(df_ts2weight_previous)
 
 在真實的加速器中，資料是在 **L1（片上）緩衝區**中暫存的，而非每次 MAC 傳輸一個元素。本講展示如何利用一個直接的時間戳分塊映射，將逐時步的分析提升到**分塊（tile）層級**。
 
-![L1 緩衝方案——計算分塊層級資料搬移的四個步驟](../../assets/L13/L13-p44-l1-buffering-recipe.png)
-
 ### 分塊時間戳
 
 通過投影出快速維度，將細粒度時間戳分組到 L1 分塊：
@@ -229,8 +245,6 @@ df_L1ts2weight_delta = df_L1ts2weight_current.subtract(df_L1ts2weight_previous)
 
 每個後續分塊只需要一個新的輸入元素，反映了一維卷積的單位步幅（unit stride）。這是一個經典結論：滑動視窗卷積的輸入重用模式正好是每個輸出位置一個新元素。
 
-![L1 輸入差量——滑動視窗模式（每個分塊一個新輸入）](../../assets/L13/L13-p54-l1-input-deltas-sliding-window.png)
-
 對於**輸出**：每個分塊恰好寫入一個新的輸出累加器（即當前 `q` 的那個），排除完整部份和後共產生 Q 個差量條目。
 
 > **為什麼重要：** 分塊層級的差量正是硬體設計師實際用來決定 L1 緩衝區大小、以及估計 L1 緩衝區與全域緩衝區（或 DRAM）之間所需頻寬的工具。識別出輸入的滑動視窗模式，立即就能提示出適合採用**行緩衝（line buffer）** 微架構。
@@ -264,11 +278,126 @@ ws_schedule = isl.Map('{ IterationSpace[q, s] -> Timestamp[t1, t0] : t1 = s and 
 
 外層迴圈現在走 `s`（慢速），內層迴圈走 `q`（快速）。通過新的時間戳映射運行相同的差量流水線，產生了完全不同的資料搬移剖析：在 WS 下，權重是駐留的（分塊 0 之後差量為零），而輸入在每個 `s`-分塊都必須重新讀入，輸出則在所有分塊中累積部份和，產生 Q × (S − 1) 次部份和回讀事件。
 
-![改變排程：OS（外層 q、內層 s）vs. WS（外層 s、內層 q）](../../assets/L13/L13-p65-os-vs-ws-schedule.png)
-
 這個結尾比較使整講的回報變得具體：**形式化的 ISL 框架讓你可以機械地計算並比較任意兩種資料流的資料搬移代價**，無需建構硬體——這正是驅動 TeAAL 關注點金字塔 Mapping 層（映射層）設計決策的那種分析。
 
 > **為什麼重要：** 資料流選擇是加速器設計中槓桿最高的決策之一。ISL 方法將這個決策從直覺變成算術：你寫下時間戳映射，運行差量流水線，讀出記憶體流量數字。這是自動化設計空間探索工具的基礎。
+
+---
+
+## Worked Examples（worked examples）
+
+### Example 1：列舉 OS schedule
+
+令 \(Q = 3\)、\(S = 2\)。Iteration space 有六個 MACs：
+
+\[
+(q,s) \in \{(0,0),(0,1),(1,0),(1,1),(2,0),(2,1)\}.
+\]
+
+對 output-stationary schedule，\(t_1=q\)、\(t_0=s\)。Timestamp order 因此是 \((0,0)\)、\((0,1)\)、\((1,0)\)、\((1,1)\)、\((2,0)\)、\((2,1)\)。Output projection 會把前兩個點映射到 \(O[0]\)，中間兩個映射到 \(O[1]\)，最後兩個映射到 \(O[2]\)。Output fill delta 只在 \((0,0)\)、\((1,0)\)、\((2,0)\) 非零，因為每個 output 的第二個 MAC reuse 同一個 accumulator。
+
+硬體意義：OS 在最低層級降低 partial-sum traffic，因為 accumulator 在 reduction loop 期間保持 live。
+
+### Example 2：L1 input sliding window
+
+令 \(Q = 5\)、\(S = 3\)，也就是投影片的小卷積。OS tiling 下，一個 L1 tile 對應固定 \(q\) 的所有 \(s\) values。Tile 0 需要 inputs \(\{I[0], I[1], I[2]\}\)。Tile 1 需要 \(\{I[1], I[2], I[3]\}\)。Delta 只有 \(\{I[3]\}\)，因為 \(I[1]\) 與 \(I[2]\) 已經 live。之後同理：初始載入 \(S\) 個 inputs 後，stride 1 每個 tile 只需要一個新 input。
+
+硬體意義：這正是 convolution line buffer 有效的原因。Symbolic delta calculation 重新推導出 sliding-window microarchitecture。
+
+### Example 3：Fill 與 shrink 決定 capacity
+
+對 \(Q = 5, S = 3\)，OS L1 input live set 在 warmup 後維持大小 3：\(\{I[q], I[q+1], I[q+2]\}\)。Fill 在 window 前進時加入 \(I[q+2]\)；shrink 在舊值最後一次使用後移除 \(I[q-1]\)。因此 maximum live input set 是 3 個元素，而不是整個 input tensor 的 \(Q+S-1 = 7\) 個元素。
+
+硬體意義：bandwidth 與 capacity 是不同問題。Delta 計算新進資料；shrink 加上 carry-over 決定 live capacity。
+
+---
+
+## 重要公式與讀法（Key Equations）
+
+- Iteration space：\(\mathcal{I} = \{(q,s) : 0 \le q < Q,\ 0 \le s < S\}\)。這是 MACs 的集合，不是 data elements 的集合。
+- Projections：\(P_W(q,s)=s\)、\(P_O(q,s)=q\)、\(P_I(q,s)=q+s\)。這些 maps 定義 reuse：多個 iteration points 可能指向同一個 data element。
+- Output-stationary schedule：\(T_{\mathrm{OS}}(q,s)=(q,s)\)。Output index 慢變；reduction index 快變。
+- Weight-stationary schedule：\(T_{\mathrm{WS}}(q,s)=(s,q)\)。Weight index 慢變；output index 快變。
+- Fill delta at time \(t\)：\(D_{\mathrm{fill}}(t)=A(t)-A(t-1)\)，其中 \(A(t)\) 是 time \(t\) 存取的 data elements set。在 ISL 中，這會實作成 current access 與 previous access 的 set/map difference。
+- Shrink at time \(t\)：\(D_{\mathrm{shrink}}(t)=A(t)-A(t+1)\)。Fill 問「什麼要進來」；shrink 問「什麼可以離開」。
+
+這些公式是投影片 ISL relations 的教學式記法。真的實作時 ISL syntax 很重要，但數學概念就是 relation composition 加 set difference。
+
+---
+
+## 硬體意涵（Hardware Implications）
+
+- **Bandwidth：** Fill deltas 計算跨過某個 boundary 的新 values。把它們加總就是該 memory level 的 bandwidth demand。
+- **Capacity：** 由 fill/shrink 推出的 live sets 決定 minimum buffer size。Capacity 可能小但 total traffic 大，也可能反過來。
+- **Latency hiding：** 如果下一個 tile 的 fill set 能 symbolically 算出，compiler 或 DMA engine 就能 prefetch。
+- **SRAM banking：** Schedule 決定 accesses 是 sequential、strided，還是 repeated。這影響 bank conflicts 與 port requirements。
+- **NoC traffic：** Projection maps 揭示 multicast opportunities。如果很多 iterations 共用同一個 weight 或 input，interconnect 可以 broadcast，而不是發出獨立 reads。
+- **Correctness：** Shrink 不只是 optimization，也是 correctness 問題。太早 evict value 會改變 computation，或造成昂貴 reload。
+- **Design-space exploration：** 只改 timestamp map，就能比較 OS、WS 與其他 schedules，而保持同一個 mathematical layer。
+
+---
+
+## 常見誤解（Common Misconceptions）
+
+### 誤解：Iteration space 已經告訴你 data movement。
+
+Iteration space 只告訴你有多少 MACs。Data movement 取決於 projection maps、schedule order 與 buffer tiling。兩個 schedules 可以有相同 MAC count，但 traffic 完全不同。
+
+### 誤解：Stationary dataflow 表示該 tensor 完全不動。
+
+Stationary 表示 mapping 嘗試在某個 level 保留該 tensor。它仍可能需要 initial fill、final eviction、跨 tile reloads，或在其他 hierarchy levels 移動。
+
+### 誤解：Delta 等於 total access count。
+
+Delta 計算的是相對於前一個 time / tile 的**新資料**。一個 value live 期間可能被存取很多次，但不一定跨過被建模的 boundary 重新讀入。
+
+### 誤解：Shrink 只是可有可無的 bookkeeping。
+
+沒有 shrink，你只能算 fills，不能 sizing buffer。Shrink 告訴你 value 何時死亡，因此 storage 何時能被 reuse。
+
+---
+
+## Paper Bridge：TETRIS
+
+### Bibliographic identity
+
+- Title: *TETRIS: Scalable and Efficient Neural Network Acceleration with 3D Memory*
+- Authors: Mingyu Gao, Jing Pu, Xuan Yang, Mark Horowitz, Christos Kozyrakis
+- Year / venue: ASPLOS 2017
+- Used in this lecture: 作為 analytical scheduling 與 data-motion accounting 為何重要的 system-level example。
+
+### Problem addressed
+
+TETRIS 處理的是 NN accelerator 擴大 PE arrays 與 network sizes 時出現的 memory-system bottleneck。Compute 增加沒有用，除非 buffers、DRAM bandwidth 與 interconnect traffic 能有效餵飽它。
+
+### Core idea
+
+這篇 paper 使用 3D memory 重新平衡 compute 與 buffers 的面積配置，把部分 accumulation 移到 memory 附近，並以 analytical method 推導 dataflow schedules，而不是只靠 exhaustive search。它與 L13 的連結是：scheduling 與 data movement 必須被建模成可計算的量，而不只是 architecture intuition。
+
+### Relevance to this lecture
+
+L13 教的是這類 analytical data-motion reasoning 的機械步驟。TETRIS 顯示這些步驟在完整 accelerator 中為什麼重要：memory hierarchy、bypassing、accumulation location 與 partitioning 都取決於知道哪些 data 在哪裡移動。
+
+### Key claims used in this chapter
+
+- Abstract 與 Section 1 說明 scaling NN accelerators 會加劇 on-chip SRAM 與 off-chip DRAM overhead，使 memory system 成為 bottleneck。
+- Sections 3.2 與 3.3 說明 3D memory 改變 PE/buffer balance，並可用 in-memory accumulation 降低 memory traffic。
+- Section 4 發展 software scheduling 與 partitioning techniques，包含 analytical scheduling choices，而不只是 exhaustive search。
+- Section 6 報告在 paper 假設下，TETRIS 相對 conventional 2D DRAM accelerator baselines 改善 performance 與 energy。
+
+### What students should remember
+
+- Data-motion accounting 不是課堂練習；它決定 area allocation、buffer bypass 與 partitioning。
+- 不同 memory technology 會改變 cost model，因此 optimal schedule 可能改變。
+- Analytical scheduling 很有價值，因為所有 mapping / partitioning choices 的 exhaustive search 很快就變昂貴。
+
+### Limitations and assumptions
+
+TETRIS 研究的是 3D-memory accelerator design space，不是 L13 投影片中完全相同的 ISL recipe。這裡應把它當作 analytical scheduling 與 memory traffic 的 system-level bridge，而不是「所有 accelerator 都應使用 3D memory」的證據。
+
+### Suggested insertion points
+
+讀完第五章的 L1 buffering recipe 與第六章 OS-vs-WS comparison 後，再讀這篇 bridge，可以看到手算方法如何走向 automated mapping tools。
 
 ---
 
@@ -363,3 +492,17 @@ ws_schedule = isl.Map('{ IterationSpace[q, s] -> Timestamp[t1, t0] : t1 = s and 
 | L13-57 … L13-64 | 第六章 — 縮退計算——權重、輸入、輸出 |
 | L13-65 | 第六章 — 比較 OS vs. WS：切換時間戳映射 |
 | L13-66 | 結語 |
+
+## 來源註記（Source Notes）
+
+- 本章順序、1-D convolution example、ISL set/map syntax、timestamp construction、delta recipe、L1 tiling recipe、shrink recipe 與 OS-vs-WS comparison 依據 `Lecture/L13-Calculating_Motion.pdf`。
+- OS loop nest 與 projections 主要來自 L13-2 與 L13-19 到 L13-24。
+- Delta / fill 解釋依據 L13-35 到 L13-43；L1 tile-level explanation 依據 L13-44 到 L13-56；shrink 依據 L13-57 到 L13-64。
+- TETRIS paper bridge 依據 Gao et al., *TETRIS: Scalable and Efficient Neural Network Acceleration with 3D Memory*, ASPLOS 2017，尤其 Abstract、Sections 1、3、4、6。
+- OS enumeration、sliding-window live-set、capacity examples 是本 walkthrough 根據投影片 1-D convolution setup 建立的 teaching examples。
+
+## 不確定性註記（Uncertainty Notes）
+
+- Local file `papers/L13_Buffets_Pellauer_ASPLOS2019.pdf` 抽出的內容看起來是 Douglas-Rachford / ADMM optimization paper，而不是檔名所指的 Buffets paper。因此本章沒有把它當作來源引用。
+- 本章以教學方式呈現 ISL operations。實際 implementation details 可能依 ISL Python binding 版本與 local helper functions 而不同。
+- Live lecture 可能強調一些投影片 PDF 中看不到的 tool implementation details；本 walkthrough 是根據投影片與可用 local papers 重建 likely narration。

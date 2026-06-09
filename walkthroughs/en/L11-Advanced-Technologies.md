@@ -1,385 +1,554 @@
 # L11 — Advanced Technologies
 
 > **Course:** 6.5930/1 — Hardware Architectures for Deep Learning
-> **Instructors:** Joel Emer & Vivienne Sze (MIT EECS)
+> **Instructors:** Joel Emer & Vivienne Sze
 > **Lecture date:** March 9, 2026 · **Slides:** 81 · **Source:** [`Lecture/L11-Advanced_Tech.pdf`](../../Lecture/L11-Advanced_Tech.pdf)
 >
-> *This is a conceptual walkthrough that reconstructs the lecture's narrative from the slides. It is organized by idea, not slide-by-slide. Each section cites the slide range it draws from so you can follow along with the original deck.*
+> This chapter reconstructs the lecture narrative from slides and local papers. It avoids reproducing slide or paper figures; any visual content is described in words.
 
 ---
 
 ## TL;DR
 
-The dominant energy cost in a DNN accelerator is not arithmetic — it is **moving data**. Every technique in the course has been a way to keep data closer to compute. This lecture takes that insight to its logical extreme: what if the computation moved *into* the memory itself? **Compute-in-Memory (CiM)** uses the physical properties of memory devices — resistance, voltage, charge — to perform multiply-accumulate operations directly inside the storage array, eliminating the most expensive data movement entirely. The lecture covers (1) the memory-technology landscape from SRAM to 3D-stacked DRAM that motivates CiM, (2) the analog crossbar as the core CiM primitive and its governing tradeoffs, (3) the **Titanium Law** quantifying ADC overhead as the fundamental CiM energy bottleneck, (4) **RAELLA** as a case study in escaping that bottleneck without retraining, (5) CiM variants across SRAM, DRAM, and non-volatile memory, and (6) **CiMLoop** as the modeling tool that enables principled design-space exploration — including optical computing as an emerging frontier. The unifying lesson is that cross-layer co-design (device, circuit, architecture, mapping, workload) is unavoidable when the physics of the compute substrate enters the loop.
+Most of this course has treated memory as a hierarchy around a digital MAC array. Lecture 11 asks what happens when that boundary starts to move. **Near-memory processing** keeps compute and memory distinct but shortens the path between them, using technologies such as eDRAM and 3D-stacked DRAM. **Compute-in-memory (CiM)** goes further: the memory device or array participates directly in computation.
+
+The lecture's main arc is: data movement is expensive, so designers first move memory closer to compute, then move simple compute closer to memory, then ask whether memory itself can perform MACs. Analog CiM crossbars use Ohm's Law for multiplication and Kirchhoff's Current Law for accumulation, but practical systems are dominated by peripheral costs, especially ADCs. The **Titanium Law** expresses ADC energy as a product of energy per conversion, conversions per MAC, MACs per DNN, and utilization penalty. **RAELLA** and **CiMLoop**, presented in the slides, show why advanced technologies require cross-layer co-design across device, circuit, architecture, mapping, and workload.
+
+---
+
+## What Problem This Lecture Solves
+
+The problem is not "how do we invent a faster multiplier?" It is:
+
+> When data movement dominates energy and performance, which parts of the memory-compute boundary should be redrawn, and what new bottlenecks appear after we redraw it?
+
+Near-memory designs reduce wire distance and increase bandwidth. CiM designs try to eliminate some reads entirely. But neither approach makes computation free. eDRAM consumes area and has refresh/circuit constraints; 3D memory introduces thermal and logic-die area limits; analog CiM needs DACs, ADCs, calibration, precision slicing, and robust modeling. The lecture teaches how to evaluate these technologies without being dazzled by peak TOPS.
+
+---
+
+## Why This Lecture Matters
+
+Advanced technologies are seductive because they sound like escape hatches from the memory wall. A hardware architect needs a colder question: which cost moved, and where did it reappear?
+
+For example, a resistive crossbar can compute many products "in place," but the result is analog current. If the rest of the accelerator is digital, that current must pass through an ADC. The saved weight reads may be replaced by conversion energy, limited precision, and array utilization loss. This is why L11 is not a device survey. It is a lesson in **cross-layer accounting**.
+
+---
+
+## Prerequisites and Mental Model
+
+You should be comfortable with:
+
+- The energy hierarchy from L01-L03: off-chip memory is far more expensive than local arithmetic.
+- Dataflow from L05: keeping one operand stationary can reduce movement.
+- Sparsity from L07-L10: reducing MACs helps only when overheads are counted.
+- Matrix-vector multiplication: $y_j = \sum_i x_i w_{ij}$.
+
+The mental model for L11 is a single matrix-vector multiply. In a digital accelerator, weights are read from memory and delivered to MACs. In near-memory processing, the weight memory is physically closer or has much higher bandwidth. In CiM, the stored weight itself helps produce the product.
 
 ---
 
 ## Learning Objectives
 
-After this lecture you should be able to:
+After this lecture, you should be able to:
 
-- Explain the **memory taxonomy** (SRAM, eDRAM, 3D-stacked DRAM, NVM) and how each addresses a different aspect of the data-movement bottleneck.
-- Describe how an **analog crossbar** performs a matrix-vector multiply using Ohm's Law and Kirchhoff's Current Law.
-- State the **four factors of the Titanium Law** and explain how each knob trades off against the others.
-- Explain why **ADC overhead** (energy and area) is the dominant cost in most CiM designs, and what design strategies address it.
-- Describe the three techniques that **RAELLA** uses to reduce ADC input range without retraining.
-- Articulate why **CiM requires cross-layer co-design** (device ↔ circuit ↔ architecture ↔ mapping ↔ workload) and how CiMLoop models that full stack.
-- Name at least one **beyond-SRAM CiM substrate** (DRAM, ReRAM/memristor, SRAM, photonics) and its distinguishing property.
-
----
-
-## Chapter 1 — Why bring compute closer to memory?
-
-> *Slides: L11-2 … L11-9*
-
-### The memory-technology landscape
-
-Every practical DNN system contains a hierarchy of memory technologies, each occupying a different point in the density-vs-cost trade space:
-
-![Advanced storage technology taxonomy — near-memory and in-memory computing](../../assets/L11/L11-p02-storage-taxonomy.png)
-
-The lecture organizes these into two broad strategies for attacking the data-movement problem:
-
-- **Processing/Compute Near Memory (near-data processing):** move the compute *closer* to memory, but keep them physically separate.
-  - *Embedded DRAM (eDRAM)* — higher density than SRAM (2.85× denser than 6T SRAM) so more storage fits on-chip, avoiding expensive off-chip DRAM accesses. DaDianNao used 36 MB of eDRAM to hold fully-connected-layer weights, achieving 321× better energy than DDR3.
-  - *3D-stacked DRAM* — stack a logic die under multiple DRAM dies (Hybrid Memory Cube / High Bandwidth Memory). NeuroCube demonstrated 6.25× higher bandwidth than DDR3; Tetris combined HMC with the Eyeriss spatial array to get 1.5× energy reduction and 4.1× higher throughput vs. 2D DRAM.
-
-- **Processing/Compute In Memory (in-memory computing):** integrate the computation *into* or *using* the memory array itself. This is the focus of the rest of the lecture.
-
-### Why the cost of off-chip DRAM access is the forcing function
-
-The slide on memory access cost is the quantitative grounding for everything that follows:
-
-![Memory access cost hierarchy — DRAM read at 640 pJ vs. 8b add at 0.03 pJ](../../assets/L11/L11-p05-memory-cost-hierarchy.png)
-
-The numbers (from Horowitz, ISSCC 2014) are stark: a 32-bit DRAM read costs **640 pJ**, while an 8-bit integer addition costs only **0.03 pJ**. That is a ratio of more than **20,000:1** between the most expensive memory access and the cheapest arithmetic operation. Even a 32-bit SRAM read at 8 KB costs ~5 pJ — 167× an 8b add. The conclusion is unavoidable: data movement is the bottleneck, and anything that reduces it is valuable.
-
-> **Why it matters:** The energy hierarchy established in L01 (RF 1× → DRAM 200×) is now grounded in measured silicon numbers. CiM is a direct architectural response: if reads from the weight array are the biggest cost, what if those reads never happened — because the compute happened inside the array?
+- Distinguish **near-memory processing** from **compute-in-memory**.
+- Explain why eDRAM and 3D-stacked DRAM reduce different parts of the memory bottleneck.
+- Describe how an analog crossbar computes a dot product using voltage, conductance, and current.
+- Explain why ADCs and DACs can dominate practical CiM systems.
+- Read the **Titanium Law** and identify which factor a proposed technique changes.
+- Explain why pruning, low precision, and array size interact differently in CiM than in a digital accelerator.
+- Describe what **RAELLA** changes about the ADC input distribution.
+- Explain why a modeling tool such as **CiMLoop** is necessary for fair comparison across devices and circuit styles.
+- Use DaDianNao, Neurocube, Tetris, and TPU as anchored examples of memory-centric design choices.
 
 ---
 
-## Chapter 2 — The analog crossbar: CiM's core primitive
+## Main Textbook-Style Narrative
 
-> *Slides: L11-10 … L11-27*
+### 1. Start With the Memory Cost, Not the Device Hype
 
-### Conventional processing vs. compute-in-memory
+Lecture 11 slide 5 repeats the quantitative motivation from Horowitz, ISSCC 2014: an 8-bit add is listed at 0.03 pJ, a 32-bit SRAM read from an 8 KB SRAM at 5 pJ, and a 32-bit DRAM read at 640 pJ. These are slide-derived numbers. The exact values depend on process and assumptions, but the ordering is the durable idea: moving data from far away is often more expensive than operating on it.
 
-The contrast is sharpest at the system level:
+This explains the lecture sequence:
 
-![Conventional processing vs. compute-in-memory — data flow comparison](../../assets/L11/L11-p10-cim-vs-conventional.png)
+1. Put more memory on chip with eDRAM.
+2. Put DRAM in the package with 3D stacking.
+3. Put simple compute in the logic layer or memory periphery.
+4. Let the memory array participate directly in computation.
 
-In a *conventional* accelerator, weights sit in a memory array and must be read out over a high-bandwidth bus to a separate MAC unit. The read bus is the bottleneck: many bytes must travel many wire lengths, paying capacitive charging energy at every hop. In a *CiM* accelerator, weights remain in the array and input activations are delivered to the array periphery as voltages (via a DAC). The computation happens inside the array; only a single low-bandwidth output (a current sum) exits, converted to digital by an ADC. The read bandwidth inside the chip drops dramatically.
+### 2. Near-Memory Processing: Still Digital, But Closer
 
-### Ohm's Law as a multiplier, Kirchhoff as an adder
+**eDRAM** is a density move. Lecture 11 slides 6-8 state that eDRAM is denser than SRAM and use DaDianNao as the example. DaDianNao stores many synaptic weights in on-chip eDRAM, reducing expensive off-chip memory traffic. The paper reports that a 10 MB SRAM at 28 nm would occupy 20.73 mm2 while same-size eDRAM has 2.85x higher storage density, and that a 256-bit eDRAM read at 28 nm is 0.0192 nJ versus 6.18 nJ for Micron DDR3, a 321x energy ratio (DaDianNao Section V-A). These are paper-derived claims.
 
-The physical mechanism is elegant:
+**3D-stacked DRAM** is a bandwidth and distance move. HMC/HBM-style stacks place DRAM dies near or above a logic die, connected by TSVs. Tetris reports that 3D memory provides 160-250 GB/s bandwidth with 3-5x lower access energy than DDR3, then uses that substrate to rebalance accelerator area and move accumulation closer to memory (Tetris Section 2.4 and Section 3). Neurocube uses HMC-style memory with programmable sequence generators in vault controllers to drive neural-network data movement (Neurocube Sections III-V).
 
-![Analog MAC principle — voltage × conductance = current, currents sum on bit-line](../../assets/L11/L11-p11-analog-mac-principle.png)
+Teaching interpretation: eDRAM asks "can enough weights fit close to compute?" 3D memory asks "can memory bandwidth scale with PE count?" Both preserve mostly digital arithmetic. They do not yet use memory cells as multipliers.
 
-- Each **weight** is stored as the *conductance* G of a device (resistor, memristor, or transistor). Conductance is 1/resistance.
-- Each **input activation** is delivered as a *voltage* V on the word line.
-- By Ohm's Law, the current through the device is I = V × G. This is a **multiplication**.
-- All currents on the same bit-line sum by Kirchhoff's Current Law: I_total = Σ Vᵢ × Gᵢ. This is an **accumulation** (a dot product).
+### 3. Compute-In-Memory: Use the Array as the Datapath
 
-Thus, a single crossbar column computes an entire dot product *in one step*, using the physics of the circuit — no digital adder tree required. This is why CiM proponents call it a fundamentally different compute paradigm.
+In an analog resistive crossbar, each weight is stored as conductance $G$, each input is applied as voltage $V$, and the device current is:
 
-### Weight-stationary dataflow in the CiM array
+$$
+I = V G.
+$$
 
-The natural dataflow for a CiM array is weight-stationary: weights are written into the array once and stay there while many input vectors are streamed through.
+For one column, currents from many rows sum:
 
-![Weight-stationary CiM dataflow — loop nest and array organization](../../assets/L11/L11-p14-weight-stationary-cim.png)
+$$
+I_{\text{col}} = \sum_i V_i G_i.
+$$
 
-The mapping fits neatly onto the loop-nest view introduced in earlier lectures: the M (output channel / row in weight matrix) and CHW (input channel-height-width / column in weight matrix) dimensions tile onto the rows and columns of the array. Benefits include: reduced weight data-movement (weights never move after programming), higher memory read bandwidth (multiple weights accessed in parallel along a row), higher throughput (many dot-product computations run simultaneously), and lower input-activation delivery cost (activations are delivered once to many rows simultaneously).
+This is a dot product. Ohm's Law supplies multiplication; Kirchhoff's Current Law supplies addition. The crossbar is naturally **weight-stationary**: weights remain in the memory array while input vectors are applied repeatedly.
 
-### Design considerations and practical limits
+The ideal picture is powerful, but incomplete. A digital DNN accelerator still needs digital activations and outputs, so practical CiM systems require:
 
-Analog computing introduces a set of practical constraints that *reduce* the idealized gains:
+- DACs or pulse encoders to present inputs to the array.
+- ADCs to convert column currents back to digital values.
+- Bit slicing when a device stores fewer bits than the model weight requires.
+- Calibration and margins for nonlinearity, device variation, temperature, voltage, and noise.
+- Mapping decisions that keep arrays utilized.
 
-1. **Non-linearity and device variation (PVT):** Analog values are sensitive to process, voltage, and temperature variations. This limits achievable precision.
-2. **Number of storage elements per weight (weight slicing):** Each device typically stores only 1–4 bits of precision. A full 8-bit weight requires multiple devices ("bit slices"), multiplying array area and ADC conversion count.
-3. **Array size limits:** Word-line and bit-line resistance and capacitance grow with array dimension. Large arrays degrade robustness and sensing margin. Utilization drops when the workload does not fill the full array.
-4. **Number of rows activated in parallel:** Limited by the ADC's resolvable range. More parallel rows → larger analog sum → higher required ADC resolution → exponentially more energy.
-5. **Number of columns activated in parallel:** Limited by ADC area (one ADC per column is expensive).
-6. **Input delivery time:** DAC non-linearity forces time-encoded inputs (pulse-width modulation), requiring multiple cycles per input and reducing throughput.
-7. **Temporal accumulation:** Single-bit or two-bit device operations require multi-cycle temporal accumulation to build up a multi-bit result, further reducing throughput.
+### 4. The ADC Is the CiM Tax Collector
 
-These constraints mean that the raw physical speedup of analog compute is significantly eroded by the overhead of the digital interfaces on both sides of the array.
+Lecture 11 slides 29-52 focus on the ADC bottleneck and introduce the **Titanium Law**:
 
-> **Why it matters:** Every "gain" claimed for CiM must be weighed against these overheads. The ADC in particular — which must convert the analog column current back to a digital number — turns out to be the dominant cost. The next chapter quantifies this precisely.
+$$
+\frac{E_{\text{ADC}}}{\text{DNN}}
+=
+\frac{E_{\text{convert}}}{\text{convert}}
+\cdot
+\frac{\text{converts}}{\text{MAC}}
+\cdot
+\frac{\text{MACs}}{\text{DNN}}
+\cdot
+\frac{1}{\text{utilization}}.
+$$
 
----
+Read each factor as a lever:
 
-## Chapter 3 — The Titanium Law and the ADC bottleneck
+- $E_{\text{convert}}/\text{convert}$ rises steeply with ADC resolution.
+- $\text{converts}/\text{MAC}$ rises when weights or inputs are sliced across multiple cycles/devices.
+- $\text{MACs}/\text{DNN}$ is reduced by smaller models, pruning, or algorithmic changes.
+- $1/\text{utilization}$ rises when the array is partly empty.
 
-> *Slides: L11-29 … L11-52*
+The painful part is that levers fight. Reducing ADC resolution can require more slices, increasing conversions per MAC. Increasing array rows may improve utilization for some shapes but increases analog summation range and required ADC resolution. Pruning reduces MACs, but may leave CiM arrays underfilled.
 
-### The energy breakdown of a CiM accelerator
+### 5. RAELLA: Change the Distribution Seen by the ADC
 
-When you account for the full system, the energy distribution is striking:
+Lecture 11 slides 43-52 present RAELLA as a response to the Titanium Law. The slide-derived explanation is that RAELLA reduces the analog input range seen by the ADC without retraining the DNN. It uses:
 
-![CiM accelerator energy breakdown — ADC dominates](../../assets/L11/L11-p29-cim-energy-breakdown.png)
+- **Center + offset encoding:** subtract a column center so the analog array computes smaller residuals.
+- **Adaptive weight slicing:** only spend extra conversions on computations likely to exceed ADC range.
+- **Dynamic input slicing:** speculate with coarse input slices and recover only when needed.
 
-The ADC (Analog-to-Digital Converter) consumes a significant fraction of total system energy — in many designs, *more* than the analog crossbar computation itself. DAC energy and other analog processing add to the overhead. The promised efficiency of CiM is real, but it is largely consumed by the conversion interfaces.
+Lecture 11 slide 52 reports a 1024x reduction of input to ADC, 3.9x energy-efficiency improvement, and 1.8x throughput improvement versus an iso-area ISAAC baseline. Because the RAELLA PDF was not in the provided local paper list for this worker, these claims are treated as slide-derived.
 
-### The Titanium Law: a closed-form expression for ADC energy
+### 6. CiM Across SRAM, DRAM, NVM, and Photonics
 
-The lecture introduces a key analytical result from Andrulis, ISCA 2023:
+The lecture then widens the substrate view:
 
-![The Titanium Law — ADC energy as product of four factors](../../assets/L11/L11-p30-titanium-law.png)
+- **SRAM CiM** can use current-mode or charge-sharing circuits. It is process-compatible but constrained by SRAM cell area and circuit nonidealities.
+- **DRAM CiM** can exploit charge sharing for in-array bitwise operations. It has density advantages but faces refresh, timing, and peripheral constraints.
+- **NVM / ReRAM / memristor CiM** naturally stores weights as resistance/conductance and is dense/nonvolatile, but precision and variation are major issues.
+- **Photonics** uses light propagation, modulation, and interference to implement linear algebra primitives. Lecture 11 uses it as an emerging example where data-movement physics differs from CMOS wires.
 
-The total ADC energy per DNN inference is the product of four terms:
+The important teaching point is that these are not interchangeable "faster MAC" technologies. Each changes the cost model and therefore changes the best mapping and model design.
 
-```
-ADC Energy      Energy       Converts     MACs        1
-──────────── = ────────── × ────────── × ──────── × ──────────
-    DNN         Convert       MAC          DNN       Utilization
-```
+### 7. CiMLoop: Modeling the Whole Stack
 
-- **Energy/Convert:** Energy per ADC conversion — increases *exponentially* with ADC resolution (number of bits). This is the steepest term.
-- **Converts/MAC:** Number of ADC conversions per MAC — determined by weight slicing and input slicing (how many bit-slices are needed to represent each value at the required precision).
-- **MACs/DNN:** Total number of MAC operations in the DNN — set by the workload, not the hardware.
-- **1/Utilization:** Array utilization penalty — always ≥ 1, worsens when the workload cannot fill the array dimensions.
+Lecture 11 slides 62-75 present CiMLoop as a Timeloop/Accelergy-style tool extended for CiM. The key modeling requirement is **data-value dependence**: analog energy can depend on the actual values being processed, not only the operation count. A high-conductance device under a high input voltage dissipates more energy than a low-conductance device under a small voltage.
 
-The law reveals the fundamental tension: reducing ADC resolution (to save Energy/Convert) requires more slices (raising Converts/MAC), while increasing array size (to reduce 1/Utilization) increases the analog sum range (raising required ADC resolution). Every knob tightens another constraint.
-
-### Applying the law: why ISAAC's tradeoffs are hard to escape
-
-The ISAAC design (Shafiee, ISCA 2016) used 128 rows of 2-bit memristors. Applying the Titanium Law:
-
-- Increasing rows to 1024 reduces 1/Utilization but forces higher ADC resolution (11-bit), so ADC energy dominates even more.
-- Decreasing bits per weight slice (1-bit per memristor) reduces Energy/Convert but increases Converts/MAC — ADC energy again rises.
-
-Both directions worsen the total ADC energy relative to the analog crossbar energy. This is not a flaw in ISAAC; it is a fundamental tension in the design space.
-
-### Two prior escape routes and their costs
-
-Two strategies have been used to work around the Titanium Law, each paying a price:
-
-1. **Weight pruning (weight-count-limited designs):** Reduce MACs/DNN by pruning the network. This lowers the "MACs/DNN" factor. The cost: pruned networks may sacrifice accuracy, and the reduced weight count can reduce array utilization.
-2. **Low-resolution ADC (sum-fidelity-limited designs):** Use a lower-resolution ADC, reducing Energy/Convert. The cost: the ADC cannot accurately represent all output values; accuracy must be recovered by retraining the DNN to tolerate low-resolution readouts.
-
-Both approaches **require retraining the DNN** to preserve accuracy — which is expensive and couples the hardware design directly to the model.
-
-### RAELLA: reshaping distributions without retraining
-
-RAELLA (Andrulis, ISCA 2023) escapes the bottleneck through three complementary techniques applied *at inference time*, without modifying the DNN:
-
-![RAELLA distribution reshaping — three techniques to reduce ADC input range](../../assets/L11/L11-p43-raella-reshape.png)
-
-**Technique 1 — Center + Offset Encoding (shift the distribution mean):**
-Each weight column is decomposed into a *center* (mean) and *offset* (residual). The center is computed digitally at high resolution (cheap, since it is a scalar multiply). The analog array computes only the offsets, whose values cluster near zero — requiring far less ADC range. This shifts the distribution of analog results toward zero, reducing the required ADC dynamic range.
-
-**Technique 2 — Adaptive Weight Slicing (split only large-result computations):**
-Instead of always slicing weights into fixed-precision pieces, RAELLA monitors whether a given computation's result falls outside the ADC range. Only out-of-range columns are re-run with finer weight slices. This keeps Converts/MAC low for the majority of computations while handling outliers.
-
-**Technique 3 — Dynamic Input Slicing (speculate and recover):**
-RAELLA first *speculates* with a coarse input slice. If the result is in range, no further action is needed. If out of range, it recovers by re-running with finer input slices. This amortizes the extra ADC conversion cost over only the fraction of inputs that need it.
-
-Together, these three techniques achieve a **1024× reduction in analog input to ADC**, enabling lower-resolution ADCs with no accuracy loss:
-
-![RAELLA results — 3.9× energy improvement and 1.8× throughput vs. iso-area ISAAC](../../assets/L11/L11-p52-raella-results.png)
-
-Compared to a iso-area ISAAC baseline, RAELLA achieves **3.9× energy efficiency improvement** and **1.8× throughput improvement** while **maintaining DNN accuracy without retraining**.
-
-> **Why it matters:** The Titanium Law is not just a descriptive formula — it is a design compass. RAELLA shows that understanding the law precisely enough allows you to reshape the *input* to the bottleneck term (Energy/Convert via ADC resolution) rather than just tuning the knobs that are in tension with each other. This is cross-layer co-design at its most concrete.
+The slide-derived claims are that CiMLoop captures cross-stack interactions with error within 8%, uses statistical models more than 1000x faster than prior accurate simulation, and can compare designs normalized to the same technology/device/ADC assumptions. The teaching interpretation is that advanced technologies make modeling more important, not less. When device physics enters the datapath, a simple MAC count is no longer a safe proxy.
 
 ---
 
-## Chapter 4 — CiM across substrate technologies
+## Worked Examples
 
-> *Slides: L11-53 … L11-60*
+### Example 1: Why Moving Weights Matters
 
-### Designing DNNs for CiM — a different optimization landscape
+Suppose a layer performs 1 million 8-bit additions and requires 1 million 32-bit DRAM reads. Using the slide-derived Horowitz numbers, the adds cost approximately $1{,}000{,}000 \times 0.03$ pJ = 30,000 pJ, while the DRAM reads cost $1{,}000{,}000 \times 640$ pJ = 640,000,000 pJ. The reads dominate.
 
-An important insight: the *best* DNN for a digital accelerator may not be the best for a CiM accelerator. The tradeoffs differ:
+The exact numbers should not be overgeneralized, but the design lesson is robust: a technology that reduces far memory reads can matter more than a slightly more efficient arithmetic unit.
 
-- **Weight count vs. utilization:** Pruning weights is desirable on digital hardware (fewer MACs), but on CiM it can hurt array utilization (fewer rows filled). CiM arrays perform best with dense weight matrices.
-- **Filter shape:** CiM is weight-stationary and prefers *fewer activations* relative to weights, so shallower networks with larger filters may be better suited than deeper networks with tiny filters.
-- **Robustness to non-idealities:** Quantization-aware training is more important for CiM because device variability introduces noise that the DNN must tolerate.
+### Example 2: Crossbar Dot Product
 
-### CiM using SRAM bit cells
+Let three inputs be voltages $V = [1, 2, 1]$ and three stored conductances be $G = [3, 0.5, 2]$ in arbitrary normalized units. The column current is:
 
-SRAM-based CiM uses the access transistor's I-V relationship to perform multiplication. Two implementations:
+$$
+I_{\text{col}} = 1 \cdot 3 + 2 \cdot 0.5 + 1 \cdot 2 = 6.
+$$
 
-- **Current-mode:** Word-line voltage modulates the transistor current; binary weights are stored in the bit-cell state. Bit-line current sums give the partial sum. Limited by transistor non-linearity.
-- **Charge-sharing:** Uses an explicit capacitor to store charge. XNOR logic on the bit-cell performs binary multiplication; charge sharing on the bit-line performs addition (Vf = ½(V1 + V2), a scaled sum). Better linearity and matching than current-mode.
+This is the same computation as a dot product. The hardware implication is that the array did not read three weights out to a digital multiplier. But the output current still needs sensing, range control, and usually ADC conversion.
 
-SRAM CiM is attractive because it uses the standard SRAM process — no exotic devices or process modifications required.
+### Example 3: Reading the Titanium Law
 
-### CiM using DRAM
+Assume a design reduces ADC energy per conversion by 4x by using a lower-resolution ADC, but it now needs 3x as many conversions per MAC because of extra slicing. Ignoring other factors, ADC energy changes by:
 
-DRAM-based CiM (Ambit, MICRO 2017) uses charge sharing to perform **bitwise AND and OR** operations without moving data out of the array:
+$$
+\frac{1}{4} \times 3 = 0.75.
+$$
 
-- Activating three rows simultaneously causes charge sharing that resolves to AND or OR depending on the pre-charge voltage (VDD/2 − δ for AND, VDD/2 + δ for OR).
-- Multi-bit multiplication requires multiple cycles of temporal accumulation, but the operation runs at the full DRAM bus width — massive parallelism across rows.
-
-### CiM using non-volatile memory (memristors)
-
-Non-volatile memories (ReRAM/RRAM, Phase-Change Memory, STT-RAM) store data as resistance states that persist without power. Memristors are particularly attractive because:
-
-- **Resistance is directly programmable** — weights are encoded as conductance values, which is the natural CiM representation.
-- **Higher density** than SRAM (no need for the 6-transistor bit cell).
-- **Non-volatile** — weights survive power-off, enabling instant-on inference without reloading.
-
-The challenge is limited precision per device (1–4 bits typically) and device-to-device variation, which amplifies the need for weight slicing and careful calibration.
-
-> **Why it matters:** No single substrate is dominant. The right choice depends on the target application (power, area, latency, precision), the DNN architecture, and the manufacturing process available. This diversity motivates a modeling framework that can compare across all of them.
+That is only a 1.33x ADC-energy improvement, not 4x. This is the reason the Titanium Law is useful: it prevents one knob from being advertised without its coupled cost.
 
 ---
 
-## Chapter 5 — CiMLoop: modeling the full stack
+## Key Equations and How to Read Them
 
-> *Slides: L11-60 … L11-75*
+Analog multiplication:
 
-### The CiM design space is enormous
+$$
+I = V G.
+$$
 
-The lecture enumerates the design choices at each level of the CiM stack:
+The input activation is represented by voltage $V$, the weight by conductance $G$, and the product by current $I$.
 
-![The CiM stack — devices, circuits, architecture, mapping, workload](../../assets/L11/L11-p62-cim-stack.png)
+Analog accumulation:
 
-Every level presents multiple options:
-- **Devices:** SRAM, DRAM, ReRAM, STT-RAM, photonic elements, superconducting circuits.
-- **Circuits:** DAC type (R-2R, pulse-train, capacitor-based), ADC type (flash, SAR, integrating), MAC circuit (current-mode, charge-sharing, digital XNOR), sparsity/and-logic controllers.
-- **Architecture:** Array dimensions, number of arrays, banking, periphery organization.
-- **Mapping:** Which dimensions tile onto rows/columns, loop order, weight stationary vs. output stationary, batch size.
-- **Workload:** DNN layer type, shape, sparsity, precision.
+$$
+I_{\text{col}} = \sum_i V_i G_i.
+$$
 
-With so many interacting choices, hand-analysis cannot navigate the space systematically. The cross-layer dependencies (data values affect device energy, which depends on the encoding, which depends on the mapping, which depends on the architecture...) make any decoupled analysis inaccurate.
+All currents on a bitline add physically, producing a dot product.
 
-### CiMLoop: flexible, accurate, and fast
+Titanium Law:
 
-![CiMLoop overview — flexible, accurate, and fast CiM modeling tool](../../assets/L11/L11-p65-cimloop-overview.png)
+$$
+\frac{E_{\text{ADC}}}{\text{DNN}}
+=
+\frac{E_{\text{convert}}}{\text{convert}}
+\cdot
+\frac{\text{converts}}{\text{MAC}}
+\cdot
+\frac{\text{MACs}}{\text{DNN}}
+\cdot
+\frac{1}{\text{utilization}}.
+$$
 
-CiMLoop (Andrulis, ISPASS 2024, **Best Paper Award**) is the Timeloop+Accelergy-based tool extended to handle the cross-stack interactions of CiM. Its three distinguishing properties:
+This is not just an equation for ADCs. It is a checklist for CiM claims: which term improved, which term got worse, and what happened to end-to-end accuracy and throughput?
 
-1. **Flexibility:** User-defined specifications describe any device, circuit, or architecture component. The library includes models for 6T SRAM, 8T SRAM, DRAM, ReRAM, multiple ADC architectures, DAC architectures, and photonic components. Users can add new models via a plug-in interface.
+---
 
-2. **Accuracy (data-value-dependent modeling):** Most prior tools (Timeloop, NeuroSim) assume fixed energy per operation. CiMLoop recognizes that in analog, energy depends on the *actual values* being processed: a higher-conductance memristor dissipates more power for the same input voltage. CiMLoop captures the chain: value → binary representation → encoding → bit assignment to components → per-component energy. The result is within **8% error** of value-by-value simulation.
+## Hardware Implications
 
-3. **Speed (statistical modeling):** Accurate value-dependent simulation would require evaluating >10¹² value combinations. CiMLoop instead computes *data distributions* (histograms) and applies statistical models — achieving **>1000× speedup** compared to NeuroSim while matching its accuracy. Compared to Timeloop (fast but inaccurate), CiMLoop is the same speed but 10× more accurate.
+- **Bandwidth:** 3D memory can provide much higher bandwidth than conventional off-chip DRAM, but the logic die area and thermal envelope limit how much compute can be placed nearby.
+- **Area:** eDRAM and SRAM trade density, latency, refresh, and integration complexity. Large buffers can dominate accelerator area.
+- **ADC/DAC overhead:** CiM's analog compute core can be efficient while peripheral conversion dominates total energy.
+- **Precision:** Device precision, ADC resolution, weight slicing, input slicing, and model accuracy form one coupled design space.
+- **Utilization:** A huge CiM array is inefficient if layer shapes cannot fill rows and columns.
+- **Programmability:** Near-memory and CiM designs often expose unusual mapping constraints to compilers and modeling tools.
+- **Correctness:** Analog nonidealities are not just performance issues; they can change numerical results and therefore model accuracy.
 
-### Apples-to-apples comparison and design-space exploration
+---
 
-With a common modeling framework, designs from different papers (different technology nodes, ADC types, memory devices) can be compared fairly by normalizing to the same technology, ADC, and device:
+## Common Misconceptions
 
-![Design space exploration with CiMLoop — array size vs. DNN shape](../../assets/L11/L11-p74-design-space-exploration.png)
+### Misconception: Compute-in-memory makes MACs free.
 
-CiMLoop also enables exploration of how array size (an architecture decision) interacts with DNN layer shapes (a workload property) — a question that is impossible to answer with decoupled tools. This kind of joint optimization is the kind of work proposed for the course's final project.
+The array-level multiply-accumulate can be cheap, but DACs, ADCs, sense amplifiers, calibration, slicing, and digital accumulation can dominate.
 
-### CiMLoop enabling collaborations — and photonic computing
+### Misconception: More rows in a crossbar are always better.
 
-CiMLoop has been used at MIT to model not just conventional CiM but also:
+More rows can increase parallelism, but they also increase analog summation range, required ADC resolution, wire parasitics, and utilization risk.
 
-- **Resistive memory CiM** (collaboration with Jesus del Alamo's group)
-- **Superconducting electronics CiM** (collaboration with Karl Berggren and Neil Gershenfeld — started as a 6.5930/1 final project!)
-- **Optical / photonic computing** (collaboration with Dirk Englund's group)
+### Misconception: Pruning always helps CiM.
 
-The photonic frontier is worth pausing on:
+Pruning reduces MACs/DNN, but sparse weights may underfill dense CiM arrays. The Titanium Law makes this visible through the utilization factor.
 
-![Compute with light — optical matrix multiplication](../../assets/L11/L11-p77-compute-with-light.png)
+### Misconception: TOPS is enough to compare advanced technologies.
 
-Photons have properties that make them attractive for DNN compute:
+TOPS ignores precision, accuracy, conversion overhead, memory traffic, array utilization, batching assumptions, and technology normalization.
 
-- **Distance-independent energy:** Moving a photon across a chip consumes (nearly) the same energy regardless of distance — unlike electrons, where wire resistance creates ohmic loss proportional to wire length.
-- **Passive multiplication:** An optical modulator scales a light signal's intensity by a weight value without active amplification.
-- **No electromagnetic interference:** Photons do not interact with each other in a linear medium, enabling dense wavelength-multiplexed interconnects.
+---
 
-A 2017 Nature Photonics paper (Shen et al.) demonstrated matrix multiplication in the optical domain using a Mach-Zehnder interferometer network. Lightmatter's Envise chip, based on this principle, was reported to run BERT inference 5× faster than an NVIDIA A100 at 1/6 the power.
+## Connections to Previous and Later Lectures
 
-CiMLoop's library includes models for photonic components (waveguides, microring resonators, photodiodes, modulator drivers), enabling the same principled co-design methodology to be applied to photonic DNN accelerators.
+- **L01-L03:** L11 is the physical-technology answer to the energy hierarchy introduced early in the course.
+- **L05 Dataflow:** Weight-stationary mapping appears again because CiM arrays naturally keep weights in place.
+- **L07-L10 Sparsity:** Sparse models reduce MAC count but can hurt utilization in array-based CiM. Sparse benefits are technology-dependent.
+- **L12 Reduced Precision:** Precision is central to CiM because ADC bits, device bits, and model accuracy are coupled.
+- **Labs and final projects:** CiMLoop appears as the modeling bridge from lecture concepts to design-space exploration.
 
-> **Why it matters:** The modeling framework is not a product of one design point — it is infrastructure that makes the entire field of CiM-based DNN acceleration more reproducible and comparable. Without it, every new paper compares against baselines on different technology nodes with different assumptions, making progress hard to measure.
+---
+
+## Paper Bridge: DaDianNao
+
+### Bibliographic Identity
+
+- **Title:** DaDianNao: A Machine-Learning Supercomputer
+- **Authors:** Yunji Chen et al.
+- **Year / venue:** MICRO 2014
+- **Local PDF:** [`papers/L15_DaDianNao_Chen_MICRO2014.pdf`](../../papers/L15_DaDianNao_Chen_MICRO2014.pdf)
+- **Used in lecture:** Lecture 11 eDRAM and near-memory motivation
+
+### Problem Addressed
+
+DaDianNao addresses the memory bandwidth and energy cost of large neural networks, especially layers with many synaptic weights. It observes that keeping weights in external memory forces high-bandwidth, high-energy transfers.
+
+### Core Idea
+
+Place large eDRAM banks near neural functional units and move neuron values rather than repeatedly moving synaptic weights. A node contains many tiles with local eDRAM and compute, plus central eDRAM and interconnect.
+
+### Relevance to This Lecture
+
+DaDianNao is the eDRAM example for near-memory design. It keeps compute digital but changes the memory hierarchy so that weights are stored close to compute.
+
+### Key Claims Used in This Chapter
+
+- Off-chip memory bandwidth can become the bottleneck for large neural-network layers; see DaDianNao Sections I and IV.
+- The paper states that off-chip memory accesses can increase total energy by about 10x for the discussed setting; see Section IV.
+- It reports 2.85x higher density for eDRAM than SRAM and a 321x energy ratio between a 256-bit eDRAM read and Micron DDR3 in its 28 nm assumptions; see Section V-A.
+- A node contains 36 MB of eDRAM; see the architecture parameter discussion around Table II.
+- The paper reports 150.31x average energy reduction for a 64-chip system over the evaluated baseline; see the abstract and evaluation discussion.
+
+### What Students Should Remember
+
+1. DaDianNao is near-memory, not compute-in-memory.
+2. The main move is storing many weights close enough that external memory traffic drops.
+3. eDRAM density helps, but the design still pays area, wire, and integration costs.
+
+### Limitations and Assumptions
+
+The paper targets neural networks and technology assumptions from its era. Its quantitative ratios should be used as historical anchored evidence, not universal constants.
+
+### Suggested Insertion Points
+
+Use DaDianNao when explaining eDRAM and the first step from ordinary memory hierarchy toward memory-centric accelerator design.
+
+---
+
+## Paper Bridge: Neurocube
+
+### Bibliographic Identity
+
+- **Title:** Neurocube: A Programmable Digital Neuromorphic Architecture with High-Density 3D Memory
+- **Authors:** Donghyuk Kim et al.
+- **Year / venue:** ISCA 2016
+- **Local PDF:** [`papers/L15_Neurocube_Kim_ISCA2016.pdf`](../../papers/L15_Neurocube_Kim_ISCA2016.pdf)
+- **Used in lecture:** Lecture 11 3D-stacked memory / HMC discussion
+
+### Problem Addressed
+
+Neurocube addresses memory capacity and bandwidth limits for neural networks by using 3D high-density memory integrated with a logic tier.
+
+### Core Idea
+
+Integrate processing elements and programmable neurosequence generators (PNGs) into the HMC logic layer. The memory system drives known neural-network data movement patterns through programmable state machines.
+
+### Relevance to This Lecture
+
+Neurocube shows near-memory processing in a 3D memory stack. It is not analog CiM; it is a digital memory-centric architecture that uses memory organization and programmable controllers to reduce movement overhead.
+
+### Key Claims Used in This Chapter
+
+- HMC provides multiple vaults and highly parallel access; see Neurocube Section II-B and Table I.
+- The architecture uses programmable neurosequence generators associated with vault controllers; see Sections III-V.
+- General neural-network nested loops can be mapped to finite-state machines in the PNG; see Figure 8 and its surrounding text.
+- The paper reports example throughput for scene-labeling inference in 28 nm and 15 nm designs; see Section VI.
+
+### What Students Should Remember
+
+1. 3D memory offers bandwidth and capacity, but useful performance requires mapping and scheduling.
+2. Programmable memory-side controllers can exploit static neural-network access patterns.
+3. Near-memory processing can remain fully digital while still changing the architecture.
+
+### Limitations and Assumptions
+
+Neurocube is framed around neuromorphic/neural-network workloads and HMC assumptions. It is best used as a memory-centric design example, not as evidence for analog CiM.
+
+### Suggested Insertion Points
+
+Use Neurocube when explaining why 3D memory is more than a wider DRAM bus: the logic layer can participate in scheduling and data movement.
+
+---
+
+## Paper Bridge: Tetris
+
+### Bibliographic Identity
+
+- **Title:** Tetris: Scalable and Efficient Neural Network Acceleration with 3D Memory
+- **Authors:** Mingyu Gao et al.
+- **Year / venue:** ASPLOS 2017
+- **Local PDF:** [`papers/L15_TETRIS_Gao_ASPLOS2017.pdf`](../../papers/L15_TETRIS_Gao_ASPLOS2017.pdf)
+- **Used in lecture:** Lecture 11 3D memory and near-memory accumulation
+
+### Problem Addressed
+
+Tetris asks how a neural-network accelerator should be redesigned when 3D memory provides high bandwidth and lower access energy than conventional off-chip DRAM.
+
+### Core Idea
+
+Use 3D memory to rebalance accelerator area away from large on-chip SRAM buffers and toward PE arrays, and move simple accumulation operations closer to DRAM banks to reduce output-feature-map traffic.
+
+### Relevance to This Lecture
+
+Tetris is the bridge between near-memory bandwidth and near-memory computation. It shows that simply attaching 3D DRAM is not enough; dataflow scheduling, buffer sizing, and where accumulation happens must be reconsidered.
+
+### Key Claims Used in This Chapter
+
+- The abstract reports 4.1x performance improvement and 1.5x energy reduction over conventional low-power DRAM systems.
+- Section 2.4 states that 3D memory can provide 160-250 GB/s bandwidth with 3-5x lower access energy than DDR3.
+- Section 3 discusses rebalancing PE/buffer area and placing engines per vault.
+- Section 4 discusses dataflow scheduling and in-memory accumulation to reduce ofmap traffic.
+
+### What Students Should Remember
+
+1. 3D memory changes the optimal accelerator balance between buffers and PEs.
+2. Near-memory accumulation saves traffic only when dataflow is scheduled to exploit it.
+3. Bandwidth alone does not solve utilization, area, or scheduling.
+
+### Limitations and Assumptions
+
+Tetris is a digital 3D-memory accelerator, not an analog CiM design. Its speedup depends on evaluated networks, area budgets, vault organization, and dataflow schedules.
+
+### Suggested Insertion Points
+
+Use Tetris when explaining why advanced memory technology must be paired with architecture and mapping changes.
+
+---
+
+## Paper Bridge: TPU as a Digital Baseline
+
+### Bibliographic Identity
+
+- **Title:** In-Datacenter Performance Analysis of a Tensor Processing Unit
+- **Authors:** Norman P. Jouppi et al.
+- **Year / venue:** ISCA 2017
+- **Local PDF:** [`papers/L12_TPU_Jouppi_ISCA2017.pdf`](../../papers/L12_TPU_Jouppi_ISCA2017.pdf)
+- **Used in lecture:** Contextual baseline for memory-aware digital acceleration
+
+### Problem Addressed
+
+The TPU paper analyzes a deployed digital inference accelerator and shows how matrix units, on-chip memory, and weight-memory bandwidth determine datacenter inference performance.
+
+### Core Idea
+
+The TPU uses a 256 x 256 systolic matrix unit with 65,536 8-bit MACs, large software-managed on-chip memory, and a deterministic execution model. It is not an advanced memory device, but it is a useful contrast: it attacks data movement with a digital systolic array and explicit memory management.
+
+### Relevance to This Lecture
+
+TPU provides a baseline for what advanced technologies are competing against. A CiM design must outperform not a naive MAC array, but a carefully engineered digital accelerator with locality, systolic data reuse, and roofline-aware performance constraints.
+
+### Key Claims Used in This Chapter
+
+- The abstract states the TPU has a 65,536 8-bit MAC matrix unit, 92 TOPS peak, and 28 MiB on-chip memory.
+- Section 2 describes the matrix unit, unified buffer, weight FIFO, and systolic execution.
+- Section 4 applies a roofline model and notes a ridge point around 1350 operations per byte of weight memory fetched.
+- The paper reports 15x-30x speedup over contemporary GPU/CPU inference systems and much higher TOPS/Watt in its evaluated datacenter workloads; see the abstract.
+
+### What Students Should Remember
+
+1. Digital accelerators already exploit locality aggressively.
+2. Roofline reasoning remains useful even when comparing to advanced technologies.
+3. Advanced technology claims should be compared against strong digital baselines.
+
+### Limitations and Assumptions
+
+The TPU paper evaluates specific Google datacenter workloads from its era. It is a baseline and modeling contrast, not evidence for CiM device behavior.
+
+### Suggested Insertion Points
+
+Use TPU when students need a grounded digital reference point for systolic arrays, memory bandwidth, and roofline limits.
 
 ---
 
 ## Standalone Study Guide
 
-### What to master before moving on
+### What to Master Before Moving On
 
-- Explain why compute-in-memory attacks data movement by moving MACs toward storage.
-- Describe the analog crossbar multiply-accumulate primitive and why ADC/DAC overhead matters.
-- State the Titanium Law: ADC cost can dominate analog CiM energy as resolution and array size grow.
-- Explain RAELLA as arithmetic reform, not simply a better memory cell.
-- Use CiMLoop as the modeling bridge across devices, circuits, architectures, mappings, and workloads.
+- Explain the difference between moving memory closer and computing inside memory.
+- Derive the crossbar dot product from $I=VG$ and current summation.
+- Use the Titanium Law to identify which cost a CiM technique changes.
+- Explain why ADCs turn an elegant analog primitive into a system-level tradeoff.
+- Compare eDRAM, 3D DRAM, analog CiM, and photonics by cost model rather than hype.
 
-### Self-check questions
+### Self-Check Questions
 
-1. What part of a crossbar performs multiplication, and what part performs accumulation?
-2. Why can analog CiM lose its energy advantage after accounting for ADCs?
-3. Why is an apples-to-apples modeling framework necessary when comparing CiM designs?
+1. Why is DaDianNao near-memory rather than compute-in-memory?
+2. What does 3D memory improve, and what constraints does it introduce?
+3. In a resistive crossbar, what represents the input and what represents the weight?
+4. Why can lowering ADC resolution increase conversions per MAC?
+5. Why might pruning hurt CiM utilization?
+6. Why does CiMLoop need data-value-dependent modeling?
 
 ### Exercises
 
-1. Trace one vector-matrix multiply through a resistive crossbar, including input delivery and output conversion.
-2. List three device-level nonidealities and explain how each can appear as model accuracy loss.
-3. Compare SRAM CiM, DRAM CiM, ReRAM CiM, and photonic computing along precision, density, and programmability axes.
-
-### Common traps
-
-- Treating analog CiM as "free MACs." Data conversion, input drivers, and peripheral circuits are often dominant.
-- Comparing papers by peak TOPS without normalizing precision, accuracy, technology node, and array size.
-- Forgetting that advanced technologies move constraints rather than eliminating them.
+1. Use the Titanium Law to compare two designs: Design A has 2x lower energy per conversion but 2x more conversions per MAC; Design B keeps conversions fixed but improves utilization from 50% to 80%.
+2. For a $4 \times 4$ crossbar, write the dot product computed by one column and identify where DAC and ADC conversion occur.
+3. Choose one near-memory paper bridge in this chapter and explain which memory movement it reduces: weights, activations, partial sums, or off-chip transfers.
+4. Explain why a sparse, heavily pruned model may be good for a digital sparse accelerator but awkward for a dense analog crossbar.
+5. Paper-reading bridge: read Tetris Section 2.4 and summarize why 3D memory changes PE/buffer area allocation.
 
 ---
 
 ## Key Terms
 
-| Term | Gloss |
+| Term | Meaning |
 |---|---|
-| **Compute-in-Memory (CiM)** | Using the physical properties of memory cells to perform arithmetic (e.g., MAC) inside the storage array, eliminating read-data movement. |
-| **Near-data processing** | Moving computation physically close to memory (but not inside it) to reduce wire lengths and capacitive energy. Includes eDRAM and 3D-stacked DRAM. |
-| **eDRAM** | Embedded DRAM integrated on the same die as logic; 2.85× denser than SRAM but pricier than off-chip DRAM. |
-| **HMC / HBM** (Hybrid Memory Cube / High Bandwidth Memory) | 3D-stacked DRAM technologies that place memory dies directly above a logic die, multiplying bandwidth and reducing access energy. |
-| **Analog crossbar** | A 2D array of programmable resistances (weights) with word-line voltages (inputs) producing bit-line currents (partial sums) via Ohm's Law. |
-| **Memristor / ReRAM / RRAM** | Non-volatile resistive memory device whose resistance is programmable; used as the weight element in analog CiM crossbars. |
-| **DAC** (Digital-to-Analog Converter) | Converts digital input activations to analog voltages/currents for delivery to the crossbar word lines. |
-| **ADC** (Analog-to-Digital Converter) | Converts analog bit-line currents back to digital partial sums. The dominant energy/area overhead in most CiM designs. |
-| **Weight slicing** | Representing a multi-bit weight across multiple devices (bit slices), each storing fewer bits; increases ADC conversion count. |
-| **Input slicing** | Decomposing a multi-bit input activation into bit-serial cycles; increases compute time. |
-| **Titanium Law** | Formula expressing total ADC energy as Energy/Convert × Converts/MAC × MACs/DNN × 1/Utilization; each factor trades off against the others. |
-| **RAELLA** | An inference-time technique (center+offset encoding, adaptive weight slicing, dynamic input slicing) that reduces ADC input range 1024× without DNN retraining. |
-| **CiMLoop** | MIT's Timeloop+Accelergy-based CiM modeling tool; flexible user-defined specs, data-value-dependent energy accuracy (within 8%), 1000× faster than prior accurate tools. |
-| **Pulse-width modulation (PWM)** | Encoding an analog value in the time duration of a pulse; used for input delivery to CiM when voltage modulation is impractical. |
-| **Charge sharing** | A technique in DRAM/SRAM CiM where simultaneous activation of multiple bit-line rows causes charge averaging, performing bitwise logic without digital gates. |
-| **Data-value-dependence** | The property that analog component energy depends on the *actual numerical values* being processed, not just the number of operations. |
-| **Photonic computing** | Using optical signals (photons) in waveguides and modulators to perform matrix multiplication with distance-independent energy and no electromagnetic crosstalk. |
-| **CiM stack** | The five levels of cross-layer co-design: devices → circuits → architecture → mapping → workload. |
+| **Near-memory processing** | Keeping compute digital but placing it physically closer to memory or using high-bandwidth memory packaging. |
+| **Compute-in-memory (CiM)** | Using a memory array or memory device as part of the computation itself. |
+| **eDRAM** | Embedded DRAM; denser than SRAM and useful for larger on-chip storage, with integration and refresh tradeoffs. |
+| **3D-stacked DRAM** | DRAM dies stacked with a logic die and connected by TSVs, increasing bandwidth and reducing distance. |
+| **HMC / HBM** | 3D or 2.5D high-bandwidth memory technologies used to reduce memory bottlenecks. |
+| **Analog crossbar** | A grid of programmable conductances that computes dot products using voltages and currents. |
+| **Conductance** | Reciprocal of resistance; in resistive CiM it represents a stored weight. |
+| **DAC** | Digital-to-analog converter; presents digital inputs as analog signals. |
+| **ADC** | Analog-to-digital converter; converts analog sums back to digital values. |
+| **Weight slicing** | Representing a multi-bit weight across multiple devices or cycles. |
+| **Input slicing** | Representing a multi-bit input across multiple temporal or analog steps. |
+| **Titanium Law** | A product expression for ADC energy per DNN inference: conversion energy, conversions per MAC, MACs per DNN, and utilization penalty. |
+| **RAELLA** | Slide-presented CiM technique that reshapes analog values entering ADCs without retraining. |
+| **CiMLoop** | Slide-presented modeling framework for cross-stack CiM design exploration. |
+| **Data-value dependence** | The property that analog energy depends on actual processed values, not just operation count. |
+| **Photonic computing** | Computing with optical signals, often using modulation/interference for linear algebra. |
 
 ---
 
 ## Takeaways
 
-- The **fundamental motivation for CiM** is the same energy hierarchy established in L01: DRAM access costs ~200× an ALU operation. CiM eliminates the read entirely by moving computation into the array.
-- **Analog crossbars** implement multiply-accumulate using Ohm's Law (weight = conductance, input = voltage, product = current) and Kirchhoff's Current Law (accumulation = current sum). This is physically elegant but introduces sensitivity to device variation, non-linearity, and limited precision.
-- The **ADC is the dominant cost** in practical CiM designs, not the crossbar computation. ADC energy scales exponentially with resolution; this is quantified by the **Titanium Law** (four-factor product involving Energy/Convert, Converts/MAC, MACs/DNN, and 1/Utilization).
-- The Titanium Law reveals a **fundamental tension**: reducing ADC resolution requires more bit-slices (more conversions); increasing array rows reduces utilization overhead but increases ADC resolution. Prior escape routes (pruning, low-resolution ADC) both require retraining.
-- **RAELLA** escapes without retraining by reshaping the *distribution* of analog values going into the ADC — center+offset encoding, adaptive weight slicing, and dynamic input slicing — achieving 3.9× energy improvement and 1.8× throughput improvement vs. iso-area ISAAC.
-- **CiM spans multiple substrates**: SRAM (process-compatible, modest gains), DRAM (bitwise logic via charge sharing), and NVM/memristors (density and non-volatility, but precision challenges). **No single substrate dominates** all applications.
-- **Cross-layer co-design is mandatory**: device physics, circuit topology, array architecture, dataflow mapping, and DNN workload shape all interact. The **CiMLoop** modeling tool captures these interactions (data-value-dependent energy, within 8% error, 1000× faster than prior accurate tools) and enables apples-to-apples comparison and design-space exploration.
-- **Photonic computing** is an emerging substrate where multiplication is passive and inter-PE energy is distance-independent — a potentially radical departure from the energy scaling of CMOS, modeled by CiMLoop's photonic component library.
+- Advanced technologies are responses to data movement, not magic replacements for architecture.
+- eDRAM and 3D memory keep computation digital but reduce storage distance or increase bandwidth.
+- Analog CiM computes dot products elegantly, but ADC/DAC, slicing, variation, and utilization dominate practical design.
+- The Titanium Law is a compact way to check whether a CiM proposal improved one term while worsening another.
+- RAELLA's slide-level lesson is distribution reshaping: reduce the analog range that ADCs must resolve.
+- CiMLoop's slide-level lesson is modeling discipline: advanced substrates require value-aware, cross-layer evaluation.
+- Strong digital baselines such as TPU matter; advanced technology should be compared against memory-aware architectures, not strawman MAC arrays.
 
 ---
 
-## Connections to Later Lectures
+## Connections
 
-- **L01 energy hierarchy (DRAM 200×):** CiM is the most aggressive architectural response to that hierarchy — it eliminates the weight read cost entirely. L11 is the culmination of the energy-reduction arc that started on the first day.
-- **L05–L06 dataflows:** The weight-stationary dataflow introduced in earlier lectures maps directly onto the CiM weight-stationary array. The loop-nest view (M rows × CHW columns) is the same formalism applied to a new substrate.
-- **L07–L10 sparsity:** Sparse weights reduce MACs/DNN (one Titanium Law factor), but they also reduce array utilization (another factor). The interaction is non-trivial — sparsity is less straightforwardly beneficial for CiM than for digital architectures.
-- **L12 — Reduced Precision:** Weight/input quantization (the Format layer of the TeAAL pyramid) directly determines precision per device slice, Converts/MAC, and ADC resolution — all Titanium Law factors. Precision co-design with CiM is a natural joint problem.
-- **Lab 5:** The course lab on CiM uses CiMLoop directly to explore the design space introduced in this lecture. Concepts here (array size, bit slicing, ADC cost) are the parameters students will tune.
-- **Final Project:** Design-space exploration across array size and DNN shapes (shown in the CiMLoop slides) is explicitly proposed as a final project topic. Photonic modeling with CiMLoop is also an available extension.
+L11 connects the whole course to physical implementation choices. L01-L03 taught that memory movement dominates. L05 taught that dataflow chooses what moves. L07-L10 taught that sparsity changes the dynamic work and metadata traffic. L11 asks what happens when the storage device, circuit interface, and package are redesigned. L12 then returns to precision, which is central because CiM device bits and ADC bits directly shape accuracy, energy, and throughput.
 
 ---
 
 ## Appendix — Slide-to-Section Map
 
-| Slides | Section |
-|---|---|
-| L11-1 | Title |
-| L11-2 … L11-9 | Ch.1 — Memory technology landscape; near-data processing (eDRAM, 3D DRAM); memory cost quantification |
-| L11-10 … L11-27 | Ch.2 — Analog crossbar principle; weight-stationary CiM dataflow; practical design constraints (device precision, array size, ADC, input delivery) |
-| L11-28 … L11-52 | Ch.3 — ISAAC case study; CiM energy breakdown; Titanium Law; prior escape routes; RAELLA techniques and results |
-| L11-53 … L11-59 | Ch.4 — DNN/CiM co-design; SRAM CiM (current-mode, charge-sharing); DRAM CiM (Ambit charge-sharing AND/OR); research landscape |
-| L11-60 … L11-75 | Ch.5 — CiM stack; CiMLoop (flexibility, accuracy, speed); apples-to-apples comparison; design-space exploration |
-| L11-75 … L11-80 | Ch.5 — CiMLoop collaborations; photonic computing frontier |
-| L11-81 | Summary and references |
+| Slides | Chapter section | Notes |
+|---|---|---|
+| 1 | Title | Lecture framing. |
+| 2-9 | Memory cost and near-memory | eDRAM, 3D DRAM, DaDianNao, Neurocube, Tetris. |
+| 10-27 | Analog crossbar | Conventional processing vs. CiM, Ohm/Kirchhoff MAC, weight-stationary mapping, practical limits. |
+| 28-52 | ADC bottleneck | ISAAC context, Titanium Law, RAELLA techniques and slide-reported results. |
+| 53-60 | CiM substrates | SRAM, DRAM, NVM/memristor discussion. |
+| 60-75 | CiMLoop | Device/circuit/architecture/mapping/workload stack and modeling claims. |
+| 75-80 | Photonics | Emerging substrate and CiMLoop photonics modeling. |
+| 81 | Summary/references | Used for source attribution. |
+
+---
+
+## Source Notes
+
+- Lecture flow follows `Lecture/L11-Advanced_Tech.pdf`, slides 1-81.
+- Memory energy numbers for add/SRAM/DRAM are slide-derived from Lecture 11 slide 5, which attributes them to Horowitz, ISSCC 2014.
+- RAELLA, Titanium Law, CiMLoop, and photonics discussion are slide-derived from Lecture 11 slides 29-80. The local paper PDFs for RAELLA and CiMLoop were not in this worker's specified inputs, so this chapter does not independently verify their paper details.
+- DaDianNao claims are derived from `papers/L15_DaDianNao_Chen_MICRO2014.pdf`, especially Sections IV-V and the evaluation discussion.
+- Neurocube claims are derived from `papers/L15_Neurocube_Kim_ISCA2016.pdf`, especially Sections II-VI.
+- Tetris claims are derived from `papers/L15_TETRIS_Gao_ASPLOS2017.pdf`, especially Sections 2-4 and 6.
+- TPU baseline claims are derived from `papers/L12_TPU_Jouppi_ISCA2017.pdf`, especially the abstract, Sections 2 and 4.
+- Worked examples are original teaching examples based on slide-stated concepts.
+
+## Uncertainty Notes
+
+- The live lecture may have emphasized RAELLA, CiMLoop, and photonics with details not recoverable from the slide text alone.
+- Numerical technology ratios are process- and assumption-dependent. This chapter treats them as anchored evidence from slides or papers, not universal constants.
+- Existing repository assets under `assets/L11/` may be copyright-sensitive slide captures. This chapter no longer embeds them, but this worker did not delete assets outside the owned walkthrough files.
